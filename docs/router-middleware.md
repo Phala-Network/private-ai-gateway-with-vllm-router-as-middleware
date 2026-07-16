@@ -40,6 +40,11 @@ No route list is compiled into the binary. No external router control API is
 required. A production deployment can boot with an empty seed and add PIG-backed
 upstreams later without restarting the gateway.
 
+Upstreams with `"enabled": false` stay in the admin-visible config but are not
+route candidates. They are also skipped by PIG metrics polling and background
+upstream verification, which avoids repeated noise while a node is known to be
+down.
+
 In middleware mode, every configured upstream should expose the same public
 model id. The selected backend route id has this form:
 
@@ -186,4 +191,3 @@ response.returned
 Middleware cannot forge `upstream.verified`; the backend verifies or refreshes
 the selected upstream lease and enforces the verified channel binding before
 sending request bytes.
-

@@ -18,6 +18,7 @@ fn test_upstream_config(
 ) -> UpstreamConfig {
     UpstreamConfig {
         name: name.to_string(),
+        enabled: true,
         provider,
         base_url: format!("https://{name}.example"),
         path: None,
@@ -38,6 +39,17 @@ fn test_upstream_config(
         chutes_e2ee_discovery_rounds: None,
         chutes_e2ee_discovery_interval_seconds: None,
     }
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "private-ai-gateway-upstreams-{name}-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
 }
 
 #[test]
@@ -130,6 +142,96 @@ fn parse_config_allows_same_public_model_on_distinct_route_ids() {
     .expect("same public model can have multiple route ids");
 
     assert_eq!(config.len(), 2);
+}
+
+#[test]
+fn parse_config_defaults_enabled_and_accepts_disabled() {
+    let config = parse_config_text(
+        r#"
+            [
+              {
+                "name": "enabled-node",
+                "provider": "phala-direct",
+                "base_url": "https://enabled.example",
+                "models": {"public-model": "upstream-enabled"}
+              },
+              {
+                "name": "disabled-node",
+                "enabled": false,
+                "provider": "phala-direct",
+                "base_url": "https://disabled.example",
+                "models": {"public-model": "upstream-disabled"}
+              }
+            ]
+            "#,
+    )
+    .expect("enabled is an optional runtime switch");
+
+    assert!(config[0].enabled);
+    assert!(!config[1].enabled);
+    assert!(!config[1].redacted().bearer_token_configured);
+    assert!(!config[1].redacted().enabled);
+}
+
+#[test]
+fn disabled_upstreams_are_ignored_by_runtime_targets() {
+    let enabled = test_upstream_config(
+        "enabled-node",
+        UpstreamProvider::PhalaDirect,
+        "public-model",
+        "upstream-enabled",
+    );
+    let mut disabled = test_upstream_config(
+        "disabled-node",
+        UpstreamProvider::PhalaDirect,
+        "public-model",
+        "upstream-disabled",
+    );
+    disabled.enabled = false;
+    let config = vec![enabled, disabled];
+
+    let verification_names = super::validation::verification_targets(&config)
+        .into_iter()
+        .map(|target| target.upstream_name)
+        .collect::<Vec<_>>();
+    assert_eq!(verification_names, vec!["enabled-node"]);
+
+    let path = temp_path("disabled-runtime-targets");
+    let manager = UpstreamConfigManager::load(
+        &path,
+        UpstreamRuntimeOptions {
+            verifier_mode: UpstreamVerifierMode::None,
+            accepted_workload_ids: Vec::new(),
+            accepted_image_digests: Vec::new(),
+            accepted_dstack_kms_root_public_keys: Vec::new(),
+            pccs_url: None,
+            verifier_cache_seconds: 300,
+            connect_timeout_seconds: 10,
+            read_timeout_seconds: 600,
+            verifier_request_timeout_seconds: 60,
+        },
+    )
+    .unwrap();
+    manager.replace(config).unwrap();
+
+    assert_eq!(
+        manager
+            .metrics_targets()
+            .into_iter()
+            .map(|target| target.upstream_name)
+            .collect::<Vec<_>>(),
+        vec!["enabled-node"]
+    );
+    assert_eq!(
+        manager.upstream_names_for_model("public-model"),
+        vec!["enabled-node"]
+    );
+    assert!(manager
+        .attestation_upstream_target("upstream-disabled")
+        .is_none());
+    assert_eq!(manager.snapshot().upstreams.len(), 2);
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -239,6 +341,7 @@ async fn prewarm_verification_deduplicates_upstream_models() {
     let invalidations = Arc::new(AtomicUsize::new(0));
     let config = vec![UpstreamConfig {
         name: "provider-a".to_string(),
+        enabled: true,
         // Per-model provider (not a router): two public models sharing one
         // upstream model dedup to one target; a third yields a second.
         provider: UpstreamProvider::PhalaDirect,

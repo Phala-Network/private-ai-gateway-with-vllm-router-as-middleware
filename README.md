@@ -352,6 +352,11 @@ middleware mode, middleware selects a backend target route of this form:
 <upstream name>:<public model id in upstream config>
 ```
 
+Each upstream is enabled by default. Set `"enabled": false` to keep a node in
+the live config while taking it out of routing, upstream metrics polling, and
+background upstream verification. The admin snapshot still shows disabled
+entries so operators can re-enable them without losing the configured route.
+
 Supported `provider` values:
 
 | Provider | Use |

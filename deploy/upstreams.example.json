@@ -10,6 +10,7 @@
   },
   {
     "name": "node-b",
+    "enabled": false,
     "provider": "phala-direct",
     "base_url": "https://model-node-b.example.com",
     "models": {

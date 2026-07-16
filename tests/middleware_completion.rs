@@ -114,6 +114,7 @@ fn upstream_config(
 ) -> UpstreamConfig {
     UpstreamConfig {
         name: name.to_string(),
+        enabled: true,
         provider: UpstreamProvider::OpenAiCompatible,
         base_url: base_url.to_string(),
         path: None,
@@ -430,6 +431,54 @@ async fn forwarding_uses_selected_route_and_finalizes_receipt() {
         json!("up-a"),
         "selected route must rewrite the public model to its upstream model"
     );
+}
+
+#[tokio::test]
+async fn disabled_upstream_is_visible_but_not_routed() {
+    let calls_disabled = Arc::new(CapturedCalls::default());
+    let calls_active = Arc::new(CapturedCalls::default());
+    let disabled_url = spawn_openai_upstream(
+        "chat-disabled",
+        200,
+        json!({"object":"chat.completion","model":"up-disabled","choices":[]}),
+        calls_disabled.clone(),
+    )
+    .await;
+    let active_url = spawn_openai_upstream(
+        "chat-active",
+        200,
+        json!({"object":"chat.completion","model":"up-active","choices":[]}),
+        calls_active.clone(),
+    )
+    .await;
+    let mut disabled = upstream_config("gpu-a", &disabled_url, "gpt-test", "up-disabled");
+    disabled.enabled = false;
+    let manager = upstream_manager(vec![
+        disabled,
+        upstream_config("gpu-b", &active_url, "gpt-test", "up-active"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default());
+
+    let (status, _, body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["id"], json!("chat-active"));
+    assert_eq!(calls_disabled.bodies.lock().unwrap().len(), 0);
+    assert_eq!(calls_active.bodies.lock().unwrap().len(), 1);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    let disabled_route = snapshot["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["route_id"] == json!("gpu-a:gpt-test"))
+        .unwrap();
+    assert_eq!(disabled_route["enabled"], json!(false));
 }
 
 #[tokio::test]

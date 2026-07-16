@@ -36,6 +36,8 @@ use validation::{
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub name: String,
+    #[serde(default = "default_enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub provider: UpstreamProvider,
     pub base_url: String,
@@ -83,6 +85,7 @@ pub struct UpstreamConfig {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PublicUpstreamConfig {
     pub name: String,
+    pub enabled: bool,
     pub provider: UpstreamProvider,
     pub base_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +126,7 @@ impl UpstreamConfig {
     pub fn redacted(&self) -> PublicUpstreamConfig {
         PublicUpstreamConfig {
             name: self.name.clone(),
+            enabled: self.enabled,
             provider: self.provider,
             base_url: self.base_url.clone(),
             path: self.path.clone(),
@@ -144,6 +148,14 @@ impl UpstreamConfig {
             chutes_e2ee_discovery_interval_seconds: self.chutes_e2ee_discovery_interval_seconds,
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -391,6 +403,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.models.contains_key(model) || cfg.models.values().any(|v| v == model))
             .map(|cfg| cfg.name.clone())
             .collect()
@@ -402,7 +415,7 @@ impl UpstreamConfigManager {
     /// Returns `None` when no configured upstream serves `model`.
     pub fn attestation_upstream_target(&self, model: &str) -> Option<AttestationUpstreamTarget> {
         let state = self.state.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let cfg = state.config.iter().find(|cfg| {
+        let cfg = state.config.iter().filter(|cfg| cfg.enabled).find(|cfg| {
             cfg.models.contains_key(model) || cfg.models.values().any(|v| v == model)
         })?;
         // `model` is either a public alias (mapped to an upstream id) or already
@@ -432,6 +445,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .map(|cfg| UpstreamMetricsTarget {
                 upstream_name: cfg.name.clone(),
                 base_url: cfg.base_url.trim_end_matches('/').to_string(),
@@ -487,6 +501,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter_map(|cfg| verification_refresh_seconds(cfg, &self.options))
             .min()
     }
@@ -501,6 +516,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.provider == UpstreamProvider::Chutes)
             .filter_map(session_refresh_seconds)
             .min()
@@ -579,6 +595,7 @@ impl UpstreamConfigManager {
         for cfg in state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.provider == UpstreamProvider::Chutes)
             .filter(|cfg| session_refresh_seconds(cfg).is_some())
         {
@@ -677,6 +694,7 @@ impl ProviderSessionRegistry {
     fn new(config: &[UpstreamConfig]) -> Self {
         let chutes = config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.provider == UpstreamProvider::Chutes)
             .map(|cfg| (cfg.name.clone(), Arc::new(ChutesSessionStore::new())))
             .collect();

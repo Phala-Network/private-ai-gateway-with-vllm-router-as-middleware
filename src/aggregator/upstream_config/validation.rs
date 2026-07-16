@@ -21,7 +21,7 @@ pub(super) struct UpstreamVerificationTarget {
 }
 
 pub(super) fn verification_targets(config: &[UpstreamConfig]) -> Vec<UpstreamVerificationTarget> {
-    verification_targets_for_configs(config.iter())
+    verification_targets_for_configs(config.iter().filter(|cfg| cfg.enabled))
 }
 
 pub(super) fn verification_targets_for_refresh(
@@ -31,6 +31,7 @@ pub(super) fn verification_targets_for_refresh(
     verification_targets_for_configs(
         config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| verification_refresh_seconds(cfg, options).is_some()),
     )
 }

@@ -25,13 +25,22 @@ pub(super) fn build_state(
     options: &UpstreamRuntimeOptions,
 ) -> Result<ConfiguredUpstreams, UpstreamConfigError> {
     validate_config(config)?;
-    let sessions = Arc::new(ProviderSessionRegistry::new(config));
-    let backend: Arc<dyn UpstreamBackend> = if config.is_empty() {
+    let active_config = config
+        .iter()
+        .filter(|cfg| cfg.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    let sessions = Arc::new(ProviderSessionRegistry::new(&active_config));
+    let backend: Arc<dyn UpstreamBackend> = if active_config.is_empty() {
         Arc::new(EmptyUpstreamBackend)
     } else {
-        Arc::new(build_model_router(config, options, sessions.as_ref())?)
+        Arc::new(build_model_router(
+            &active_config,
+            options,
+            sessions.as_ref(),
+        )?)
     };
-    let verifier = build_verifier(config, options, sessions.as_ref())?;
+    let verifier = build_verifier(&active_config, options, sessions.as_ref())?;
     Ok(ConfiguredUpstreams {
         config: config.to_vec(),
         config_digest: config_digest(config)?,
@@ -47,7 +56,7 @@ fn build_model_router(
     sessions: &ProviderSessionRegistry,
 ) -> Result<ModelRouterBackend, UpstreamConfigError> {
     let mut router = ModelRouterBackend::new("model-router");
-    for cfg in config {
+    for cfg in config.iter().filter(|cfg| cfg.enabled) {
         let backend = build_provider_backend(cfg, options, sessions)?;
         for (public_model, upstream_model) in &cfg.models {
             router
@@ -178,7 +187,7 @@ pub(super) fn build_verifier(
         )))),
         UpstreamVerifierMode::AciService => {
             let mut router = RoutingUpstreamVerifier::new();
-            for cfg in config {
+            for cfg in config.iter().filter(|cfg| cfg.enabled) {
                 let verifier = build_aci_service_verifier(cfg, options)?;
                 router = router
                     .add_origin(
@@ -197,11 +206,15 @@ fn build_provider_verifier(
     options: &UpstreamRuntimeOptions,
     sessions: &ProviderSessionRegistry,
 ) -> Result<Option<Arc<dyn UpstreamVerifier>>, UpstreamConfigError> {
-    if !config.iter().any(|cfg| provider_is_tee(cfg.provider)) {
+    if !config
+        .iter()
+        .filter(|cfg| cfg.enabled)
+        .any(|cfg| provider_is_tee(cfg.provider))
+    {
         return Ok(None);
     }
     let mut router = RoutingUpstreamVerifier::new();
-    for cfg in config {
+    for cfg in config.iter().filter(|cfg| cfg.enabled) {
         let cache_seconds = cfg
             .verifier_cache_seconds
             .unwrap_or(options.verifier_cache_seconds);

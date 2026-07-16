@@ -142,6 +142,9 @@ impl RouterBackend {
         }
         let mut models = BTreeSet::new();
         for upstream in &snapshot.upstreams {
+            if !upstream.enabled {
+                continue;
+            }
             for public_model in upstream.models.keys() {
                 models.insert(public_model.clone());
             }
@@ -161,7 +164,7 @@ impl RouterBackend {
         let snapshot = self.upstream_config.snapshot();
         let mut routes = Vec::new();
         for upstream in snapshot.upstreams {
-            if upstream.models.contains_key(model) {
+            if upstream.enabled && upstream.models.contains_key(model) {
                 routes.push(route_from_upstream(&upstream, model, &self.config));
             }
         }
@@ -235,6 +238,7 @@ impl RouterBackend {
                     .map_or(0, Vec::len);
                 routes.push(json!({
                     "route_id": route_id,
+                    "enabled": upstream.enabled,
                     "upstream_name": upstream.name,
                     "public_model": model,
                     "provider": provider_name(upstream.provider),

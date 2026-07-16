@@ -183,6 +183,7 @@ the admin API.
 [
   {
     "name": "route-a",
+    "enabled": true,
     "provider": "aci-service",
     "base_url": "https://upstream-a.example",
     "models": {
@@ -193,6 +194,11 @@ the admin API.
   }
 ]
 ```
+
+`enabled` defaults to `true`. Set it to `false` when a configured node should
+remain visible to admin tooling but must not receive traffic. Disabled upstreams
+are excluded from middleware route candidates, PIG metrics polling, attestation
+prewarm/refresh, and provider session refresh.
 
 Supported `provider` values:
 
