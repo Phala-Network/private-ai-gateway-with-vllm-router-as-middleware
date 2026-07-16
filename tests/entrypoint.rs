@@ -413,6 +413,24 @@ fn docs_include_config_and_env_reference() {
 }
 
 #[test]
+fn smoke_dockerfile_packages_provider_verifier_runtime() {
+    let body = repo_text("Dockerfile.smoke");
+    for required in [
+        "FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim",
+        "COPY scripts/dstack_os_image.py scripts/dstack_os_image.py",
+        "COPY scripts/private_ai_provider_verifier.py scripts/private_ai_provider_verifier.py",
+        "COPY scripts/provider_verifier scripts/provider_verifier",
+        "COPY scripts/confidential_verifier scripts/confidential_verifier",
+        "RUN uv sync --locked --no-dev --no-install-project",
+    ] {
+        assert!(
+            body.contains(required),
+            "Dockerfile.smoke must package the provider verifier runtime; missing {required:?}"
+        );
+    }
+}
+
+#[test]
 fn entrypoint_sh_header_claims_gateway_ownership() {
     // Make sure the script's own header tells future readers who owns it.
     let body = script_text();

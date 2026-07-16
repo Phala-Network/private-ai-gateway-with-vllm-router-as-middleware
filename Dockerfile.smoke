@@ -11,6 +11,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml uv.lock ./
+COPY scripts/dstack_os_image.py scripts/dstack_os_image.py
 COPY scripts/private_ai_provider_verifier.py scripts/private_ai_provider_verifier.py
 COPY scripts/provider_verifier scripts/provider_verifier
 COPY scripts/confidential_verifier scripts/confidential_verifier
