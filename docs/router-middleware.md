@@ -34,6 +34,7 @@ Operators manage that file through the existing authenticated APIs:
 ```text
 GET /v1/admin/upstreams
 PUT /v1/admin/upstreams
+PATCH /v1/admin/upstreams/{name}
 ```
 
 No route list is compiled into the binary. No external router control API is
@@ -43,7 +44,9 @@ upstreams later without restarting the gateway.
 Upstreams with `"enabled": false` stay in the admin-visible config but are not
 route candidates. They are also skipped by PIG metrics polling and background
 upstream verification, which avoids repeated noise while a node is known to be
-down.
+down. Use `PATCH /v1/admin/upstreams/{name}` to disable or re-enable one node
+without losing its stored config. `PUT /v1/admin/upstreams` is full replacement
+and removes any node omitted from the submitted array.
 
 In middleware mode, every configured upstream should expose the same public
 model id. The selected backend route id has this form:

@@ -483,6 +483,28 @@ impl UpstreamConfigManager {
         Ok(snapshot_for(&self.path, &next))
     }
 
+    pub fn set_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<UpstreamConfigSnapshot, UpstreamConfigError> {
+        let mut config = {
+            let state = self
+                .state
+                .read()
+                .expect("upstream config manager state poisoned")
+                .clone();
+            state.config.clone()
+        };
+        let Some(upstream) = config.iter_mut().find(|cfg| cfg.name == name) else {
+            return Err(UpstreamConfigError::InvalidConfig(format!(
+                "upstream {name:?} not found"
+            )));
+        };
+        upstream.enabled = enabled;
+        self.replace(config)
+    }
+
     pub async fn prewarm_upstream_verification(&self) -> Vec<UpstreamPrewarmResult> {
         self.run_upstream_verification(false).await
     }

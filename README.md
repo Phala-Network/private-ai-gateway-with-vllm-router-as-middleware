@@ -356,6 +356,9 @@ Each upstream is enabled by default. Set `"enabled": false` to keep a node in
 the live config while taking it out of routing, upstream metrics polling, and
 background upstream verification. The admin snapshot still shows disabled
 entries so operators can re-enable them without losing the configured route.
+Use `PATCH /v1/admin/upstreams/{name}` to toggle one upstream safely. `PUT
+/v1/admin/upstreams` is a full replacement API and should only be used when the
+caller intentionally sends the complete desired config.
 
 Supported `provider` values:
 
@@ -470,6 +473,7 @@ config; see the [router middleware design](docs/router-middleware.md) and the
 | `GET /v1/metrics` | Gateway-owned Prometheus metrics. Requires `api_token` when configured. |
 | `GET /v1/admin/upstreams` | Authenticated upstream config snapshot. |
 | `PUT /v1/admin/upstreams` | Authenticated upstream config replacement. |
+| `PATCH /v1/admin/upstreams/{name}` | Authenticated single-upstream enable/disable update without replacing the full config. |
 | `GET /v1/admin/router` | Authenticated router middleware snapshot, including redacted PIG metrics status, when the `middleware` section is enabled. |
 
 ## Runtime Configuration

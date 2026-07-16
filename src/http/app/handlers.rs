@@ -63,6 +63,12 @@ pub(super) struct SessionListQuery {
     model: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpstreamPatchRequest {
+    enabled: Option<bool>,
+}
+
 // Liveness probe for load balancers and orchestrators. Unauthenticated and
 // version-independent: it reports only that the process is serving requests.
 pub(super) async fn health() -> Json<Value> {
@@ -212,6 +218,60 @@ pub(super) async fn admin_put_upstreams(
                     }
                 }
             });
+            Json(snapshot).into_response()
+        }
+        Err(e) => upstream_config_error_response(e),
+    }
+}
+
+pub(super) async fn admin_patch_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<UpstreamPatchRequest>,
+) -> Response {
+    if let Some(resp) = enforce_admin(&state, &headers) {
+        return resp;
+    }
+    let Some(manager) = &state.upstream_config else {
+        return admin_not_found_response();
+    };
+    let Some(enabled) = body.enabled else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_upstream_config",
+            "PATCH /v1/admin/upstreams/{name} currently requires an enabled boolean",
+        );
+    };
+    match manager.set_enabled(&name, enabled) {
+        Ok(snapshot) => {
+            if enabled {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    let results = manager.prewarm_upstream_verification().await;
+                    for result in results {
+                        match result.reason {
+                            Some(reason) => tracing::warn!(
+                                upstream = %result.upstream_name,
+                                model = %result.model_id,
+                                origin = ?result.url_origin,
+                                verifier = %result.verifier_id,
+                                result = %result.result,
+                                reason = %reason,
+                                "upstream verification prewarm finished"
+                            ),
+                            None => tracing::info!(
+                                upstream = %result.upstream_name,
+                                model = %result.model_id,
+                                origin = ?result.url_origin,
+                                verifier = %result.verifier_id,
+                                result = %result.result,
+                                "upstream verification prewarm finished"
+                            ),
+                        }
+                    }
+                });
+            }
             Json(snapshot).into_response()
         }
         Err(e) => upstream_config_error_response(e),

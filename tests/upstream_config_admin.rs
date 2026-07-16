@@ -14,8 +14,12 @@ use private_ai_gateway::aggregator::service::{
 use private_ai_gateway::aggregator::upstream_config::{
     UpstreamConfigManager, UpstreamRuntimeOptions, UpstreamVerifierMode,
 };
-use private_ai_gateway::http::{build_router_with_admin, build_router_with_admin_and_api};
-use serde_json::Value;
+use private_ai_gateway::http::{
+    build_router_with_admin, build_router_with_admin_and_api,
+    build_router_with_admin_api_and_middleware,
+};
+use private_ai_gateway::middleware::{Middleware, MiddlewareConfig};
+use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use common::{StaticKeyProvider, StubQuoter};
@@ -232,4 +236,117 @@ async fn api_token_gates_public_model_and_metrics_surfaces() {
     assert_eq!(status, StatusCode::OK);
 
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn admin_can_disable_upstream_without_removing_it_from_snapshots() {
+    let path = temp_config_path();
+    let manager = Arc::new(UpstreamConfigManager::load(&path, runtime_options()).unwrap());
+    let config = br#"[
+      {
+        "name": "gpu-a",
+        "provider": "openai-compatible",
+        "base_url": "https://gpu-a.example",
+        "models": {"public-a": "upstream-a"},
+        "bearer_token": "secret-a"
+      },
+      {
+        "name": "gpu-b",
+        "provider": "openai-compatible",
+        "base_url": "https://gpu-b.example",
+        "models": {"public-a": "upstream-b"},
+        "bearer_token": "secret-b"
+      }
+    ]"#;
+    manager.replace(parse_config_for_test(config)).unwrap();
+    let keys = Arc::new(StaticKeyProvider::default());
+    let service = Arc::new(
+        AciService::new_with_upstream_verifier(
+            keys,
+            Arc::new(StubQuoter::default()),
+            manager.backend(),
+            manager.verifier(),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test("private-ai-gateway"),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    );
+    let middleware = Arc::new(
+        Middleware::new(
+            &MiddlewareConfig {
+                public_model: Some("public-a".to_string()),
+                ..Default::default()
+            },
+            manager.clone(),
+        )
+        .unwrap(),
+    );
+    let app = build_router_with_admin_api_and_middleware(
+        service,
+        manager,
+        Some("admin-secret".to_string()),
+        None,
+        middleware,
+    );
+
+    let (status, body) = call(
+        app.clone(),
+        "PATCH",
+        "/v1/admin/upstreams/gpu-a",
+        br#"{"enabled":false}"#.to_vec(),
+        Some("admin-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["upstreams"].as_array().unwrap().len(), 2);
+    assert_eq!(body["upstreams"][0]["name"], json!("gpu-a"));
+    assert_eq!(body["upstreams"][0]["enabled"], json!(false));
+    assert!(body["upstreams"][0].get("bearer_token").is_none());
+
+    let (status, body) = call(
+        app.clone(),
+        "GET",
+        "/v1/admin/upstreams",
+        Vec::new(),
+        Some("admin-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["upstreams"].as_array().unwrap().len(), 2);
+    let disabled = body["upstreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|upstream| upstream["name"] == json!("gpu-a"))
+        .unwrap();
+    assert_eq!(disabled["enabled"], json!(false));
+
+    let (status, router) = call(
+        app,
+        "GET",
+        "/v1/admin/router",
+        Vec::new(),
+        Some("admin-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let route = router["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["route_id"] == json!("gpu-a:public-a"))
+        .unwrap();
+    assert_eq!(route["enabled"], json!(false));
+
+    let _ = std::fs::remove_file(path);
+}
+
+fn parse_config_for_test(
+    config: &[u8],
+) -> Vec<private_ai_gateway::aggregator::upstream_config::UpstreamConfig> {
+    private_ai_gateway::aggregator::upstream_config::parse_config_text(
+        std::str::from_utf8(config).unwrap(),
+    )
+    .unwrap()
 }

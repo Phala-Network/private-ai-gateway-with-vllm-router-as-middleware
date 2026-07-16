@@ -16,7 +16,9 @@ directory. Operators must choose the config file with
 Operators configure `state_dir`, not the individual writable files inside it.
 The gateway creates `state_dir` on startup, seeds `upstreams.json` from the
 read-only upstream seed only when the active file is missing or empty, and
-updates `upstreams.json` through `PUT /v1/admin/upstreams`.
+updates `upstreams.json` through the upstream admin API. Use
+`PATCH /v1/admin/upstreams/{name}` for safe enable/disable toggles. Use
+`PUT /v1/admin/upstreams` only for intentional full-config replacement.
 
 Unknown fields in the static gateway config are rejected at startup.
 
@@ -42,7 +44,7 @@ This is the smallest practical container config.
 | `bind` | `127.0.0.1:8086` | Public HTTP listener address. Use `0.0.0.0:8086` in containers that expose the gateway port. |
 | `state_dir` | `/var/lib/private-ai-gateway` | Gateway-owned writable state directory. The active upstream config and attested-session log are derived from this directory. |
 | `upstream_config_seed_path` | unset | Read-only JSON seed copied to `<state_dir>/upstreams.json` only when the active upstream config is missing or empty. |
-| `admin_token` | unset | Bearer token for `GET` and `PUT /v1/admin/upstreams`. When unset, the admin API is not exposed. |
+| `admin_token` | unset | Bearer token for `GET`, `PUT`, and `PATCH` upstream admin APIs. When unset, the admin API is not exposed. |
 | `api_token` | unset | Bearer token for `/v1/models`, `/v1/metrics`, and OpenAI-compatible inference POST endpoints. When unset, those endpoints remain open for local development. Production deployments should set it. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `middleware` | unset | Optional middleware section. When present, the gateway runs in-process middleware before the verified backend forward; when unset it serves directly. See [Middleware](#middleware). |
@@ -101,8 +103,11 @@ for the selection algorithm and security boundary.
 }
 ```
 
-The route set comes from the active upstream config. Dynamic upstream add/remove
-remains `GET` and `PUT /v1/admin/upstreams` with the gateway admin bearer token.
+The route set comes from the active upstream config. Dynamic upstream inspection
+and replacement remain `GET` and `PUT /v1/admin/upstreams` with the gateway
+admin bearer token. Dynamic enable/disable should use
+`PATCH /v1/admin/upstreams/{name}` so the node remains visible in admin
+snapshots.
 The router exposes an authenticated
 `GET /v1/admin/router` snapshot with current route counters, in-flight counts,
 selection counters, history sample counts, redacted PIG metrics status, router
@@ -199,6 +204,17 @@ the admin API.
 remain visible to admin tooling but must not receive traffic. Disabled upstreams
 are excluded from middleware route candidates, PIG metrics polling, attestation
 prewarm/refresh, and provider session refresh.
+
+For operational disable/re-enable flows, prefer:
+
+```text
+PATCH /v1/admin/upstreams/route-a
+{"enabled": false}
+```
+
+This preserves the rest of the node config, including bearer-token presence and
+model mapping. `PUT /v1/admin/upstreams` replaces the whole file and will remove
+any upstream omitted from the submitted array.
 
 Supported `provider` values:
 

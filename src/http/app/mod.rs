@@ -32,6 +32,8 @@
 //!   current upstream config, with secrets redacted.
 //! * `PUT  /v1/admin/upstreams` - authenticated admin replacement of
 //!   the single upstream config file.
+//! * `PATCH /v1/admin/upstreams/{name}` - authenticated admin enable/disable
+//!   toggle for one upstream without replacing the full config.
 //! * `GET  /v1/admin/router` - authenticated middleware router status when
 //!   router middleware mode is enabled.
 //! * `POST /v1/admin/revoke-keyset` - authenticated admin revocation of the
@@ -76,7 +78,7 @@ use axum::{
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -92,9 +94,10 @@ mod util;
 
 use handlers::{
     aci_attestation_report, aci_list_sessions, aci_receipt, aci_revocations, admin_get_upstreams,
-    admin_put_upstreams, admin_revoke_keyset, admin_router_status, attestation_report,
-    attested_session, chat_completions, completions, embeddings, embeddings_models, health,
-    messages, metrics, models, models_subpath, receipt_by_chat_id, responses, root,
+    admin_patch_upstream, admin_put_upstreams, admin_revoke_keyset, admin_router_status,
+    attestation_report, attested_session, chat_completions, completions, embeddings,
+    embeddings_models, health, messages, metrics, models, models_subpath, receipt_by_chat_id,
+    responses, root,
 };
 
 #[derive(Clone)]
@@ -192,6 +195,7 @@ fn build_router_inner(
             "/v1/admin/upstreams",
             get(admin_get_upstreams).put(admin_put_upstreams),
         )
+        .route("/v1/admin/upstreams/:name", patch(admin_patch_upstream))
         .route("/v1/admin/router", get(admin_router_status))
         .route("/v1/admin/revoke-keyset", post(admin_revoke_keyset))
         // Canonical ACI verification surface (clean shapes).
