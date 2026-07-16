@@ -1,0 +1,60 @@
+# One-file dstack compose for Private AI Gateway under git-launcher.
+#
+# Deploy from this directory after setting the variables below, for example:
+#
+#   PRIVATE_AI_GATEWAY_REPO_COMMIT=<full-40-hex-sha> \
+#   PRIVATE_AI_GATEWAY_ADMIN_TOKEN=<long-random-token> \
+#   phala-h4xuser deploy -n private-ai-gateway -c compose.yaml
+#
+# The compose inlines the launcher pin, static gateway config, and initial
+# upstream config so dstack's compose_hash covers the complete launch policy.
+# The gateway copies the read-only upstream seed into its mutable state path only
+# when no mutable config exists yet; later admin updates replace the mutable file
+# without changing this attested compose.
+
+services:
+  private-ai-gateway:
+    image: docker.io/dstacktee/git-launcher@sha256:4437dce18ec713b0991d34bd926d324966b1a0b90fad485b8ddb3f4ed2af138b
+    command: ["/etc/git-launcher/gateway.conf"]
+    ports:
+      - "8086:8086"
+    configs:
+      - source: gateway-pin
+        target: /etc/git-launcher/gateway.conf
+      - source: gateway-config
+        target: /etc/private-ai-gateway/gateway.config.json
+      - source: gateway-upstreams
+        target: /etc/private-ai-gateway/upstreams.seed.json
+    environment:
+      PRIVATE_AI_GATEWAY_CONFIG_PATH: /etc/private-ai-gateway/gateway.config.json
+      PRIVATE_AI_GATEWAY_CACHE_DIR: /var/lib/private-ai-gateway/cache
+    volumes:
+      - gateway-checkout:/var/lib/git-launcher
+      - gateway-state:/var/lib/private-ai-gateway
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    restart: unless-stopped
+
+configs:
+  gateway-pin:
+    content: |
+      REPO_URL=https://github.com/Dstack-TEE/private-ai-gateway.git
+      COMMIT_SHA=${PRIVATE_AI_GATEWAY_REPO_COMMIT:?set PRIVATE_AI_GATEWAY_REPO_COMMIT to the audited full commit SHA}
+      WORK_DIR=/var/lib/git-launcher/private-ai-gateway
+
+  gateway-config:
+    content: |
+      {
+        "bind": "0.0.0.0:8086",
+        "state_dir": "/var/lib/private-ai-gateway",
+        "upstream_config_seed_path": "/etc/private-ai-gateway/upstreams.seed.json",
+        "admin_token": "${PRIVATE_AI_GATEWAY_ADMIN_TOKEN:?set PRIVATE_AI_GATEWAY_ADMIN_TOKEN}",
+        "dstack_endpoint": "unix:/var/run/dstack.sock"
+      }
+
+  gateway-upstreams:
+    content: |
+      []
+
+volumes:
+  gateway-checkout:
+  gateway-state:
