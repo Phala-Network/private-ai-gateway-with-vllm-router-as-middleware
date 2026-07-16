@@ -3,12 +3,18 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin private-ai-gateway
 
-FROM debian:bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 ARG SOURCE_REPO_URL
 ARG SOURCE_COMMIT
+WORKDIR /src
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml uv.lock ./
+COPY scripts/private_ai_provider_verifier.py scripts/private_ai_provider_verifier.py
+COPY scripts/provider_verifier scripts/provider_verifier
+COPY scripts/confidential_verifier scripts/confidential_verifier
+RUN uv sync --locked --no-dev --no-install-project
 RUN test -n "$SOURCE_REPO_URL" \
  && test -n "$SOURCE_COMMIT" \
  && mkdir -p /etc/git-launcher \
