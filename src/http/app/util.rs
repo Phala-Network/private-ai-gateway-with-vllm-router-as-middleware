@@ -117,9 +117,7 @@ pub(super) fn enforce_admin(state: &AppState, headers: &HeaderMap) -> Option<Res
 }
 
 pub(super) fn enforce_api(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let Some(expected) = state.api_token.as_deref() else {
-        return None;
-    };
+    let expected = state.api_token.as_deref()?;
     let Some(token) = extract_bearer(headers) else {
         return Some(error_response(
             StatusCode::UNAUTHORIZED,

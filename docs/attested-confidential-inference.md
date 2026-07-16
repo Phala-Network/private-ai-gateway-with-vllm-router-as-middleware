@@ -122,17 +122,17 @@ expired, unsigned, or rejected by policy.
 | `GET /v1/aci/receipts/{id}` | Signed ACI receipt (bare). `{id}` can be a receipt ID or response chat ID. |
 | `GET /v1/aci/sessions/{session_id}` | Attested-session record referenced by receipt events. |
 | `GET /v1/aci/sessions?upstream_name=&model=` | List a provider's imported attested sessions. |
-| `GET /v1/attestation/report` · `GET /v1/signature/{id}` | Legacy dstack-vllm-proxy aliases. New verifiers should use the `/v1/aci/*` endpoints above. |
+| `GET /v1/attestation/report` / `GET /v1/signature/{id}` | Legacy dstack-vllm-proxy aliases. New verifiers should use the `/v1/aci/*` endpoints above. |
 
 ## Tracing a receipt to its session
 
 The artifacts are linked, not bundled. A receipt's `upstream.verified` event
-carries the typed claim verdicts inline (shallow audit — trust the gateway's
+carries the typed claim verdicts inline (shallow audit: trust the gateway's
 signed claim) plus the content-addressed `session_id`. For a deep audit, follow
 that reference to `GET /v1/aci/sessions/{session_id}`: an immutable record with
 the full evidence and per-claim reasons, which the verifier re-checks itself.
 Because `session_id` is a content hash, the session you fetch is exactly the one
-the receipt committed to — race-free, and permanently cacheable.
+the receipt committed to: race-free and permanently cacheable.
 
 The gateway never stores request bodies, so there is no body to fetch: the
 rewrite (if any) is committed by `request.forwarded.body_hash` plus the

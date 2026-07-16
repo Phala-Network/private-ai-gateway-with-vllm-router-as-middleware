@@ -647,6 +647,12 @@ pub(super) async fn openai_completion_endpoint(
     let requester = extract_bearer(&headers)
         .as_deref()
         .map(ReceiptOwner::from_bearer);
+    let user_tier = headers
+        .get("x-user-tier")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let context = GatewayRequestContext {
         request_id: generate_request_id(),
         user_model: parsed
@@ -654,7 +660,7 @@ pub(super) async fn openai_completion_endpoint(
             .and_then(Value::as_str)
             .map(str::to_string),
         target_route_id: None,
-        // Populated from the x-user-tier header on the internal-forward path.
+        // Middleware mode sanitizes and forwards trusted tier headers itself.
         user_tier: None,
     };
 
@@ -687,6 +693,7 @@ pub(super) async fn openai_completion_endpoint(
             upstream_required,
             request_id: context.request_id,
             user_model: context.user_model,
+            user_tier,
             stream,
         };
         return middleware.handle_completion(&state.service, input).await;

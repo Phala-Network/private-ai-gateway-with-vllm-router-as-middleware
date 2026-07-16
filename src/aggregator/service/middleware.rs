@@ -153,7 +153,7 @@ impl AciService {
             candidates.iter().map(|c| c.route_id.clone()).collect();
         let last_index = candidates.len() - 1;
 
-        // Optional x-user-tier passed through to every upstream attempt.
+        // Optional trusted x-user-tier passed through to every upstream attempt.
         let mut upstream_headers: HashMap<String, String> = HashMap::new();
         if let Some(tier) = req.context.user_tier.as_deref() {
             upstream_headers.insert("x-user-tier".to_string(), tier.to_string());

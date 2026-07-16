@@ -7,11 +7,6 @@ Reviewed commit: `41b2e93e099baf3dd8085066c205f030b280cadc`.
 Observed router image: `ghcr.io/tinfoilsh/confidential-model-router@sha256:893f9a33e3c24bced341413a2a934e9a4f0453a76787616d42631b3181c472ba`
 (`v0.0.102`).
 
-Source reports:
-
-- [router-mode-soundness.md](../../reviews/router-mode-soundness.md)
-- [router-mode-load-balancing-cache.md](../../reviews/router-mode-load-balancing-cache.md)
-
 > **How the gateway verifies this provider:** see [verification.md](verification.md).
 > Status (2026-06 soundness pass): the gateway now verifies Tinfoil with the official
 > `tinfoil` SDK — the full AMD signature chain + Sigstore code-provenance + TLS-key

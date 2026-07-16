@@ -65,8 +65,10 @@ The checked-in compose starts with an empty upstream seed:
 For a real deployment, replace the `gateway-upstreams` `content:` block in
 `compose.yaml` with the provider routes you want to boot with, or keep it
 empty and set the config after boot through `PUT /v1/admin/upstreams`.
-[`upstreams.example.json`](./upstreams.example.json) shows the current
-three-provider shape.
+[`upstreams.example.json`](./upstreams.example.json) shows the intended
+single-public-model, multi-node PhalaDirect/PIG-backed shape. Other providers
+remain supported by the gateway backend, but they are not the deployment target
+for this router-middleware fork.
 
 ## Ownership boundary
 

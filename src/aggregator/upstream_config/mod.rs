@@ -172,7 +172,7 @@ impl UpstreamProvider {
             UpstreamProvider::PhalaDirect => AttestationScope::PerModel,
             // Plain cloud APIs (OpenAI-compatible, Anthropic) have no verifier
             // and ACI service uses its own, so for all of these this only tunes
-            // prewarm probe granularity. Per-model is the safe default — it
+            // prewarm probe granularity. Per-model is the safe default; it
             // never collapses channels. ACI's real scope is service-dependent
             // (router or model), resolved when ACI becomes a first-party router.
             UpstreamProvider::OpenAiCompatible
@@ -262,6 +262,18 @@ pub struct AttestationUpstreamTarget {
     pub base_url: String,
     /// The upstream's own model id (some providers need it as a query param).
     pub upstream_model_id: String,
+    pub bearer_token: Option<String>,
+    pub connect_timeout_seconds: u64,
+    pub read_timeout_seconds: u64,
+}
+
+/// Connection details for polling an upstream node's serving metrics. This is
+/// intentionally not part of [`UpstreamConfigSnapshot`] because it carries the
+/// upstream bearer token.
+#[derive(Debug, Clone)]
+pub struct UpstreamMetricsTarget {
+    pub upstream_name: String,
+    pub base_url: String,
     pub bearer_token: Option<String>,
     pub connect_timeout_seconds: u64,
     pub read_timeout_seconds: u64,
@@ -413,6 +425,25 @@ impl UpstreamConfigManager {
                 .read_timeout_seconds
                 .unwrap_or(self.options.read_timeout_seconds),
         })
+    }
+
+    pub fn metrics_targets(&self) -> Vec<UpstreamMetricsTarget> {
+        let state = self.state.read().unwrap_or_else(|p| p.into_inner()).clone();
+        state
+            .config
+            .iter()
+            .map(|cfg| UpstreamMetricsTarget {
+                upstream_name: cfg.name.clone(),
+                base_url: cfg.base_url.trim_end_matches('/').to_string(),
+                bearer_token: cfg.bearer_token.clone(),
+                connect_timeout_seconds: cfg
+                    .connect_timeout_seconds
+                    .unwrap_or(self.options.connect_timeout_seconds),
+                read_timeout_seconds: cfg
+                    .read_timeout_seconds
+                    .unwrap_or(self.options.read_timeout_seconds),
+            })
+            .collect()
     }
 
     pub fn snapshot(&self) -> UpstreamConfigSnapshot {

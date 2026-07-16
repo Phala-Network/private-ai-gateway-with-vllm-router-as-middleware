@@ -13,7 +13,7 @@ mod common;
 
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body, Bytes};
-use axum::http::{header::CONTENT_TYPE, StatusCode};
+use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::post, Json, Router};
 use futures_util::{stream, StreamExt};
@@ -40,6 +40,7 @@ use common::{event_from_request, StaticKeyProvider, StubQuoter};
 #[derive(Default)]
 struct CapturedCalls {
     bodies: Mutex<Vec<Value>>,
+    headers: Mutex<Vec<HashMap<String, String>>>,
 }
 
 struct MockUpstream {
@@ -184,12 +185,17 @@ async fn spawn_openai_upstream(
     let response_body = Arc::new(body);
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(move |raw: Bytes| {
+        post(move |headers: HeaderMap, raw: Bytes| {
             let response_body = response_body.clone();
             let calls = calls.clone();
             async move {
                 let parsed = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
                 calls.bodies.lock().unwrap().push(parsed);
+                calls
+                    .headers
+                    .lock()
+                    .unwrap()
+                    .push(capture_headers(&headers));
                 let status = StatusCode::from_u16(status).unwrap();
                 let mut body = (*response_body).clone();
                 if let Some(obj) = body.as_object_mut() {
@@ -210,11 +216,16 @@ async fn spawn_openai_upstream(
 async fn spawn_openai_streaming_upstream(id: &'static str, calls: Arc<CapturedCalls>) -> String {
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(move |raw: Bytes| {
+        post(move |headers: HeaderMap, raw: Bytes| {
             let calls = calls.clone();
             async move {
                 let parsed = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
                 calls.bodies.lock().unwrap().push(parsed);
+                calls
+                    .headers
+                    .lock()
+                    .unwrap()
+                    .push(capture_headers(&headers));
                 let first = format!(
                     "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\
                      \"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"hi\"}}}}]}}\n\n"
@@ -243,6 +254,18 @@ async fn spawn_openai_streaming_upstream(id: &'static str, calls: Arc<CapturedCa
     format!("http://{addr}")
 }
 
+fn capture_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
+}
+
 fn middleware(manager: Arc<UpstreamConfigManager>, config: MiddlewareConfig) -> Middleware {
     Middleware::new(&config, manager).unwrap()
 }
@@ -263,6 +286,7 @@ fn chat_input(model: &str, content: &str) -> CompletionInput {
         upstream_required: true,
         request_id: "req-1".to_string(),
         user_model: Some(model.to_string()),
+        user_tier: None,
         stream: false,
     }
 }
@@ -405,6 +429,70 @@ async fn forwarding_uses_selected_route_and_finalizes_receipt() {
         calls_a.bodies.lock().unwrap()[0]["model"],
         json!("up-a"),
         "selected route must rewrite the public model to its upstream model"
+    );
+}
+
+#[tokio::test]
+async fn untrusted_user_tier_header_is_not_forwarded_by_default() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_upstream(
+        "chat-a",
+        200,
+        json!({"object":"chat.completion","model":"up-a","choices":[]}),
+        calls.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![upstream_config(
+        "gpu-a", &upstream, "gpt-test", "up-a",
+    )]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default());
+    let mut input = chat_input("gpt-test", "hello");
+    input.user_tier = Some("premium".to_string());
+
+    let (status, _, _) = response_parts(mw.handle_completion(&service, input).await).await;
+
+    assert_eq!(status, 200);
+    let headers = calls.headers.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert!(
+        !headers[0].contains_key("x-user-tier"),
+        "untrusted public x-user-tier must not reach PIG"
+    );
+}
+
+#[tokio::test]
+async fn trusted_user_tier_header_is_forwarded_when_enabled() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_upstream(
+        "chat-a",
+        200,
+        json!({"object":"chat.completion","model":"up-a","choices":[]}),
+        calls.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![upstream_config(
+        "gpu-a", &upstream, "gpt-test", "up-a",
+    )]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            trusted_user_tier_header: true,
+            ..Default::default()
+        },
+    );
+    let mut input = chat_input("gpt-test", "hello");
+    input.user_tier = Some("premium".to_string());
+
+    let (status, _, _) = response_parts(mw.handle_completion(&service, input).await).await;
+
+    assert_eq!(status, 200);
+    let headers = calls.headers.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(
+        headers[0].get("x-user-tier").map(String::as_str),
+        Some("premium")
     );
 }
 

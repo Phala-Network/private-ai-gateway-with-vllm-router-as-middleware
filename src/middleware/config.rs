@@ -2,7 +2,7 @@
 //!
 //! Selected through the gateway's optional `middleware` config section. This
 //! fork intentionally supports one middleware shape: one public model routed
-//! across multiple configured upstreams with cache-aware and load-aware ordering.
+//! across multiple configured upstreams with cache-aware and PIG-aware ordering.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,15 @@ pub struct MiddlewareConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub max_history_per_route: usize,
+    /// Background upstream `/v1/metrics` polling interval. `0` disables metric
+    /// polling and falls back to gateway-local in-flight routing only.
+    pub metrics_poll_ms: u64,
+    pub metrics_timeout_ms: u64,
+    pub metrics_stale_ms: u64,
+    pub metrics_path: String,
+    /// Trust inbound `x-user-tier` for routing and upstream forwarding. Keep
+    /// disabled unless a trusted front door strips or sets the header.
+    pub trusted_user_tier_header: bool,
     pub default_engine: Option<Engine>,
     /// SSE keep-alive interval for streaming responses. Defaults to 10_000 ms;
     /// `0` disables the heartbeat.
@@ -34,6 +43,11 @@ impl Default for MiddlewareConfig {
             balance_abs_threshold: 64,
             balance_rel_threshold: 1.50,
             max_history_per_route: 256,
+            metrics_poll_ms: 1_000,
+            metrics_timeout_ms: 800,
+            metrics_stale_ms: 3_000,
+            metrics_path: "/v1/metrics".to_string(),
+            trusted_user_tier_header: false,
             default_engine: None,
             sse_keepalive_ms: None,
         }

@@ -46,6 +46,7 @@ pub struct CompletionInput {
     pub upstream_required: bool,
     pub request_id: String,
     pub user_model: Option<String>,
+    pub user_tier: Option<String>,
     pub stream: bool,
 }
 
@@ -67,6 +68,7 @@ pub(super) async fn run(
         upstream_required,
         request_id,
         user_model,
+        user_tier,
         stream,
     } = input;
 
@@ -102,7 +104,7 @@ pub(super) async fn run(
         request_id,
         user_model,
         target_route_id: None,
-        user_tier: None,
+        user_tier,
     };
 
     let journal = MiddlewareReceiptJournal::default();

@@ -2,8 +2,9 @@
 //!
 //! PAG still performs the verified upstream forward and receipt finalization.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
@@ -13,7 +14,8 @@ use serde_json::{json, Value};
 
 use crate::aggregator::service::AciService;
 use crate::aggregator::upstream_config::{
-    PublicUpstreamConfig, UpstreamConfigManager, UpstreamConfigSnapshot, UpstreamProvider,
+    PublicUpstreamConfig, UpstreamConfigManager, UpstreamConfigSnapshot, UpstreamMetricsTarget,
+    UpstreamProvider,
 };
 
 use super::completion::{self, CompletionInput};
@@ -27,6 +29,7 @@ const MAX_ROUTING_HISTORY_CHARS: usize = 16_384;
 #[derive(Clone)]
 struct RouterRoute {
     route_id: String,
+    upstream_name: String,
     candidate: RouteCandidate,
 }
 
@@ -43,7 +46,55 @@ struct RouteStats {
 struct RouterState {
     stats: HashMap<String, RouteStats>,
     history: HashMap<String, HashMap<String, Vec<String>>>,
+    upstream_metrics: HashMap<String, UpstreamMetrics>,
 }
+
+#[derive(Default, Clone)]
+struct UpstreamMetrics {
+    ok: bool,
+    error: Option<String>,
+    updated_at: Option<Instant>,
+    observed_running: Option<f64>,
+    observed_waiting: Option<f64>,
+    global_limit: Option<f64>,
+    basic_limit: Option<f64>,
+    basic_inflight: Option<f64>,
+    premium_inflight: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserTier {
+    Basic,
+    Premium,
+}
+
+impl UserTier {
+    fn from_header(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("premium") => Self::Premium,
+            _ => Self::Basic,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Premium => "premium",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RoutePressure {
+    blocked: bool,
+    metrics_missing: bool,
+    waiting: u64,
+    fullness_milli: u64,
+    effective_running: usize,
+    processed: u64,
+}
+
+type RouteOrderKey = (u8, u8, u64, u64, usize, u64, String);
 
 pub(super) struct RouterBackend {
     upstream_config: Arc<UpstreamConfigManager>,
@@ -76,10 +127,12 @@ impl RouterBackend {
         {
             return Err("middleware.public_model must not be empty".to_string());
         }
+        let state = Arc::new(Mutex::new(RouterState::default()));
+        spawn_metrics_poller(config.clone(), upstream_config.clone(), state.clone());
         Ok(Self {
             upstream_config,
             config: config.clone(),
-            state: Arc::new(Mutex::new(RouterState::default())),
+            state,
         })
     }
 
@@ -120,6 +173,7 @@ impl RouterBackend {
         public_model: &str,
         input: &CompletionInput,
     ) -> (Vec<RouterRoute>, Option<RouteSelection>) {
+        let tier = self.request_tier(input);
         let requested_model = input.params.get("model").and_then(Value::as_str);
         if requested_model != Some(public_model) {
             return (Vec::new(), None);
@@ -129,7 +183,7 @@ impl RouterBackend {
         let routing_text = bounded_routing_text(&input.params, input.endpoint);
         let selected = {
             let mut state = self.state.lock().expect("router state poisoned");
-            state.select(public_model, &routing_text, &routes, &self.config)
+            state.select(public_model, &routing_text, &routes, &self.config, tier)
         };
         let Some(selected) = selected.clone() else {
             return (routes, None);
@@ -142,7 +196,9 @@ impl RouterBackend {
                 .map(|route| {
                     (
                         route.route_id.clone(),
-                        state.stats.get(&route.route_id).map_or(0, |s| s.running),
+                        state
+                            .route_pressure(route, &self.config, tier)
+                            .effective_running,
                     )
                 })
                 .collect::<HashMap<_, _>>()
@@ -189,6 +245,7 @@ impl RouterBackend {
                     "selected_by_order": stats.selected_by_order,
                     "history_samples": history_samples,
                     "bearer_token_configured": upstream.bearer_token_configured,
+                    "pig_metrics": state.metrics_admin_json(&upstream.name, &self.config),
                 }));
             }
         }
@@ -271,13 +328,19 @@ impl RouterBackend {
                 );
             }
         };
+        let mut input = input;
         let (routes, selected) = self.ordered_routes(&public_model, &input);
+        let user_tier = self.request_tier(&input);
+        if !self.config.trusted_user_tier_header {
+            input.user_tier = None;
+        }
         let route_in_flight = selected
             .as_ref()
             .map(|selection| RouteInFlight::start(self.state.clone(), selection));
         if let Some(selection) = selected.as_ref() {
             tracing::debug!(
                 public_model,
+                user_tier = user_tier.as_str(),
                 selected_route = %selection.route_id,
                 reason = selection.reason,
                 cache_match_rate = selection.cache_match_rate,
@@ -297,6 +360,14 @@ impl RouterBackend {
             route_in_flight,
         )
         .await
+    }
+
+    fn request_tier(&self, input: &CompletionInput) -> UserTier {
+        if self.config.trusted_user_tier_header {
+            UserTier::from_header(input.user_tier.as_deref())
+        } else {
+            UserTier::Basic
+        }
     }
 }
 
@@ -351,16 +422,84 @@ impl RouterState {
         }
     }
 
-    fn least_loaded<'a>(&self, routes: &'a [RouterRoute]) -> Option<&'a RouterRoute> {
+    fn least_loaded<'a>(
+        &self,
+        routes: &'a [RouterRoute],
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> Option<&'a RouterRoute> {
         routes.iter().min_by(|a, b| {
-            self.route_order_key(&a.route_id)
-                .cmp(&self.route_order_key(&b.route_id))
+            self.route_order_key(a, config, tier)
+                .cmp(&self.route_order_key(b, config, tier))
         })
     }
 
-    fn route_order_key(&self, route_id: &str) -> (usize, u64, String) {
-        let stats = self.stats.get(route_id).cloned().unwrap_or_default();
-        (stats.running, stats.processed, route_id.to_string())
+    fn route_order_key(
+        &self,
+        route: &RouterRoute,
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> RouteOrderKey {
+        let pressure = self.route_pressure(route, config, tier);
+        (
+            u8::from(pressure.blocked),
+            u8::from(pressure.metrics_missing),
+            pressure.waiting,
+            pressure.fullness_milli,
+            pressure.effective_running,
+            pressure.processed,
+            route.route_id.clone(),
+        )
+    }
+
+    fn route_pressure(
+        &self,
+        route: &RouterRoute,
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> RoutePressure {
+        let stats = self.stats.get(&route.route_id).cloned().unwrap_or_default();
+        let local_running = stats.running;
+        let Some(metrics) = self.upstream_metrics.get(&route.upstream_name) else {
+            return RoutePressure {
+                blocked: false,
+                metrics_missing: true,
+                waiting: 0,
+                fullness_milli: 0,
+                effective_running: local_running,
+                processed: stats.processed,
+            };
+        };
+        if metrics.is_stale(config) || !metrics.ok {
+            return RoutePressure {
+                blocked: false,
+                metrics_missing: true,
+                waiting: 0,
+                fullness_milli: 0,
+                effective_running: local_running,
+                processed: stats.processed,
+            };
+        }
+
+        let observed_running = metrics.observed_running.unwrap_or(0.0).max(0.0);
+        let observed_waiting = metrics.observed_waiting.unwrap_or(0.0).max(0.0);
+        let global_fullness = ratio_milli(observed_running, metrics.global_limit);
+        let tier_fullness = match tier {
+            UserTier::Premium => global_fullness,
+            UserTier::Basic => global_fullness.max(ratio_milli(
+                metrics.basic_inflight.unwrap_or(0.0).max(0.0),
+                metrics.basic_limit,
+            )),
+        };
+        let effective_running = local_running.max(observed_running.ceil() as usize);
+        RoutePressure {
+            blocked: observed_waiting > 0.0 || tier_fullness >= 1_000,
+            metrics_missing: false,
+            waiting: observed_waiting.ceil() as u64,
+            fullness_milli: tier_fullness,
+            effective_running,
+            processed: stats.processed,
+        }
     }
 
     fn select(
@@ -369,6 +508,7 @@ impl RouterState {
         text: &str,
         routes: &[RouterRoute],
         config: &MiddlewareConfig,
+        tier: UserTier,
     ) -> Option<RouteSelection> {
         if routes.is_empty() {
             return None;
@@ -396,7 +536,7 @@ impl RouterState {
         let (min_load, max_load) = routes
             .iter()
             .fold((usize::MAX, 0usize), |(min, max), route| {
-                let load = self.stats.get(&route.route_id).map_or(0, |s| s.running);
+                let load = self.route_pressure(route, config, tier).effective_running;
                 (min.min(load), max.max(load))
             });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
@@ -404,8 +544,8 @@ impl RouterState {
             && (max_load as f32) > (min_load as f32 * config.balance_rel_threshold);
 
         let selected = if imbalanced || text.is_empty() {
-            self.least_loaded(routes).map(|route| {
-                let running_at_select = self.stats.get(&route.route_id).map_or(0, |s| s.running);
+            self.least_loaded(routes, config, tier).map(|route| {
+                let pressure = self.route_pressure(route, config, tier);
                 RouteSelection {
                     route_id: route.route_id.clone(),
                     reason: if imbalanced {
@@ -414,11 +554,11 @@ impl RouterState {
                         "no_text"
                     },
                     cache_match_rate: 0.0,
-                    running_at_select,
+                    running_at_select: pressure.effective_running,
                 }
             })
         } else {
-            self.select_cache_aware(model, text, routes, config)
+            self.select_cache_aware(model, text, routes, config, tier)
         }?;
 
         self.record_history(
@@ -436,10 +576,11 @@ impl RouterState {
         text: &str,
         routes: &[RouterRoute],
         config: &MiddlewareConfig,
+        tier: UserTier,
     ) -> Option<RouteSelection> {
         let input_chars = text.chars().count().max(1);
         let history = self.history.get(model);
-        let mut best: Option<(&str, f32, (usize, u64, String))> = None;
+        let mut best: Option<(&RouterRoute, f32, RouteOrderKey)> = None;
         for route in routes {
             let matched = history
                 .and_then(|by_route| by_route.get(&route.route_id))
@@ -452,7 +593,7 @@ impl RouterState {
                 })
                 .unwrap_or(0);
             let rate = matched as f32 / input_chars as f32;
-            let order_key = self.route_order_key(&route.route_id);
+            let order_key = self.route_order_key(route, config, tier);
             let replace = match best.as_ref() {
                 None => true,
                 Some((_, best_rate, best_key)) => {
@@ -460,29 +601,63 @@ impl RouterState {
                 }
             };
             if replace {
-                best = Some((&route.route_id, rate, order_key));
+                best = Some((route, rate, order_key));
             }
         }
-        let (route_id, rate, _) = best?;
-        if rate > config.cache_threshold {
-            let running_at_select = self.stats.get(route_id).map_or(0, |s| s.running);
+        let (cache_route, rate, _) = best?;
+        let least = self.least_loaded(routes, config, tier)?;
+        if rate > config.cache_threshold
+            && self.cache_route_is_acceptable(cache_route, least, config, tier)
+        {
+            let pressure = self.route_pressure(cache_route, config, tier);
             Some(RouteSelection {
-                route_id: route_id.to_string(),
+                route_id: cache_route.route_id.clone(),
                 reason: "cache",
                 cache_match_rate: rate,
-                running_at_select,
+                running_at_select: pressure.effective_running,
             })
         } else {
-            self.least_loaded(routes).map(|route| {
-                let running_at_select = self.stats.get(&route.route_id).map_or(0, |s| s.running);
-                RouteSelection {
-                    route_id: route.route_id.clone(),
-                    reason: "least_running",
-                    cache_match_rate: rate,
-                    running_at_select,
-                }
+            let pressure = self.route_pressure(least, config, tier);
+            Some(RouteSelection {
+                route_id: least.route_id.clone(),
+                reason: "least_running",
+                cache_match_rate: rate,
+                running_at_select: pressure.effective_running,
             })
         }
+    }
+
+    fn cache_route_is_acceptable(
+        &self,
+        cache_route: &RouterRoute,
+        least_route: &RouterRoute,
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> bool {
+        let cache = self.route_pressure(cache_route, config, tier);
+        let least = self.route_pressure(least_route, config, tier);
+        if cache.blocked && !least.blocked {
+            return false;
+        }
+        if cache.metrics_missing && !least.metrics_missing {
+            return false;
+        }
+        if cache.waiting > 0 && least.waiting == 0 {
+            return false;
+        }
+        if cache.fullness_milli > least.fullness_milli.saturating_add(250) {
+            return false;
+        }
+        let gap = cache
+            .effective_running
+            .saturating_sub(least.effective_running);
+        if gap > config.balance_abs_threshold
+            && (cache.effective_running as f32)
+                > (least.effective_running as f32 * config.balance_rel_threshold)
+        {
+            return false;
+        }
+        true
     }
 
     fn record_history(&mut self, model: &str, route_id: &str, text: &str, max_samples: usize) {
@@ -502,6 +677,217 @@ impl RouterState {
             samples.drain(0..overflow);
         }
     }
+
+    fn update_upstream_metrics(&mut self, upstream_name: String, metrics: UpstreamMetrics) {
+        self.upstream_metrics.insert(upstream_name, metrics);
+    }
+
+    fn retain_upstream_metrics(&mut self, upstream_names: &HashSet<String>) {
+        self.upstream_metrics
+            .retain(|name, _| upstream_names.contains(name));
+    }
+
+    fn metrics_admin_json(&self, upstream_name: &str, config: &MiddlewareConfig) -> Value {
+        let Some(metrics) = self.upstream_metrics.get(upstream_name) else {
+            return json!({
+                "ok": false,
+                "stale": true,
+                "error": "not_collected",
+            });
+        };
+        json!({
+            "ok": metrics.ok,
+            "stale": metrics.is_stale(config),
+            "error": metrics.error,
+            "observed_running": metrics.observed_running,
+            "observed_waiting": metrics.observed_waiting,
+            "global_limit": metrics.global_limit,
+            "basic_limit": metrics.basic_limit,
+            "basic_inflight": metrics.basic_inflight,
+            "premium_inflight": metrics.premium_inflight,
+            "age_ms": metrics.age_ms(),
+        })
+    }
+}
+
+impl UpstreamMetrics {
+    fn collected_error(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(message.into()),
+            updated_at: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    fn is_stale(&self, config: &MiddlewareConfig) -> bool {
+        let Some(updated_at) = self.updated_at else {
+            return true;
+        };
+        updated_at.elapsed() > Duration::from_millis(config.metrics_stale_ms)
+    }
+
+    fn age_ms(&self) -> Option<u64> {
+        self.updated_at
+            .map(|updated_at| updated_at.elapsed().as_millis() as u64)
+    }
+}
+
+fn ratio_milli(value: f64, limit: Option<f64>) -> u64 {
+    let Some(limit) = limit else {
+        return 0;
+    };
+    if limit <= 0.0 {
+        return 0;
+    }
+    ((value / limit) * 1_000.0).max(0.0).round() as u64
+}
+
+fn spawn_metrics_poller(
+    config: MiddlewareConfig,
+    upstream_config: Arc<UpstreamConfigManager>,
+    state: Arc<Mutex<RouterState>>,
+) {
+    if config.metrics_poll_ms == 0 {
+        return;
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(config.metrics_timeout_ms))
+            .timeout(Duration::from_millis(config.metrics_timeout_ms))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(error = %err, "router middleware could not build metrics client");
+                return;
+            }
+        };
+        let poll = Duration::from_millis(config.metrics_poll_ms);
+        loop {
+            let targets = upstream_config.metrics_targets();
+            let live_names = targets
+                .iter()
+                .map(|target| target.upstream_name.clone())
+                .collect::<HashSet<_>>();
+            let fetched = futures_util::future::join_all(targets.into_iter().map(|target| {
+                let upstream_name = target.upstream_name.clone();
+                async {
+                    let metrics = fetch_upstream_metrics(&client, &config, target).await;
+                    (upstream_name, metrics)
+                }
+            }))
+            .await;
+            for (upstream_name, metrics) in fetched {
+                let mut state = state.lock().expect("router state poisoned");
+                state.update_upstream_metrics(upstream_name, metrics);
+            }
+            {
+                let mut state = state.lock().expect("router state poisoned");
+                state.retain_upstream_metrics(&live_names);
+            }
+            tokio::time::sleep(poll).await;
+        }
+    });
+}
+
+async fn fetch_upstream_metrics(
+    client: &reqwest::Client,
+    config: &MiddlewareConfig,
+    target: UpstreamMetricsTarget,
+) -> UpstreamMetrics {
+    let path = if config.metrics_path.starts_with('/') {
+        config.metrics_path.as_str()
+    } else {
+        "/v1/metrics"
+    };
+    let url = format!("{}{}", target.base_url.trim_end_matches('/'), path);
+    let mut req = client.get(url).header("accept", "text/plain");
+    if let Some(token) = target.bearer_token.as_deref() {
+        req = req.bearer_auth(token);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return UpstreamMetrics::collected_error(format!("http_{status}"));
+            }
+            match resp.text().await {
+                Ok(body) => parse_upstream_metrics(&body),
+                Err(err) => UpstreamMetrics::collected_error(format!("read_error: {err}")),
+            }
+        }
+        Err(err) => UpstreamMetrics::collected_error(format!("fetch_error: {err}")),
+    }
+}
+
+fn parse_upstream_metrics(text: &str) -> UpstreamMetrics {
+    let mut metrics = UpstreamMetrics {
+        ok: true,
+        updated_at: Some(Instant::now()),
+        ..Default::default()
+    };
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name_and_labels, value)) = parse_prometheus_sample(line) else {
+            continue;
+        };
+        let (name, labels) = split_metric_name_labels(name_and_labels);
+        match name {
+            "pig_dynamic_observed_running" => metrics.observed_running = Some(value),
+            "pig_dynamic_observed_waiting" => metrics.observed_waiting = Some(value),
+            "pig_dynamic_global_limit" => metrics.global_limit = Some(value),
+            "pig_tier_basic_limit" => metrics.basic_limit = Some(value),
+            "pig_tier_inflight" => match labels.get("tier").map(String::as_str) {
+                Some("basic") => metrics.basic_inflight = Some(value),
+                Some("premium") => metrics.premium_inflight = Some(value),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    if metrics.observed_running.is_none()
+        && metrics.observed_waiting.is_none()
+        && metrics.global_limit.is_none()
+        && metrics.basic_limit.is_none()
+    {
+        return UpstreamMetrics::collected_error("pig_metrics_missing");
+    }
+    metrics
+}
+
+fn parse_prometheus_sample(line: &str) -> Option<(&str, f64)> {
+    let split_at = line.rfind(|c: char| c.is_whitespace())?;
+    let (left, right) = line.split_at(split_at);
+    right
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|value| (left.trim(), value))
+}
+
+fn split_metric_name_labels(input: &str) -> (&str, HashMap<String, String>) {
+    let Some(open) = input.find('{') else {
+        return (input, HashMap::new());
+    };
+    let name = &input[..open];
+    let labels_text = input[open + 1..].trim_end_matches('}');
+    let mut labels = HashMap::new();
+    for part in labels_text.split(',') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        labels.insert(
+            key.trim().to_string(),
+            value.trim().trim_matches('"').to_string(),
+        );
+    }
+    (name, labels)
 }
 
 fn route_from_upstream(
@@ -512,6 +898,7 @@ fn route_from_upstream(
     let route_id = format!("{}:{public_model}", upstream.name);
     RouterRoute {
         route_id: route_id.clone(),
+        upstream_name: upstream.name.clone(),
         candidate: RouteCandidate {
             route_id,
             format: provider_format(upstream.provider),
@@ -683,14 +1070,14 @@ mod tests {
         let routes = vec![test_route("a:m"), test_route("b:m")];
         assert_eq!(
             state
-                .select("m", "hello world", &routes, &config)
+                .select("m", "hello world", &routes, &config, UserTier::Basic)
                 .map(|s| s.route_id)
                 .as_deref(),
             Some("a:m")
         );
         assert_eq!(
             state
-                .select("m", "hello there", &routes, &config)
+                .select("m", "hello there", &routes, &config, UserTier::Basic)
                 .map(|s| s.route_id)
                 .as_deref(),
             Some("a:m")
@@ -710,16 +1097,154 @@ mod tests {
         let routes = vec![test_route("a:m"), test_route("b:m")];
         let first = {
             let mut locked = state.lock().unwrap();
-            locked.select("m", "aaaa", &routes, &config).unwrap()
+            locked
+                .select("m", "aaaa", &routes, &config, UserTier::Basic)
+                .unwrap()
         };
         assert_eq!(first.route_id, "a:m");
         drop(RouteInFlight::start(state.clone(), &first));
 
         let second = {
             let mut locked = state.lock().unwrap();
-            locked.select("m", "zzzz", &routes, &config).unwrap()
+            locked
+                .select("m", "zzzz", &routes, &config, UserTier::Basic)
+                .unwrap()
         };
         assert_eq!(second.route_id, "b:m");
+    }
+
+    #[test]
+    fn pig_pressure_overrides_cache_affinity() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig {
+            cache_threshold: 0.25,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            max_history_per_route: 16,
+            ..Default::default()
+        };
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        assert_eq!(
+            state
+                .select("m", "stable prefix one", &routes, &config, UserTier::Basic)
+                .map(|s| s.route_id)
+                .as_deref(),
+            Some("a:m")
+        );
+        state.update_upstream_metrics(
+            "a".to_string(),
+            UpstreamMetrics {
+                ok: true,
+                updated_at: Some(Instant::now()),
+                observed_running: Some(10.0),
+                observed_waiting: Some(1.0),
+                global_limit: Some(10.0),
+                basic_limit: Some(9.0),
+                basic_inflight: Some(9.0),
+                premium_inflight: Some(0.0),
+                error: None,
+            },
+        );
+        state.update_upstream_metrics(
+            "b".to_string(),
+            UpstreamMetrics {
+                ok: true,
+                updated_at: Some(Instant::now()),
+                observed_running: Some(1.0),
+                observed_waiting: Some(0.0),
+                global_limit: Some(10.0),
+                basic_limit: Some(9.0),
+                basic_inflight: Some(1.0),
+                premium_inflight: Some(0.0),
+                error: None,
+            },
+        );
+
+        let selected = state
+            .select("m", "stable prefix two", &routes, &config, UserTier::Basic)
+            .unwrap();
+        assert_eq!(selected.route_id, "b:m");
+        assert_eq!(selected.reason, "least_running");
+    }
+
+    #[test]
+    fn premium_does_not_treat_basic_full_as_blocked() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig {
+            cache_threshold: 0.25,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            max_history_per_route: 16,
+            ..Default::default()
+        };
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.update_upstream_metrics(
+            "a".to_string(),
+            UpstreamMetrics {
+                ok: true,
+                updated_at: Some(Instant::now()),
+                observed_running: Some(4.0),
+                observed_waiting: Some(0.0),
+                global_limit: Some(10.0),
+                basic_limit: Some(4.0),
+                basic_inflight: Some(4.0),
+                premium_inflight: Some(0.0),
+                error: None,
+            },
+        );
+        state.update_upstream_metrics(
+            "b".to_string(),
+            UpstreamMetrics {
+                ok: true,
+                updated_at: Some(Instant::now()),
+                observed_running: Some(5.0),
+                observed_waiting: Some(0.0),
+                global_limit: Some(10.0),
+                basic_limit: Some(8.0),
+                basic_inflight: Some(2.0),
+                premium_inflight: Some(0.0),
+                error: None,
+            },
+        );
+
+        let basic = state
+            .select("m", "cold-basic", &routes, &config, UserTier::Basic)
+            .unwrap();
+        let mut premium_state = RouterState::default();
+        premium_state.update_upstream_metrics(
+            "a".to_string(),
+            UpstreamMetrics {
+                ok: true,
+                updated_at: Some(Instant::now()),
+                observed_running: Some(4.0),
+                observed_waiting: Some(0.0),
+                global_limit: Some(10.0),
+                basic_limit: Some(4.0),
+                basic_inflight: Some(4.0),
+                premium_inflight: Some(0.0),
+                error: None,
+            },
+        );
+        premium_state.update_upstream_metrics(
+            "b".to_string(),
+            UpstreamMetrics {
+                ok: true,
+                updated_at: Some(Instant::now()),
+                observed_running: Some(5.0),
+                observed_waiting: Some(0.0),
+                global_limit: Some(10.0),
+                basic_limit: Some(8.0),
+                basic_inflight: Some(2.0),
+                premium_inflight: Some(0.0),
+                error: None,
+            },
+        );
+        let premium = premium_state
+            .select("m", "cold-premium", &routes, &config, UserTier::Premium)
+            .unwrap();
+
+        assert_eq!(basic.route_id, "b:m");
+        assert_eq!(premium.route_id, "a:m");
     }
 
     #[test]
@@ -776,8 +1301,10 @@ mod tests {
     }
 
     fn test_route(route_id: &str) -> RouterRoute {
+        let upstream_name = route_id.split(':').next().unwrap_or(route_id).to_string();
         RouterRoute {
             route_id: route_id.to_string(),
+            upstream_name,
             candidate: RouteCandidate {
                 route_id: route_id.to_string(),
                 format: ProviderFormat::Openai,

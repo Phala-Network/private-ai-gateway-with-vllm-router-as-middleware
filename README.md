@@ -123,10 +123,11 @@ flowchart LR
 2. The user sends an OpenAI-compatible request over ordinary TLS or ACI E2EE.
 3. The frontend records the user-facing request and downstream E2EE state.
 4. Optional router middleware orders the configured upstream candidates with
-   cache-aware and load-aware signals. Under balanced load it prefers warmed
-   prefixes; under pressure it drains toward the least-running route; when
-   routes are equally idle it uses processed-count tie-breaking so cold traffic
-   still spreads across nodes. Middleware does not create verification facts.
+   cache-aware and PIG-aware load signals. It polls upstream `/v1/metrics` in
+   the background, avoids PIG waiting/full routes before forwarding, preserves
+   warmed-prefix affinity when pressure is acceptable, and falls back to
+   gateway-local in-flight counters when metrics are missing or stale.
+   Middleware does not create verification facts.
 5. The backend validates the target route, verifies or refreshes the upstream
    lease, enforces the verified channel binding, and forwards the provider
    request.
@@ -430,16 +431,22 @@ Deployment files:
 The gateway runs in direct-upstream mode unless a `middleware` section is
 configured. When enabled, the middleware is the built-in single-model router: it
 derives candidates from the live upstream config and orders them in-process with
-cache-aware affinity, least-running pressure handling, and processed-count
-tie-breaking for idle cold traffic. It replaces the previous external adapter/vLLM
-Router hop and does not use a `proxy_url`.
+cache-aware affinity, PIG metrics pressure handling, and processed-count
+tie-breaking for idle cold traffic. Basic requests treat both global PIG limit
+and basic-tier limit as capacity constraints; premium requests use global
+headroom so a basic-full node can still serve premium traffic. The inbound
+`x-user-tier` header is ignored and stripped by default; enable
+`middleware.trusted_user_tier_header` only behind a trusted front door that
+sets or sanitizes it. This replaces the previous external adapter/vLLM Router
+hop and does not use a `proxy_url`.
 
 Streaming responses stay streaming across backend, middleware, and frontend.
 Middleware-generated OpenAI-compatible responses are passed through downstream
 E2EE when the original user request used E2EE.
 
 The middleware is configured by the `middleware` section of the static gateway
-config; see the [configuration reference](docs/configuration-reference.md#middleware).
+config; see the [router middleware design](docs/router-middleware.md) and the
+[configuration reference](docs/configuration-reference.md#middleware).
 
 ## API Surface
 
@@ -458,7 +465,7 @@ config; see the [configuration reference](docs/configuration-reference.md#middle
 | `GET /v1/metrics` | Gateway-owned Prometheus metrics. Requires `api_token` when configured. |
 | `GET /v1/admin/upstreams` | Authenticated upstream config snapshot. |
 | `PUT /v1/admin/upstreams` | Authenticated upstream config replacement. |
-| `GET /v1/admin/router` | Authenticated router middleware snapshot when the `middleware` section is enabled. |
+| `GET /v1/admin/router` | Authenticated router middleware snapshot, including redacted PIG metrics status, when the `middleware` section is enabled. |
 
 ## Runtime Configuration
 
@@ -582,6 +589,7 @@ src/aggregator/service.rs      report, forwarding, E2EE, receipt finalization
 src/aggregator/upstream_config.rs runtime upstream config and provider adapters
 src/http/app.rs                Axum HTTP routers and middleware/backend wiring
 docs/                          design notes, configuration reference, provider reviews
+docs/router-middleware.md      router middleware design and operating model
 deploy/                        git-launcher and dstack compose examples
 examples/                      cargo example binaries
 scripts/                       local and Phala smoke tests
@@ -591,6 +599,7 @@ tests/                         unit and integration coverage
 ## More Docs
 
 - [Deployment guide](deploy/README.md)
+- [Router middleware](docs/router-middleware.md)
 - [Configuration reference](docs/configuration-reference.md)
 - [Live E2E test suite](docs/live-e2e-test-suite.md)
 - [Providers (verification + audit)](docs/providers/README.md)

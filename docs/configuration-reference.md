@@ -57,11 +57,16 @@ and receipt finalization remain backend responsibilities. When the section is
 omitted the gateway serves directly.
 
 This fork supports one middleware shape: a single public model routed across
-multiple configured upstreams with cache-aware and load-aware ordering. Under
-balanced load it prefers warmed prefixes, under pressure it drains toward the
-least-running route, and when equally idle it uses processed-count tie-breaking
-so cold traffic still spreads across nodes. It does not use `control_url`,
-`proxy_url`, or an external adapter/vLLM Router process.
+multiple configured upstreams with cache-aware and PIG-aware load ordering. The
+router polls each configured upstream's metrics endpoint in the background and
+uses PIG's observed running, waiting, global limit, and tier counters to avoid
+full or pressured nodes before forwarding. Under balanced pressure it still
+prefers warmed prefixes; when equally idle it uses processed-count tie-breaking
+so cold traffic spreads across nodes. If upstream metrics are unavailable or
+stale, routing falls back to gateway-local in-flight counters instead of
+blocking traffic. It does not use `control_url`, `proxy_url`, or an external
+adapter/vLLM Router process. See [router-middleware.md](router-middleware.md)
+for the selection algorithm and security boundary.
 
 | Field | Default | Use |
 | --- | --- | --- |
@@ -70,6 +75,11 @@ so cold traffic still spreads across nodes. It does not use `control_url`,
 | `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
 | `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
 | `middleware.max_history_per_route` | `256` | Maximum routing-text samples kept per public model and route for prefix matching. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
+| `middleware.metrics_poll_ms` | `1000` | Background upstream metrics polling interval. Set to `0` to disable PIG-aware routing and use only gateway-local in-flight counters. |
+| `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling is concurrent, so one slow upstream does not serially delay the full target set. |
+| `middleware.metrics_stale_ms` | `3000` | Age after which a metrics sample is ignored and the route falls back to local in-flight state. |
+| `middleware.metrics_path` | `/v1/metrics` | Metrics path appended to each upstream base URL. The upstream's configured bearer token is used for metrics auth. |
+| `middleware.trusted_user_tier_header` | `false` | Whether inbound `x-user-tier` is trusted for routing and forwarding to PIG. Keep `false` for public endpoints unless a trusted front door strips or sets this header. With the default, all requests are routed as `basic` and no caller-supplied tier header is forwarded. |
 | `middleware.default_engine` | unset | Optional engine hint put into synthetic route candidates, for example `vllm` or `sglang`. |
 | `middleware.sse_keepalive_ms` | `10000` | Idle keep-alive interval for streaming responses; `0` disables the heartbeat. |
 
@@ -81,6 +91,11 @@ so cold traffic still spreads across nodes. It does not use `control_url`,
     "balance_abs_threshold": 64,
     "balance_rel_threshold": 1.5,
     "max_history_per_route": 256,
+    "metrics_poll_ms": 1000,
+    "metrics_timeout_ms": 800,
+    "metrics_stale_ms": 3000,
+    "metrics_path": "/v1/metrics",
+    "trusted_user_tier_header": false,
     "default_engine": "vllm"
   }
 }
@@ -90,9 +105,16 @@ The route set comes from the active upstream config. Dynamic upstream add/remove
 remains `GET` and `PUT /v1/admin/upstreams` with the gateway admin bearer token.
 The router exposes an authenticated
 `GET /v1/admin/router` snapshot with current route counters, in-flight counts,
-selection counters, history sample counts, router config, and upstream config
-digest. The endpoint returns `404` when the admin token is unset or the
-middleware is not enabled.
+selection counters, history sample counts, redacted PIG metrics status, router
+config, and upstream config digest. The endpoint returns `404` when the admin
+token is unset or the middleware is not enabled. The snapshot never includes
+upstream bearer tokens.
+
+Tier handling is deliberately fail-safe. The router can use PIG's basic and
+premium counters, but it trusts the caller's `x-user-tier` only when
+`middleware.trusted_user_tier_header=true`. Otherwise the router treats the
+request as `basic` and removes the header before forwarding, so a public client
+cannot self-promote into the premium lane.
 
 ## Source Provenance
 

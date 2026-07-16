@@ -12,11 +12,6 @@ Supporting repos:
   `25c25025c556ab2f797eeda3bab433f38a8ffb7a`
 - `nearai/vllm-router` at `cfd353e`
 
-Source reports:
-
-- [router-mode-soundness.md](../../reviews/router-mode-soundness.md)
-- [router-mode-load-balancing-cache.md](../../reviews/router-mode-load-balancing-cache.md)
-
 > **How the gateway verifies this provider:** see [verification.md](verification.md).
 > Status (2026-06 soundness pass): the gateway now parses `report_data` from the
 > verified quote and enforces the nonce + signing-address + TLS-SPKI binding (commit
