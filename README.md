@@ -392,6 +392,11 @@ curl -X PUT \
 The admin view redacts bearer tokens and returns the active `config_digest`.
 If no admin token is configured, the admin endpoint returns `404`.
 
+Set `api_token` in the static gateway config for production deployments. When
+configured, `/v1/models`, `/v1/metrics`, and all OpenAI-compatible inference
+POST endpoints require `Authorization: Bearer <api_token>`. `/health` and ACI
+verification artifacts remain public so clients can verify the workload.
+
 ## Deploy With Git Launcher
 
 The recommended dstack deployment path uses `git-launcher`:
@@ -441,16 +446,16 @@ config; see the [configuration reference](docs/configuration-reference.md#middle
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /` | Basic ACI version, workload id, and keyset digest. |
-| `GET /v1/models` | OpenAI-compatible model list from backend or middleware. |
-| `POST /v1/chat/completions` | OpenAI-compatible chat completions. |
-| `POST /v1/completions` | OpenAI-compatible legacy completions. |
-| `POST /v1/embeddings` | OpenAI-compatible buffered embeddings. |
+| `GET /v1/models` | OpenAI-compatible model list from backend or middleware. Requires `api_token` when configured. |
+| `POST /v1/chat/completions` | OpenAI-compatible chat completions. Requires `api_token` when configured. |
+| `POST /v1/completions` | OpenAI-compatible legacy completions. Requires `api_token` when configured. |
+| `POST /v1/embeddings` | OpenAI-compatible buffered embeddings. Requires `api_token` when configured. |
 | `GET /v1/aci/attestation?nonce=<n>` | Gateway workload identity and keyset evidence. |
 | `GET /v1/aci/receipts/{id}` | Signed ACI receipt by chat id or receipt id. |
 | `GET /v1/aci/sessions/{session_id}` | Attested-session record referenced by a receipt. |
 | `GET /v1/aci/sessions?upstream_name=&model=` | List a provider's imported attested sessions. |
 | `GET /v1/attestation/report` · `GET /v1/signature/{id}` | Legacy dstack-vllm-proxy aliases. |
-| `GET /v1/metrics` | Gateway-owned Prometheus metrics. |
+| `GET /v1/metrics` | Gateway-owned Prometheus metrics. Requires `api_token` when configured. |
 | `GET /v1/admin/upstreams` | Authenticated upstream config snapshot. |
 | `PUT /v1/admin/upstreams` | Authenticated upstream config replacement. |
 | `GET /v1/admin/router` | Authenticated router middleware snapshot when the `middleware` section is enabled. |

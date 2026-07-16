@@ -45,7 +45,9 @@ use private_ai_gateway::aggregator::upstream_config::{
     parse_config_text, UpstreamConfigManager, UpstreamRuntimeOptions, UpstreamVerifierMode,
 };
 use private_ai_gateway::dstack::{DstackAciProvider, DstackAciProviderConfig};
-use private_ai_gateway::http::{build_router_with_admin, build_router_with_admin_and_middleware};
+use private_ai_gateway::http::{
+    build_router_with_admin_and_api, build_router_with_admin_api_and_middleware,
+};
 use private_ai_gateway::middleware::{Middleware, MiddlewareConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -71,6 +73,7 @@ struct GatewayConfigFile {
     state_dir: Option<String>,
     upstream_config_seed_path: Option<String>,
     admin_token: Option<String>,
+    api_token: Option<String>,
     /// Bounded keyset-epoch validity window in seconds (§4.7). Defaults to
     /// [`DEFAULT_KEYSET_EPOCH_WINDOW_SECONDS`] (~4 weeks).
     keyset_epoch_window_seconds: Option<u64>,
@@ -496,6 +499,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     upstream_config.set_session_sink(service.clone());
     spawn_upstream_lifecycle(upstream_config.clone());
 
+    let api_token = gateway_config.api_token.clone();
     let app = if let Some(middleware_config) = middleware_config {
         let middleware = Arc::new(
             Middleware::new(&middleware_config, upstream_config.clone()).map_err(invalid_input)?,
@@ -504,9 +508,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mode = %middleware.name(),
             "private-ai-gateway middleware enabled"
         );
-        build_router_with_admin_and_middleware(service, upstream_config, admin_token, middleware)
+        build_router_with_admin_api_and_middleware(
+            service,
+            upstream_config,
+            admin_token,
+            api_token,
+            middleware,
+        )
     } else {
-        build_router_with_admin(service, upstream_config, admin_token)
+        build_router_with_admin_and_api(service, upstream_config, admin_token, api_token)
     };
 
     tracing::info!(%bind, "private-ai-gateway listening");
@@ -707,13 +717,15 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
                     "public_model": "gemma4-31b-it",
                     "cache_threshold": 0.4,
                     "default_engine": "vllm"
-                }
+                },
+                "api_token": "api-secret"
             }"#,
         )
         .unwrap();
 
         let config = load_gateway_config(config_path.to_str().unwrap()).unwrap();
 
+        assert_eq!(config.api_token.as_deref(), Some("api-secret"));
         let middleware = config.middleware.expect("middleware section must parse");
         assert_eq!(middleware.public_model.as_deref(), Some("gemma4-31b-it"));
         assert_eq!(middleware.cache_threshold, 0.4);

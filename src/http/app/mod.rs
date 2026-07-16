@@ -102,11 +102,12 @@ pub struct AppState {
     pub service: Arc<AciService>,
     pub upstream_config: Option<Arc<UpstreamConfigManager>>,
     pub admin_token: Option<String>,
+    pub api_token: Option<String>,
     middleware: Option<Arc<Middleware>>,
 }
 
 pub fn build_router(service: Arc<AciService>) -> Router {
-    build_router_inner(service, None, None, None)
+    build_router_inner(service, None, None, None, None)
 }
 
 pub fn build_router_with_admin(
@@ -114,7 +115,16 @@ pub fn build_router_with_admin(
     upstream_config: Arc<UpstreamConfigManager>,
     admin_token: Option<String>,
 ) -> Router {
-    build_router_inner(service, Some(upstream_config), admin_token, None)
+    build_router_inner(service, Some(upstream_config), admin_token, None, None)
+}
+
+pub fn build_router_with_admin_and_api(
+    service: Arc<AciService>,
+    upstream_config: Arc<UpstreamConfigManager>,
+    admin_token: Option<String>,
+    api_token: Option<String>,
+) -> Router {
+    build_router_inner(service, Some(upstream_config), admin_token, api_token, None)
 }
 
 /// Build the gateway router with in-process middleware. The middleware chooses
@@ -125,10 +135,27 @@ pub fn build_router_with_admin_and_middleware(
     admin_token: Option<String>,
     middleware: Arc<Middleware>,
 ) -> Router {
+    build_router_with_admin_api_and_middleware(
+        service,
+        upstream_config,
+        admin_token,
+        None,
+        middleware,
+    )
+}
+
+pub fn build_router_with_admin_api_and_middleware(
+    service: Arc<AciService>,
+    upstream_config: Arc<UpstreamConfigManager>,
+    admin_token: Option<String>,
+    api_token: Option<String>,
+    middleware: Arc<Middleware>,
+) -> Router {
     build_router_inner(
         service,
         Some(upstream_config),
         admin_token,
+        api_token,
         Some(middleware),
     )
 }
@@ -137,12 +164,14 @@ fn build_router_inner(
     service: Arc<AciService>,
     upstream_config: Option<Arc<UpstreamConfigManager>>,
     admin_token: Option<String>,
+    api_token: Option<String>,
     middleware: Option<Arc<Middleware>>,
 ) -> Router {
     let state = AppState {
         service,
         upstream_config,
         admin_token,
+        api_token,
         middleware,
     };
     Router::new()

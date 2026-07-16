@@ -36,7 +36,8 @@ use super::error_responses::{
     unknown_downstream_host_response, unsupported_e2ee_response, upstream_config_error_response,
 };
 use super::util::{
-    enforce_admin, enforce_owner, extract_bearer, has_e2ee_headers, header_str, request_host_domain,
+    enforce_admin, enforce_api, enforce_owner, extract_bearer, has_e2ee_headers, header_str,
+    request_host_domain,
 };
 use super::AppState;
 use crate::middleware::errors::Surface;
@@ -76,7 +77,10 @@ pub(super) async fn root(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-pub(super) async fn models(State(state): State<AppState>) -> Response {
+pub(super) async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     if let Some(middleware) = state.middleware.clone() {
         return middleware.handle_catalog("/v1/models").await;
     }
@@ -92,8 +96,12 @@ pub(super) async fn models(State(state): State<AppState>) -> Response {
 // than enumerate routes here. Only meaningful in the middleware topology.
 pub(super) async fn models_subpath(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(rest): Path<String>,
 ) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     let Some(middleware) = state.middleware.clone() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -108,7 +116,13 @@ pub(super) async fn models_subpath(
 
 // Embedding model catalog. The built-in router middleware currently serves only
 // the primary `/v1/models` catalog.
-pub(super) async fn embeddings_models(State(state): State<AppState>) -> Response {
+pub(super) async fn embeddings_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     let Some(middleware) = state.middleware.clone() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -119,7 +133,10 @@ pub(super) async fn embeddings_models(State(state): State<AppState>) -> Response
     middleware.handle_catalog("/v1/embeddings/models").await
 }
 
-pub(super) async fn metrics(State(state): State<AppState>) -> Response {
+pub(super) async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     match state.service.metrics() {
         Ok(snapshot) => {
             let mut headers = HeaderMap::new();
@@ -550,6 +567,10 @@ pub(super) async fn openai_completion_endpoint(
     endpoint_path: &'static str,
     force_buffered: bool,
 ) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
+
     // A revoked keyset backs the receipt-signing, E2EE, and TLS keys this
     // request would use; stop serving inference under it (§4.7).
     if state.service.is_keyset_revoked() {

@@ -14,7 +14,7 @@ use private_ai_gateway::aggregator::service::{
 use private_ai_gateway::aggregator::upstream_config::{
     UpstreamConfigManager, UpstreamRuntimeOptions, UpstreamVerifierMode,
 };
-use private_ai_gateway::http::build_router_with_admin;
+use private_ai_gateway::http::{build_router_with_admin, build_router_with_admin_and_api};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -67,6 +67,29 @@ async fn call(
     let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let body = serde_json::from_slice(&bytes).unwrap();
     (status, body)
+}
+
+async fn call_raw(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: impl Into<Vec<u8>>,
+    auth: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = auth {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    let resp = app
+        .oneshot(req.body(Body::from(body.into())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, bytes.to_vec())
 }
 
 #[tokio::test]
@@ -148,6 +171,65 @@ async fn admin_can_replace_single_upstream_config_file_at_runtime() {
     let (status, models) = call(app, "GET", "/v1/models", Vec::new(), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(models["data"][0]["id"], "public-a");
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn api_token_gates_public_model_and_metrics_surfaces() {
+    let path = temp_config_path();
+    let manager = Arc::new(UpstreamConfigManager::load(&path, runtime_options()).unwrap());
+    let keys = Arc::new(StaticKeyProvider::default());
+    let service = Arc::new(
+        AciService::new_with_upstream_verifier(
+            keys,
+            Arc::new(StubQuoter::default()),
+            manager.backend(),
+            manager.verifier(),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test("private-ai-gateway"),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    );
+    let app = build_router_with_admin_and_api(
+        service,
+        manager,
+        Some("admin-secret".to_string()),
+        Some("api-secret".to_string()),
+    );
+
+    let (status, body) = call(app.clone(), "GET", "/v1/models", Vec::new(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["type"], "unauthorized");
+
+    let (status, body) = call(
+        app.clone(),
+        "GET",
+        "/v1/models",
+        Vec::new(),
+        Some("wrong-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["type"], "forbidden");
+
+    let (status, body) = call(
+        app.clone(),
+        "GET",
+        "/v1/models",
+        Vec::new(),
+        Some("api-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["object"], "list");
+
+    let (status, _) = call_raw(app.clone(), "GET", "/v1/metrics", Vec::new(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _body) = call_raw(app, "GET", "/v1/metrics", Vec::new(), Some("api-secret")).await;
+    assert_eq!(status, StatusCode::OK);
 
     let _ = std::fs::remove_file(path);
 }

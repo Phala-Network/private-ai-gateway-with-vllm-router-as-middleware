@@ -3,6 +3,7 @@
   "state_dir": "/var/lib/private-ai-gateway",
   "upstream_config_seed_path": "/etc/private-ai-gateway/upstreams.seed.json",
   "admin_token": "<long-random-admin-token>",
+  "api_token": "<long-random-api-token>",
   "dstack_endpoint": "unix:/var/run/dstack.sock",
   "middleware": {
     "public_model": "<public-model>",

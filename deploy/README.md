@@ -33,6 +33,7 @@ Prepare an audited gateway commit, then run:
 cd deploy
 PRIVATE_AI_GATEWAY_REPO_COMMIT=<full-40-hex-sha> \
 PRIVATE_AI_GATEWAY_ADMIN_TOKEN=<long-random-admin-token> \
+PRIVATE_AI_GATEWAY_API_TOKEN=<long-random-api-token> \
 PRIVATE_AI_GATEWAY_PUBLIC_MODEL=<public-model> \
 phala-h4xuser deploy -n private-ai-gateway-router -c compose.yaml
 ```
@@ -40,7 +41,7 @@ phala-h4xuser deploy -n private-ai-gateway-router -c compose.yaml
 For local/dev deploys, you can also copy
 [`gateway.env.example`](./gateway.env.example), export those values from your
 shell, and run the same `phala-h4xuser deploy` command. For production, pass
-secrets such as admin tokens through the deployment secret mechanism rather
+secrets such as admin/API tokens through the deployment secret mechanism rather
 than keeping them in a plaintext env file.
 
 `compose.yaml` inlines the launcher config, the static gateway config, and the
@@ -52,7 +53,7 @@ The gateway consumes two JSON files:
 
 | File | Compose config | Runtime role |
 | --- | --- | --- |
-| Static gateway config | `gateway-config` | Startup policy: bind address, TLS certificate bindings, dstack endpoint, admin token, gateway state directory, and read-only seed paths. |
+| Static gateway config | `gateway-config` | Startup policy: bind address, TLS certificate bindings, dstack endpoint, admin token, API token, gateway state directory, and read-only seed paths. |
 | Upstream seed config | `gateway-upstreams` seed copied to `<state_dir>/upstreams.json` on first boot | Initial provider/model routing policy. The live file is replaced by the admin API. |
 
 The checked-in compose starts with an empty upstream seed:
@@ -254,7 +255,7 @@ A verifier checks:
 | --- | --- |
 | Launcher image | The image digest in the attested compose equals `sha256:4437dce18ec713b0991d34bd926d324966b1a0b90fad485b8ddb3f4ed2af138b` and verifies through the `git-launcher-v0.3.0` Sigstore provenance. |
 | Launcher config | `REPO_URL` and `COMMIT_SHA` in `gateway-pin` match the audited gateway commit. |
-| Gateway config | `gateway-config` matches the reviewed startup policy, including TLS certificate bindings, state directory, dstack endpoint, admin token, and read-only input paths. |
+| Gateway config | `gateway-config` matches the reviewed startup policy, including TLS certificate bindings, state directory, dstack endpoint, admin/API tokens, and read-only input paths. |
 | Runtime env | Service `environment:` points at the reviewed gateway config and cache location. |
 | Upstream seed | `gateway-upstreams` is the reviewed initial provider policy. |
 | Gateway report | `/v1/attestation/report` binds the dstack KMS identity, ACI keyset, TLS SPKI if configured, and the git-launcher source provenance when present. |

@@ -30,6 +30,7 @@ This is the smallest practical container config.
   "state_dir": "/var/lib/private-ai-gateway",
   "upstream_config_seed_path": "/etc/private-ai-gateway/upstreams.seed.json",
   "admin_token": "<long-random-admin-token>",
+  "api_token": "<long-random-api-token>",
   "dstack_endpoint": "unix:/var/run/dstack.sock"
 }
 ```
@@ -42,6 +43,7 @@ This is the smallest practical container config.
 | `state_dir` | `/var/lib/private-ai-gateway` | Gateway-owned writable state directory. The active upstream config and attested-session log are derived from this directory. |
 | `upstream_config_seed_path` | unset | Read-only JSON seed copied to `<state_dir>/upstreams.json` only when the active upstream config is missing or empty. |
 | `admin_token` | unset | Bearer token for `GET` and `PUT /v1/admin/upstreams`. When unset, the admin API is not exposed. |
+| `api_token` | unset | Bearer token for `/v1/models`, `/v1/metrics`, and OpenAI-compatible inference POST endpoints. When unset, those endpoints remain open for local development. Production deployments should set it. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `middleware` | unset | Optional middleware section. When present, the gateway runs in-process middleware before the verified backend forward; when unset it serves directly. See [Middleware](#middleware). |
 
@@ -211,3 +213,4 @@ Deployment tooling also uses these variables:
 | `CARGO_TARGET_DIR` | Optional override for Cargo build output. Defaults under `PRIVATE_AI_GATEWAY_CACHE_DIR`. |
 | `PRIVATE_AI_GATEWAY_REPO_COMMIT` | Used by `deploy/compose.yaml` interpolation for the git-launcher `COMMIT_SHA` pin. |
 | `PRIVATE_AI_GATEWAY_ADMIN_TOKEN` | Used by `deploy/compose.yaml` interpolation for the static config's `admin_token`. |
+| `PRIVATE_AI_GATEWAY_API_TOKEN` | Used by `deploy/compose.yaml` interpolation for the static config's `api_token`. |
