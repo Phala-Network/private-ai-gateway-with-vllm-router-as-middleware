@@ -21,12 +21,10 @@
 //!   E2EE is supported and operates on the `input` request field and
 //!   each `data[].embedding` response field.
 //! * `GET  /v1/models` - proxy the upstream OpenAI-compatible model list.
-//! * `GET  /v1/models/*` - relay model sub-catalogs to the middleware, which
-//!   owns the routing: `/v1/models/:namespace` (alias-prefix catalog) and
-//!   `/v1/models/providers/:provider` (provider catalog). Control-plane
-//!   middleware only.
-//! * `GET  /v1/embeddings/models` - embedding model catalog (control-plane
-//!   middleware only).
+//! * `GET  /v1/models/*` - relay model sub-catalogs to the middleware. The
+//!   built-in router middleware currently serves only `/v1/models`.
+//! * `GET  /v1/embeddings/models` - embedding model catalog. The built-in
+//!   router middleware currently returns `404` here.
 //! * `GET  /health` - unauthenticated liveness probe for load balancers and
 //!   orchestrators; reports only that the process is serving requests.
 //! * `GET  /v1/metrics` - expose aggregator-owned Prometheus metrics.
@@ -34,6 +32,8 @@
 //!   current upstream config, with secrets redacted.
 //! * `PUT  /v1/admin/upstreams` - authenticated admin replacement of
 //!   the single upstream config file.
+//! * `GET  /v1/admin/router` - authenticated middleware router status when
+//!   router middleware mode is enabled.
 //! * `POST /v1/admin/revoke-keyset` - authenticated admin revocation of the
 //!   current workload keyset (§4.7). Signs and persists the revocation
 //!   statement, after which the service stops serving reports/inference under
@@ -92,9 +92,9 @@ mod util;
 
 use handlers::{
     aci_attestation_report, aci_list_sessions, aci_receipt, aci_revocations, admin_get_upstreams,
-    admin_put_upstreams, admin_revoke_keyset, attestation_report, attested_session,
-    chat_completions, completions, embeddings, embeddings_models, health, messages, metrics,
-    models, models_subpath, receipt_by_chat_id, responses, root,
+    admin_put_upstreams, admin_revoke_keyset, admin_router_status, attestation_report,
+    attested_session, chat_completions, completions, embeddings, embeddings_models, health,
+    messages, metrics, models, models_subpath, receipt_by_chat_id, responses, root,
 };
 
 #[derive(Clone)]
@@ -117,8 +117,8 @@ pub fn build_router_with_admin(
     build_router_inner(service, Some(upstream_config), admin_token, None)
 }
 
-/// Build the gateway router with the middleware, which consults the
-/// control plane and calls the service directly (in-process, no extra hop).
+/// Build the gateway router with in-process middleware. The middleware chooses
+/// route candidates, but all provider traffic still goes through `AciService`.
 pub fn build_router_with_admin_and_middleware(
     service: Arc<AciService>,
     upstream_config: Arc<UpstreamConfigManager>,
@@ -163,6 +163,7 @@ fn build_router_inner(
             "/v1/admin/upstreams",
             get(admin_get_upstreams).put(admin_put_upstreams),
         )
+        .route("/v1/admin/router", get(admin_router_status))
         .route("/v1/admin/revoke-keyset", post(admin_revoke_keyset))
         // Canonical ACI verification surface (clean shapes).
         .route("/v1/aci/attestation", get(aci_attestation_report))

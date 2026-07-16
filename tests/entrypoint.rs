@@ -360,6 +360,33 @@ fn deploy_readme_documents_one_command_deploy_and_seed_config() {
 }
 
 #[test]
+fn deploy_examples_target_router_middleware_repo() {
+    let compose = deploy_text("compose.yaml");
+    let launcher = deploy_text("aggregator.conf");
+    let repo_url =
+        "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git";
+
+    assert!(
+        compose.contains(repo_url),
+        "deploy/compose.yaml must pin this router-middleware repo"
+    );
+    assert!(
+        launcher.contains(repo_url),
+        "deploy/aggregator.conf must pin this router-middleware repo"
+    );
+    assert!(
+        compose.contains(r#""middleware": {"#)
+            && compose.contains(r#""public_model": "${PRIVATE_AI_GATEWAY_PUBLIC_MODEL:?set PRIVATE_AI_GATEWAY_PUBLIC_MODEL}""#),
+        "deploy/compose.yaml should enable the in-process router middleware with an explicit public model"
+    );
+    assert!(
+        repo_text("deploy/gateway.config.example.json")
+            .contains(r#""public_model": "<public-model>""#),
+        "deploy/gateway.config.example.json should document router middleware public_model"
+    );
+}
+
+#[test]
 fn docs_include_config_and_env_reference() {
     let reference = repo_text("docs/configuration-reference.md");
     for needle in [

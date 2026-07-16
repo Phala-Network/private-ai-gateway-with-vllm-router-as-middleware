@@ -5,7 +5,11 @@
   "admin_token": "<long-random-admin-token>",
   "dstack_endpoint": "unix:/var/run/dstack.sock",
   "middleware": {
-    "control_url": "https://control.example",
-    "control_token": "<control-plane-bearer-token>"
+    "public_model": "<public-model>",
+    "cache_threshold": 0.3,
+    "balance_abs_threshold": 64,
+    "balance_rel_threshold": 1.5,
+    "max_history_per_route": 256,
+    "default_engine": "vllm"
   }
 }

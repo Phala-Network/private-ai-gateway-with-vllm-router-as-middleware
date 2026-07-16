@@ -1,4 +1,9 @@
-# Private AI Gateway
+# Private AI Gateway With vLLM Router Middleware
+
+This repository is Phala's integration of **Private AI Gateway** with an
+in-process, vLLM-router-style middleware. Its purpose is to keep Private AI
+Gateway as the only data-plane gateway while adding multi-upstream,
+cache-aware routing inside the same attested workload.
 
 Private AI Gateway is an OpenAI-compatible gateway for **Attested Confidential
 Inference (ACI)**. It publishes dstack workload attestation for the gateway,
@@ -9,12 +14,43 @@ A relying party evaluates three artifacts before accepting a response: the
 gateway attestation report, the provider verification event for the selected
 route, and the signed receipt that binds the response to the gateway identity.
 
-This repository is the reference implementation of the
+This repository is based on the Private AI Gateway implementation of the
 [ACI Spec](spec/aci.md) (earlier draft discussion in
 [`Dstack-TEE/dstack#694`](https://github.com/Dstack-TEE/dstack/pull/694)). It is
-also the workload that
+also a workload that
 [`git-launcher`](https://github.com/Dstack-TEE/dstack-examples/tree/main/git-launcher)
 can fetch, build, and run inside a dstack v2 application VM.
+
+## Repository Purpose
+
+This repo exists to prove and operate one specific architecture:
+
+```text
+client -> Private AI Gateway frontend -> in-process router middleware
+       -> Private AI Gateway verified backend -> attested upstreams
+```
+
+The key design goals are:
+
+- Preserve the Private AI Gateway trust chain: gateway attestation, upstream
+  verification, channel binding, and signed receipts still come from the PAG
+  backend.
+- Move cache-aware candidate ordering into the gateway process so plaintext
+  requests are not forwarded to a separate adapter or vLLM Router component.
+- Keep runtime upstream add/remove on the existing authenticated
+  `/v1/admin/upstreams` API. The router reads the live upstream config instead
+  of requiring a static node list at startup.
+- Provide an authenticated `/v1/admin/router` view for router state without
+  exposing upstream secrets or prompt text.
+
+Non-goals:
+
+- This repo is not a standalone vLLM Router distribution.
+- Middleware is not a verifier and must not mint verification facts.
+- No production deployment should rely on `proxy_url` filtering as a trust
+  boundary.
+- Model-specific node lists, Gemma-specific tuning, or customer traffic policy
+  do not belong in this codebase; they belong in deployment config.
 
 ## Audience
 
@@ -86,8 +122,11 @@ flowchart LR
    workload identity and keyset.
 2. The user sends an OpenAI-compatible request over ordinary TLS or ACI E2EE.
 3. The frontend records the user-facing request and downstream E2EE state.
-4. Optional middleware may handle auth, billing, routing, cache-aware logic, or
-   rewrites. Middleware does not create verification facts.
+4. Optional router middleware orders the configured upstream candidates with
+   cache-aware and load-aware signals. Under balanced load it prefers warmed
+   prefixes; under pressure it drains toward the least-running route; when
+   routes are equally idle it uses processed-count tie-breaking so cold traffic
+   still spreads across nodes. Middleware does not create verification facts.
 5. The backend validates the target route, verifies or refreshes the upstream
    lease, enforces the verified channel binding, and forwards the provider
    request.
@@ -169,8 +208,7 @@ gateway enforces only the generic verifier result and channel binding.
 
 `0.1.0` is a developer preview. The request path is implemented, but production
 release still depends on provider strict-release review, durable operational
-storage decisions, and production compose wiring for a concrete middleware
-container.
+storage decisions, and production compose wiring for concrete upstream policy.
 
 | Area | Status |
 | --- | --- |
@@ -182,8 +220,8 @@ container.
 | Gateway-owned Prometheus metrics | Implemented |
 | Provider adapters | Implemented for Tinfoil, NEAR AI, Chutes, PhalaDirect, ACI service, and generic OpenAI-compatible upstreams |
 | Attested-session audit records | Implemented for upstream sessions; downstream sessions pending TLS/domain work |
-| Middleware framework | Implemented over HTTP on Unix domain sockets |
-| Receipt store | In-memory; receipt TTL is configurable. The gateway never stores request bodies (receipts hold hashes, not content). |
+| Middleware framework | Implemented in-process as a single-model cache-aware router |
+| Receipt store | In-memory; receipt TTL is configurable. Receipts hold hashes, not request bodies. When router middleware is enabled, the gateway keeps only bounded in-memory routing-text samples for cache affinity; they are not persisted or exposed by admin APIs. |
 | Public transparency log | Not implemented |
 
 The binary has no ephemeral-key or stub-quote startup mode. It loads identity,
@@ -384,20 +422,16 @@ Deployment files:
 
 ## Middleware
 
-The gateway runs in no-middleware mode unless middleware is configured. In
-middleware mode the middleware runs in-process, between the frontend and
-backend:
+The gateway runs in direct-upstream mode unless a `middleware` section is
+configured. When enabled, the middleware is the built-in single-model router: it
+derives candidates from the live upstream config and orders them in-process with
+cache-aware affinity, least-running pressure handling, and processed-count
+tie-breaking for idle cold traffic. It replaces the previous external adapter/vLLM
+Router hop and does not use a `proxy_url`.
 
-- Public `/v1/models` and its sub-catalogs are served from the control plane.
-- Public inference requests are decrypted and normalized by the frontend, then
-  handed to the middleware, which consults the control plane to
-  authorize and route the request and shapes the provider request.
-- The middleware selects a configured target route, forwards through the
-  backend, transforms the response, injects usage cost, and reports usage back
-  to the control plane. Verification facts still come from the backend.
-- Streaming responses stay streaming across backend, middleware, and frontend.
-- Middleware-generated OpenAI-compatible responses are passed through downstream
-  E2EE when the original user request used E2EE.
+Streaming responses stay streaming across backend, middleware, and frontend.
+Middleware-generated OpenAI-compatible responses are passed through downstream
+E2EE when the original user request used E2EE.
 
 The middleware is configured by the `middleware` section of the static gateway
 config; see the [configuration reference](docs/configuration-reference.md#middleware).
@@ -419,6 +453,7 @@ config; see the [configuration reference](docs/configuration-reference.md#middle
 | `GET /v1/metrics` | Gateway-owned Prometheus metrics. |
 | `GET /v1/admin/upstreams` | Authenticated upstream config snapshot. |
 | `PUT /v1/admin/upstreams` | Authenticated upstream config replacement. |
+| `GET /v1/admin/router` | Authenticated router middleware snapshot when the `middleware` section is enabled. |
 
 ## Runtime Configuration
 
@@ -543,7 +578,7 @@ src/aggregator/upstream_config.rs runtime upstream config and provider adapters
 src/http/app.rs                Axum HTTP routers and middleware/backend wiring
 docs/                          design notes, configuration reference, provider reviews
 deploy/                        git-launcher and dstack compose examples
-examples/                      cargo example binaries + a reference control plane (control-plane/)
+examples/                      cargo example binaries
 scripts/                       local and Phala smoke tests
 tests/                         unit and integration coverage
 ```

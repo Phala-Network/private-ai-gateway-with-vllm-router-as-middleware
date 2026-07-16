@@ -256,7 +256,10 @@ async fn dstack_live_aci_report_and_receipt_chain_verify() {
     cfg.vendor = "phala".to_string();
     cfg.tee_type = "tdx".to_string();
     cfg.source_provenance = SourceProvenance {
-        repo_url: Some("https://github.com/Dstack-TEE/private-ai-gateway".to_string()),
+        repo_url: Some(
+            "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware"
+                .to_string(),
+        ),
         repo_commit: Some("live-test".to_string()),
         image_digest: None,
         image_provenance: None,
@@ -393,7 +396,10 @@ async fn dstack_live_aci_service_upstream_verifier_accepts_real_aci_service() {
     let mut cfg = AciServiceConfig::for_test("phala");
     cfg.allow_test_keys = false;
     cfg.source_provenance = SourceProvenance {
-        repo_url: Some("https://github.com/Dstack-TEE/private-ai-gateway".to_string()),
+        repo_url: Some(
+            "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware"
+                .to_string(),
+        ),
         repo_commit: Some("live-test".to_string()),
         image_digest: None,
         image_provenance: None,

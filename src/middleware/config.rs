@@ -1,32 +1,41 @@
 //! Configuration for the middleware.
 //!
-//! Selected through the gateway's optional `middleware` config section. When
-//! present, the gateway consults the control plane directly over HTTP, in
-//! process, with no Unix-domain-socket hop.
+//! Selected through the gateway's optional `middleware` config section. This
+//! fork intentionally supports one middleware shape: one public model routed
+//! across multiple configured upstreams with cache-aware and load-aware ordering.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// Middleware settings. `control_url` is required; the rest fall back
-/// to the defaults documented in the configuration reference.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+use super::types::Engine;
+
+/// Single-model router middleware settings.
+///
+/// If `public_model` is unset, the router derives it from the live upstream
+/// config and requires exactly one unique public model.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MiddlewareConfig {
-    /// Base URL of the control plane (`http`/`https`). Consult and catalog paths
-    /// are appended to it.
-    pub control_url: String,
-    /// Optional bearer token for control-plane requests.
-    #[serde(default)]
-    pub control_token: Option<String>,
-    /// Timeout for the pre-request consult and catalog fetches. Defaults to
-    /// 60_000 ms.
-    #[serde(default)]
-    pub control_timeout_ms: Option<u64>,
-    /// Timeout for the fire-and-forget post-request usage report. Defaults to
-    /// 10_000 ms.
-    #[serde(default)]
-    pub control_post_timeout_ms: Option<u64>,
+    pub public_model: Option<String>,
+    pub cache_threshold: f32,
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f32,
+    pub max_history_per_route: usize,
+    pub default_engine: Option<Engine>,
     /// SSE keep-alive interval for streaming responses. Defaults to 10_000 ms;
     /// `0` disables the heartbeat.
-    #[serde(default)]
     pub sse_keepalive_ms: Option<u64>,
+}
+
+impl Default for MiddlewareConfig {
+    fn default() -> Self {
+        Self {
+            public_model: None,
+            cache_threshold: 0.30,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.50,
+            max_history_per_route: 256,
+            default_engine: None,
+            sse_keepalive_ms: None,
+        }
+    }
 }

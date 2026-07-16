@@ -43,34 +43,54 @@ This is the smallest practical container config.
 | `upstream_config_seed_path` | unset | Read-only JSON seed copied to `<state_dir>/upstreams.json` only when the active upstream config is missing or empty. |
 | `admin_token` | unset | Bearer token for `GET` and `PUT /v1/admin/upstreams`. When unset, the admin API is not exposed. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
-| `middleware` | unset | Optional middleware section. When present, the gateway consults a control plane to route and authorize each request and applies request/response transforms; when unset it serves directly. See [Middleware](#middleware). |
+| `middleware` | unset | Optional middleware section. When present, the gateway runs in-process middleware before the verified backend forward; when unset it serves directly. See [Middleware](#middleware). |
 
 ## Middleware
 
-The optional `middleware` section runs the middleware in the request
-path. When present, the gateway consults a control plane at `control_url` to
-authorize and route each request, shapes the provider request, injects response
-cost, and reports usage back to the control plane — all in-process, with no
-out-of-process hop. When the section is omitted the gateway serves directly.
+The optional `middleware` section runs middleware in the request path. The
+middleware is inside the gateway process, after frontend normalization and
+before the verified backend forward. It may choose routes or transform request
+and response payloads, but upstream verification, channel binding, forwarding,
+and receipt finalization remain backend responsibilities. When the section is
+omitted the gateway serves directly.
+
+This fork supports one middleware shape: a single public model routed across
+multiple configured upstreams with cache-aware and load-aware ordering. Under
+balanced load it prefers warmed prefixes, under pressure it drains toward the
+least-running route, and when equally idle it uses processed-count tie-breaking
+so cold traffic still spreads across nodes. It does not use `control_url`,
+`proxy_url`, or an external adapter/vLLM Router process.
 
 | Field | Default | Use |
 | --- | --- | --- |
-| `middleware.control_url` | required | Base URL of the control plane the gateway consults for routing, authorization, catalogs, and usage reporting. |
-| `middleware.control_token` | unset | Bearer token sent to the control plane. When unset, no `Authorization` header is sent. |
-| `middleware.control_timeout_ms` | `60000` | Timeout for the pre-request consult and catalog fetches. A failed or timed-out consult fails closed. |
-| `middleware.control_post_timeout_ms` | `10000` | Timeout for the fire-and-forget post-request usage report. |
+| `middleware.public_model` | unset | Public model id served by this gateway. When unset, the router derives it from the live upstream config and requires exactly one unique public model. |
+| `middleware.cache_threshold` | `0.30` | Minimum common-prefix match rate needed to prefer a previously warmed route when load is balanced. |
+| `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
+| `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
+| `middleware.max_history_per_route` | `256` | Maximum routing-text samples kept per public model and route for prefix matching. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
+| `middleware.default_engine` | unset | Optional engine hint put into synthetic route candidates, for example `vllm` or `sglang`. |
 | `middleware.sse_keepalive_ms` | `10000` | Idle keep-alive interval for streaming responses; `0` disables the heartbeat. |
 
 ```json
 {
   "middleware": {
-    "control_url": "https://control.example",
-    "control_token": "<control-plane-bearer-token>"
+    "public_model": "public-model",
+    "cache_threshold": 0.3,
+    "balance_abs_threshold": 64,
+    "balance_rel_threshold": 1.5,
+    "max_history_per_route": 256,
+    "default_engine": "vllm"
   }
 }
 ```
 
-Only `control_url` is required.
+The route set comes from the active upstream config. Dynamic upstream add/remove
+remains `GET` and `PUT /v1/admin/upstreams` with the gateway admin bearer token.
+The router exposes an authenticated
+`GET /v1/admin/router` snapshot with current route counters, in-flight counts,
+selection counters, history sample counts, router config, and upstream config
+digest. The endpoint returns `404` when the admin token is unset or the
+middleware is not enabled.
 
 ## Source Provenance
 
@@ -79,9 +99,9 @@ provenance from the dstack git-launcher pin at
 `/etc/git-launcher/gateway.conf`:
 
 ```text
-REPO_URL=https://github.com/Dstack-TEE/private-ai-gateway.git
+REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
 COMMIT_SHA=<audited-full-40-or-64-hex-commit-sha>
-WORK_DIR=/var/lib/git-launcher/private-ai-gateway
+WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
 ```
 
 When the launcher config is absent, source provenance is unknown and the

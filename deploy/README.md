@@ -1,4 +1,4 @@
-# Deploying Private AI Gateway With git-launcher
+# Deploying Private AI Gateway Router Middleware With git-launcher
 
 This directory contains the one-file dstack compose path for launching
 Private AI Gateway through
@@ -9,10 +9,11 @@ scrubs the checkout, preserves the container environment, and runs the gateway
 repo's own [`../entrypoint.sh`](../entrypoint.sh). The launcher remains
 generic; install, build, run, and ACI policy live in this repo.
 
-The checked-in compose runs in no-middleware mode: the public ACI frontend and
-verified-provider backend are the same process, and traffic is forwarded
-directly from frontend to backend. To enable middleware, configure it in the
-static gateway config (this compose leaves it disabled). See the
+The checked-in compose enables the built-in router middleware. The public ACI
+frontend, cache-aware router middleware, and verified-provider backend run in
+the same gateway process. The router reads the live upstream config and orders
+candidates in-process; it does not start an external adapter, external vLLM
+Router process, or `proxy_url` forwarding layer. See the
 [configuration reference](../docs/configuration-reference.md#middleware).
 
 ## One-Command Deploy
@@ -32,7 +33,8 @@ Prepare an audited gateway commit, then run:
 cd deploy
 PRIVATE_AI_GATEWAY_REPO_COMMIT=<full-40-hex-sha> \
 PRIVATE_AI_GATEWAY_ADMIN_TOKEN=<long-random-admin-token> \
-phala-h4xuser deploy -n private-ai-gateway -c compose.yaml
+PRIVATE_AI_GATEWAY_PUBLIC_MODEL=<public-model> \
+phala-h4xuser deploy -n private-ai-gateway-router -c compose.yaml
 ```
 
 For local/dev deploys, you can also copy
@@ -80,14 +82,14 @@ Everything after step 4 is gateway-owned:
 | Concern | Owner | Location |
 | --- | --- | --- |
 | Workload source pin | Launcher config | `gateway-pin` in `compose.yaml` |
-| Static gateway config | Deployment compose | `gateway-config` in `compose.yaml` |
+| Static gateway config | Deployment compose | `gateway-config` in `compose.yaml`, including the optional `middleware` section |
 | Runtime bootstrap env | Deployment compose | service `environment:` in `compose.yaml` points at the static gateway config and cache directory |
 | Initial upstream config | Deployment compose | `gateway-upstreams` in `compose.yaml` |
 | Toolchain bootstrap | Gateway repo | `../entrypoint.sh` |
 | Build and exec | Gateway repo | `../entrypoint.sh` |
 | Downstream ACI frontend | Gateway binary | `../src` |
 | Verified-provider backend | Gateway binary | `../src` |
-| Optional routing middleware | Gateway deployment | Router helpers exist, but this compose and static config do not wire middleware |
+| In-process router middleware | Gateway binary and config | Enabled in `gateway-config`; selects among configured upstream routes before the verified backend forward |
 
 The public gateway repo root contains `entrypoint.sh`, so the launcher config
 does not set `REPO_SUBDIR`.

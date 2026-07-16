@@ -19,9 +19,8 @@
 //! (§4.2), and the issued keyset revocations `revocations.json` (§4.7).
 //!
 //! When the static config includes a `middleware` section, the gateway runs the
-//! middleware: it consults the control plane at `middleware.control_url`
-//! and calls the service directly. Without the section the gateway serves the
-//! upstream directly.
+//! built-in single-model router middleware and orders upstream candidates
+//! in-process. Without the section the gateway serves the upstream directly.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -498,9 +497,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_upstream_lifecycle(upstream_config.clone());
 
     let app = if let Some(middleware_config) = middleware_config {
-        let middleware = Arc::new(Middleware::new(&middleware_config).map_err(invalid_input)?);
+        let middleware = Arc::new(
+            Middleware::new(&middleware_config, upstream_config.clone()).map_err(invalid_input)?,
+        );
         tracing::info!(
-            control_url = %middleware_config.control_url,
+            mode = %middleware.name(),
             "private-ai-gateway middleware enabled"
         );
         build_router_with_admin_and_middleware(service, upstream_config, admin_token, middleware)
@@ -703,8 +704,9 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
             &config_path,
             r#"{
                 "middleware": {
-                    "control_url": "https://control.example",
-                    "control_token": "secret"
+                    "public_model": "gemma4-31b-it",
+                    "cache_threshold": 0.4,
+                    "default_engine": "vllm"
                 }
             }"#,
         )
@@ -713,10 +715,12 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         let config = load_gateway_config(config_path.to_str().unwrap()).unwrap();
 
         let middleware = config.middleware.expect("middleware section must parse");
-        assert_eq!(middleware.control_url, "https://control.example");
-        assert_eq!(middleware.control_token.as_deref(), Some("secret"));
-        // Optional timeouts default to None and fall back inside the client.
-        assert_eq!(middleware.control_timeout_ms, None);
+        assert_eq!(middleware.public_model.as_deref(), Some("gemma4-31b-it"));
+        assert_eq!(middleware.cache_threshold, 0.4);
+        assert_eq!(
+            middleware.default_engine,
+            Some(private_ai_gateway::middleware::types::Engine::Vllm)
+        );
         let _ = std::fs::remove_file(config_path);
     }
 
@@ -736,6 +740,11 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
                 "tls-certificate-paths",
                 r#"{"tls": {"certificate_paths": ["/cert.pem"]}}"#,
             ),
+            (
+                "middleware-control-url",
+                r#"{"middleware": {"control_url": "https://control.example"}}"#,
+            ),
+            ("middleware-mode", r#"{"middleware": {"mode": "router"}}"#),
         ] {
             let config_path = temp_path(name);
             std::fs::write(&config_path, body).unwrap();
@@ -758,9 +767,9 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
             &config_path,
             r#"
                 # fetched by git-launcher before entrypoint.sh runs
-                REPO_URL=https://github.com/Dstack-TEE/private-ai-gateway.git
+                REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
                 COMMIT_SHA=0123456789abcdef0123456789abcdef01234567
-                WORK_DIR=/var/lib/git-launcher/private-ai-gateway
+                WORK_DIR=/var/lib/git-launcher/private-ai-gateway-router
             "#,
         )
         .unwrap();
@@ -771,7 +780,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
 
         assert_eq!(
             provenance.repo_url.as_deref(),
-            Some("https://github.com/Dstack-TEE/private-ai-gateway.git")
+            Some("https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git")
         );
         assert_eq!(
             provenance.repo_commit.as_deref(),
@@ -786,7 +795,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         let config_path = temp_path("git-launcher-config-missing-commit");
         std::fs::write(
             &config_path,
-            "REPO_URL=https://github.com/Dstack-TEE/private-ai-gateway.git\n",
+            "REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git\n",
         )
         .unwrap();
 
@@ -803,7 +812,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         std::fs::write(
             &config_path,
             r#"
-                REPO_URL=https://github.com/Dstack-TEE/private-ai-gateway.git
+                REPO_URL=https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git
                 COMMIT_SHA=main
             "#,
         )

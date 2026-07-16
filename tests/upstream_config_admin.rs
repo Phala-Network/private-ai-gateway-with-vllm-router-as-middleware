@@ -1,4 +1,4 @@
-//! Admin upstream config control-plane tests.
+//! Admin upstream config API tests.
 
 use std::sync::Arc;
 

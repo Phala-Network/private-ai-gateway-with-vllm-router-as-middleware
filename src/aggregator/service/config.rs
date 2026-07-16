@@ -61,7 +61,10 @@ impl AciServiceConfig {
             vendor: vendor.to_string(),
             tee_type: "tdx".to_string(),
             source_provenance: SourceProvenance {
-                repo_url: Some("https://github.com/Dstack-TEE/private-ai-gateway".to_string()),
+                repo_url: Some(
+                    "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware"
+                        .to_string(),
+                ),
                 repo_commit: Some("deadbeef".to_string()),
                 image_digest: None,
                 image_provenance: None,

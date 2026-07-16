@@ -41,7 +41,7 @@ use super::util::{
 use super::AppState;
 use crate::middleware::errors::Surface;
 use crate::middleware::request_transform::Endpoint;
-use crate::middleware::{hash_api_key, CompletionInput};
+use crate::middleware::CompletionInput;
 
 #[derive(Deserialize)]
 pub(super) struct AttestationQuery {
@@ -106,8 +106,8 @@ pub(super) async fn models_subpath(
         .await
 }
 
-// Embedding model catalog. Only meaningful in the control-plane middleware
-// topology.
+// Embedding model catalog. The built-in router middleware currently serves only
+// the primary `/v1/models` catalog.
 pub(super) async fn embeddings_models(State(state): State<AppState>) -> Response {
     let Some(middleware) = state.middleware.clone() else {
         return error_response(
@@ -198,6 +198,26 @@ pub(super) async fn admin_put_upstreams(
             Json(snapshot).into_response()
         }
         Err(e) => upstream_config_error_response(e),
+    }
+}
+
+pub(super) async fn admin_router_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = enforce_admin(&state, &headers) {
+        return resp;
+    }
+    let Some(middleware) = state.middleware.as_ref() else {
+        return admin_not_found_response();
+    };
+    match middleware.admin_snapshot() {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "router middleware is not enabled",
+        ),
     }
 }
 
@@ -635,14 +655,12 @@ pub(super) async fn openai_completion_endpoint(
         } else {
             Surface::Openai
         };
-        let api_key_hash = extract_bearer(&headers).as_deref().map(hash_api_key);
         let input = CompletionInput {
             endpoint,
             endpoint_path,
             surface,
             params: parsed,
             received_body: service_body,
-            api_key_hash,
             requester,
             e2ee,
             upstream_required,

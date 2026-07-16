@@ -21,7 +21,7 @@ adapters that fail closed when binding material cannot be enforced.
 | Attested sessions | In progress | Upstream verified TLS/SPKI or provider E2EE bindings now create session ids, audit records, and receipt references. Downstream session ids are pending TLS/domain binding work. |
 | Upstream verification lifecycle | In progress | Startup prewarm, background verification refresh, and Chutes session refresh exist. Provider soundness review is still strict-release work. |
 | Provider adapters | In progress | Tinfoil, NEAR AI, Chutes, and direct vLLM-proxy-backed GPU workers are the launch surface. OpenAI-compatible remains useful for deployment bring-up. ACI service upstreams stay minimal until first-party GPU workers move from vLLM-proxy to an ACI-compatible server. |
-| Frontend/middleware/backend framework | Shipped | Frontend/backend split with an optional middleware that consults the control plane to route, transform, cost-inject, and report usage; the middleware-disabled path stays behavior-compatible. |
+| Frontend/middleware/backend framework | Shipped | Frontend/backend split with optional in-process router middleware. The router performs local cache-aware candidate ordering from the live upstream config. The middleware-disabled path stays behavior-compatible. |
 | Multi-domain downstream TLS binding | In progress | Domain-tagged TLS SPKIs can be configured, published in the keyset, and selected in report evidence from the HTTP `Host`. Downstream session ids are still pending. |
 | Local backend proxy mode | Planned | Let an end user run the verified-provider backend as a laptop-local OpenAI-compatible proxy without local TEE requirements. |
 | Live E2E fidelity suite | In progress | BFCL/OpenAI-compatible harness exists. Strict profiles and broader fidelity coverage remain P0 before external review. |
@@ -103,13 +103,13 @@ Shipped. The gateway is split into a frontend (public ACI endpoints, downstream
 E2EE, request-context creation, receipt signing), a backend (target-route
 validation, provider verification, upstream binding, backend-authored receipt
 facts), and an optional middleware between them. The middleware runs
-**in-process**: it consults the control plane to authorize and route each
-request, shapes the provider request, transforms and cost-injects the response,
-and reports usage — with no out-of-process hop. The middleware-disabled path
-stays behavior-compatible with the direct request path and is covered by the
-full test suite. Verification facts always come from backend observations, never
-middleware claims (`middleware.forwarded`, `route.selected`, `request.forwarded`,
-backend-owned `response.received`, frontend-owned `response.returned`).
+**in-process** and derives candidate routes from the live upstream config,
+performing local cache-aware ordering without an external adapter or vLLM Router
+hop. The middleware-disabled path stays behavior-compatible with the direct
+request path and is covered by the full test suite. Verification facts always
+come from backend observations, never middleware claims
+(`middleware.forwarded`, `route.selected`, `request.forwarded`, backend-owned
+`response.received`, frontend-owned `response.returned`).
 
 ### P0: Provider Soundness and Strict Pins
 

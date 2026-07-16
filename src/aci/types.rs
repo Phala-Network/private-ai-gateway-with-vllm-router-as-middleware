@@ -415,7 +415,10 @@ mod tests {
     #[test]
     fn known_source_provenance_is_reported_on_the_wire() {
         let value = serde_json::to_value(minimal_envelope(SourceProvenance {
-            repo_url: Some("https://github.com/Dstack-TEE/private-ai-gateway.git".to_string()),
+            repo_url: Some(
+                "https://github.com/Phala-Network/private-ai-gateway-with-vllm-router-as-middleware.git"
+                    .to_string(),
+            ),
             repo_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
             image_digest: None,
             image_provenance: None,
