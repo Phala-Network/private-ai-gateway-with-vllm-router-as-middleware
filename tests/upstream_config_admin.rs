@@ -232,8 +232,30 @@ async fn api_token_gates_public_model_and_metrics_surfaces() {
     let (status, _) = call_raw(app.clone(), "GET", "/v1/metrics", Vec::new(), None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, _body) = call_raw(app, "GET", "/v1/metrics", Vec::new(), Some("api-secret")).await;
+    let (status, _body) =
+        call_raw(app.clone(), "GET", "/v1/metrics", Vec::new(), Some("api-secret")).await;
     assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = call_raw(
+        app.clone(),
+        "GET",
+        "/v1/upstream-status",
+        Vec::new(),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = call_raw(
+        app,
+        "GET",
+        "/v1/upstream-status",
+        Vec::new(),
+        Some("api-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"3\n");
 
     let _ = std::fs::remove_file(path);
 }

@@ -28,6 +28,7 @@
 //! * `GET  /health` - unauthenticated liveness probe for load balancers and
 //!   orchestrators; reports only that the process is serving requests.
 //! * `GET  /v1/metrics` - expose aggregator-owned Prometheus metrics.
+//! * `GET  /v1/upstream-status` - expose one aggregate upstream capacity code.
 //! * `GET  /v1/admin/upstreams` - authenticated admin view of the
 //!   current upstream config, with secrets redacted.
 //! * `PUT  /v1/admin/upstreams` - authenticated admin replacement of
@@ -97,7 +98,7 @@ use handlers::{
     admin_patch_upstream, admin_put_upstreams, admin_revoke_keyset, admin_router_status,
     attestation_report, attested_session, chat_completions, completions, embeddings,
     embeddings_models, health, messages, metrics, models, models_subpath, receipt_by_chat_id,
-    responses, root,
+    responses, root, upstream_status,
 };
 
 #[derive(Clone)]
@@ -191,6 +192,7 @@ fn build_router_inner(
         .route("/v1/responses", post(responses))
         // Gateway operations.
         .route("/v1/metrics", get(metrics))
+        .route("/v1/upstream-status", get(upstream_status))
         .route(
             "/v1/admin/upstreams",
             get(admin_get_upstreams).put(admin_put_upstreams),

@@ -45,7 +45,7 @@ This is the smallest practical container config.
 | `state_dir` | `/var/lib/private-ai-gateway` | Gateway-owned writable state directory. The active upstream config and attested-session log are derived from this directory. |
 | `upstream_config_seed_path` | unset | Read-only JSON seed copied to `<state_dir>/upstreams.json` only when the active upstream config is missing or empty. |
 | `admin_token` | unset | Bearer token for `GET`, `PUT`, and `PATCH` upstream admin APIs. When unset, the admin API is not exposed. |
-| `api_token` | unset | Bearer token for `/v1/models`, `/v1/metrics`, and OpenAI-compatible inference POST endpoints. When unset, those endpoints remain open for local development. Production deployments should set it. |
+| `api_token` | unset | Bearer token for `/v1/models`, `/v1/metrics`, `/v1/upstream-status`, and OpenAI-compatible inference POST endpoints. When unset, those endpoints remain open for local development. Production deployments should set it. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `middleware` | unset | Optional middleware section. When present, the gateway runs in-process middleware before the verified backend forward; when unset it serves directly. See [Middleware](#middleware). |
 

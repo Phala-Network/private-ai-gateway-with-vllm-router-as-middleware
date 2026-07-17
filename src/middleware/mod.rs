@@ -48,6 +48,10 @@ impl Middleware {
         Some(self.router.admin_snapshot_value())
     }
 
+    pub fn upstream_status_code(&self) -> u8 {
+        self.router.upstream_status_code()
+    }
+
     /// Serve `/v1/models` from the single public model selected by router
     /// middleware.
     pub async fn handle_catalog(&self, v1_path: &str) -> Response {

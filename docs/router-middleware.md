@@ -177,6 +177,11 @@ The snapshot includes:
 
 The snapshot is operational state only. It is not part of the ACI proof chain.
 
+Downstream gateways that only need a coarse capacity signal can call
+`GET /v1/upstream-status` with API bearer auth. The response is one plain-text
+integer: `0` green, `1` yellow, `2` red, `3` unknown. It does not include route
+names, reasons, limits, or per-node counters.
+
 ## Security Boundary
 
 The route selected by middleware is committed into the receipt as middleware and

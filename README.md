@@ -471,6 +471,7 @@ config; see the [router middleware design](docs/router-middleware.md) and the
 | `GET /v1/aci/sessions?upstream_name=&model=` | List a provider's imported attested sessions. |
 | `GET /v1/attestation/report` · `GET /v1/signature/{id}` | Legacy dstack-vllm-proxy aliases. |
 | `GET /v1/metrics` | Gateway-owned Prometheus metrics. Requires `api_token` when configured. |
+| `GET /v1/upstream-status` | One plain-text aggregate capacity code for downstream gateways: `0` green, `1` yellow, `2` red, `3` unknown. Requires `api_token` when configured. |
 | `GET /v1/admin/upstreams` | Authenticated upstream config snapshot. |
 | `PUT /v1/admin/upstreams` | Authenticated upstream config replacement. |
 | `PATCH /v1/admin/upstreams/{name}` | Authenticated single-upstream enable/disable update without replacing the full config. |

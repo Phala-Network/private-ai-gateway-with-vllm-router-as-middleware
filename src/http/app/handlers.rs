@@ -3,7 +3,7 @@
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -151,6 +151,26 @@ pub(super) async fn metrics(State(state): State<AppState>, headers: HeaderMap) -
         }
         Err(err) => internal_error_response(err),
     }
+}
+
+pub(super) async fn upstream_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
+    let code = state
+        .middleware
+        .as_ref()
+        .map(|middleware| middleware.upstream_status_code())
+        .unwrap_or(3);
+    let mut response = format!("{code}\n").into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 pub(super) async fn admin_get_upstreams(

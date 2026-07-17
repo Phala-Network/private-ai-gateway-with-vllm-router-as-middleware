@@ -25,6 +25,9 @@ use super::request_transform::Endpoint;
 use super::types::{ProviderFormat, RouteCandidate};
 
 const MAX_ROUTING_HISTORY_CHARS: usize = 16_384;
+const UPSTREAM_STATUS_GREEN: u8 = 0;
+const UPSTREAM_STATUS_YELLOW: u8 = 1;
+const UPSTREAM_STATUS_RED: u8 = 2;
 
 #[derive(Clone)]
 struct RouterRoute {
@@ -270,6 +273,22 @@ impl RouterBackend {
         })
     }
 
+    pub(super) fn upstream_status_code(&self) -> u8 {
+        let upstream_snapshot = self.upstream_config.snapshot();
+        let public_model = match self.public_model(&upstream_snapshot) {
+            Ok(Some(model)) => model,
+            Ok(None) | Err(_) => return UPSTREAM_STATUS_RED,
+        };
+        let routes = upstream_snapshot
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.enabled && upstream.models.contains_key(&public_model))
+            .map(|upstream| route_from_upstream(upstream, &public_model, &self.config))
+            .collect::<Vec<_>>();
+        let state = self.state.lock().expect("router state poisoned");
+        state.upstream_status_code(&routes, &self.config, UserTier::Basic)
+    }
+
     pub async fn handle_catalog(&self, v1_path: &str) -> Response {
         if v1_path != "/v1/models" {
             return errors::error_response(
@@ -504,6 +523,57 @@ impl RouterState {
             effective_running,
             processed: stats.processed,
         }
+    }
+
+    fn upstream_status_code(
+        &self,
+        routes: &[RouterRoute],
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> u8 {
+        if routes.is_empty() {
+            return UPSTREAM_STATUS_RED;
+        }
+        let mut saw_yellow = false;
+        for route in routes {
+            match self.route_status_code(route, config, tier) {
+                UPSTREAM_STATUS_GREEN => return UPSTREAM_STATUS_GREEN,
+                UPSTREAM_STATUS_YELLOW => saw_yellow = true,
+                _ => {}
+            }
+        }
+        if saw_yellow {
+            UPSTREAM_STATUS_YELLOW
+        } else {
+            UPSTREAM_STATUS_RED
+        }
+    }
+
+    fn route_status_code(
+        &self,
+        route: &RouterRoute,
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> u8 {
+        let pressure = self.route_pressure(route, config, tier);
+        if pressure.blocked || pressure.waiting > 0 || pressure.fullness_milli >= 1_000 {
+            return UPSTREAM_STATUS_RED;
+        }
+        if pressure.metrics_missing || pressure.fullness_milli >= 850 {
+            return UPSTREAM_STATUS_YELLOW;
+        }
+        let Some(metrics) = self.upstream_metrics.get(&route.upstream_name) else {
+            return UPSTREAM_STATUS_YELLOW;
+        };
+        let global_limit_known = metrics.global_limit.is_some_and(|limit| limit > 0.0);
+        let tier_limit_known = match tier {
+            UserTier::Premium => true,
+            UserTier::Basic => metrics.basic_limit.is_some_and(|limit| limit > 0.0),
+        };
+        if !global_limit_known || !tier_limit_known {
+            return UPSTREAM_STATUS_YELLOW;
+        }
+        UPSTREAM_STATUS_GREEN
     }
 
     fn select(
@@ -1252,6 +1322,69 @@ mod tests {
     }
 
     #[test]
+    fn upstream_status_returns_green_when_any_route_has_capacity() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.update_upstream_metrics("a".to_string(), test_metrics(10.0, 1.0, 10.0, 9.0, 9.0));
+        state.update_upstream_metrics("b".to_string(), test_metrics(2.0, 0.0, 10.0, 9.0, 2.0));
+
+        assert_eq!(
+            state.upstream_status_code(&routes, &config, UserTier::Basic),
+            UPSTREAM_STATUS_GREEN
+        );
+    }
+
+    #[test]
+    fn upstream_status_returns_yellow_for_missing_or_near_full_metrics() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m")];
+
+        assert_eq!(
+            state.upstream_status_code(&routes, &config, UserTier::Basic),
+            UPSTREAM_STATUS_YELLOW
+        );
+
+        state.update_upstream_metrics("a".to_string(), test_metrics(8.6, 0.0, 10.0, 9.0, 7.0));
+        assert_eq!(
+            state.upstream_status_code(&routes, &config, UserTier::Basic),
+            UPSTREAM_STATUS_YELLOW
+        );
+    }
+
+    #[test]
+    fn upstream_status_returns_red_when_all_routes_are_blocked() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.update_upstream_metrics("a".to_string(), test_metrics(10.0, 0.0, 10.0, 9.0, 9.0));
+        state.update_upstream_metrics("b".to_string(), test_metrics(2.0, 1.0, 10.0, 9.0, 2.0));
+
+        assert_eq!(
+            state.upstream_status_code(&routes, &config, UserTier::Basic),
+            UPSTREAM_STATUS_RED
+        );
+    }
+
+    #[test]
+    fn upstream_status_treats_basic_full_as_red() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m")];
+        state.update_upstream_metrics("a".to_string(), test_metrics(4.0, 0.0, 10.0, 4.0, 4.0));
+
+        assert_eq!(
+            state.upstream_status_code(&routes, &config, UserTier::Basic),
+            UPSTREAM_STATUS_RED
+        );
+        assert_eq!(
+            state.upstream_status_code(&routes, &config, UserTier::Premium),
+            UPSTREAM_STATUS_GREEN
+        );
+    }
+
+    #[test]
     fn in_flight_guard_can_retarget_and_drops_running_count() {
         let state = Arc::new(Mutex::new(RouterState::default()));
         let selection = RouteSelection {
@@ -1314,6 +1447,26 @@ mod tests {
                 format: ProviderFormat::Openai,
                 engine: None,
             },
+        }
+    }
+
+    fn test_metrics(
+        observed_running: f64,
+        observed_waiting: f64,
+        global_limit: f64,
+        basic_limit: f64,
+        basic_inflight: f64,
+    ) -> UpstreamMetrics {
+        UpstreamMetrics {
+            ok: true,
+            updated_at: Some(Instant::now()),
+            observed_running: Some(observed_running),
+            observed_waiting: Some(observed_waiting),
+            global_limit: Some(global_limit),
+            basic_limit: Some(basic_limit),
+            basic_inflight: Some(basic_inflight),
+            premium_inflight: Some(0.0),
+            error: None,
         }
     }
 }
