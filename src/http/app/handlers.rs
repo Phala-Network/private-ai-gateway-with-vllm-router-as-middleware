@@ -153,10 +153,7 @@ pub(super) async fn metrics(State(state): State<AppState>, headers: HeaderMap) -
     }
 }
 
-pub(super) async fn upstream_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub(super) async fn upstream_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(resp) = enforce_api(&state, &headers) {
         return resp;
     }
