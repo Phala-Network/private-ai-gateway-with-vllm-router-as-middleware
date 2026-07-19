@@ -474,15 +474,7 @@ pub(super) async fn run(
         Err(err) => {
             let status = forward_error_status(&err);
             let detail = detail_snippet_text(&err.to_string());
-            log_generated_outcome(
-                outcome_ctx,
-                "forward_error",
-                status,
-                0,
-                "",
-                0,
-                &detail,
-            );
+            log_generated_outcome(outcome_ctx, "forward_error", status, 0, "", 0, &detail);
             service_error_response(surface, endpoint_path, service, &request_id, err, e2ee)
         }
     }
