@@ -13,10 +13,11 @@ use super::streaming::{
 };
 use super::{
     AciService, ChatCompletionRequest, E2eeError, E2eeRequestContext, E2eeResponseInfo,
-    ForwardCandidate, MiddlewareForwardResult, MiddlewareForwarded,
+    ForwardCandidate, MiddlewareAllFailed, MiddlewareForwardResult, MiddlewareForwarded,
     MiddlewareGeneratedFinalization, MiddlewareReceiptDraft, MiddlewareReceiptFinalization,
     MiddlewareReceiptJournal, MiddlewareStreamFinalization, MiddlewareStreamingForwarded,
-    ReceiptOwner, ServiceError, ServiceResponseStream, StreamingUpstreamError,
+    MiddlewareUpstreamError, ReceiptOwner, ServiceError, ServiceResponseStream,
+    StreamingUpstreamError,
 };
 use crate::aci::receipt::{ReceiptBuilder, TransparencyEventKind, UpstreamVerifiedEvent};
 use crate::aci::upstream::{UpstreamError, UpstreamRequest};
@@ -295,13 +296,17 @@ impl AciService {
                     }
                     self.metrics
                         .record_stream_error(endpoint_path, StreamErrorKind::UpstreamNon2xx);
-                    return Ok(MiddlewareForwardResult::UpstreamError(
-                        StreamingUpstreamError {
-                            upstream_status: status,
-                            upstream_headers,
-                            upstream_body,
+                    return Ok(MiddlewareForwardResult::UpstreamError(Box::new(
+                        MiddlewareUpstreamError {
+                            error: StreamingUpstreamError {
+                                upstream_status: status,
+                                upstream_headers,
+                                upstream_body,
+                            },
+                            selected_route: route_id.clone(),
+                            failed_attempts: std::mem::take(&mut failed_attempts),
                         },
-                    ));
+                    )));
                 }
 
                 // Commit this candidate.
@@ -458,14 +463,21 @@ impl AciService {
             )));
         }
 
-        // No candidate succeeded. Return the highest-priority failure, with
-        // the attempted route ids for context.
-        Err(aggregated_err.map(|(_, err)| err).unwrap_or_else(|| {
+        // No candidate succeeded. Return the highest-priority failure together
+        // with every attempt's outcome; otherwise the caller can only report
+        // the aggregate error and loses which candidates were exhausted.
+        let error = aggregated_err.map(|(_, err)| err).unwrap_or_else(|| {
             ServiceError::Upstream(UpstreamError::Routing(format!(
                 "all upstream routes failed (attempted: {})",
                 candidate_route_ids.join(", ")
             )))
-        }))
+        });
+        Ok(MiddlewareForwardResult::AllFailed(Box::new(
+            MiddlewareAllFailed {
+                failed_attempts,
+                error,
+            },
+        )))
     }
 
     /// Start a streaming chat completion. The response stream hashes

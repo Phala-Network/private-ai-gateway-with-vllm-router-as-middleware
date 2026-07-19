@@ -594,6 +594,40 @@ async fn chat_opt_out_forwards_and_signs_receipt_with_failed_event() {
 }
 
 #[tokio::test]
+async fn chat_accepts_request_body_above_axum_default_limit() {
+    let h = make_harness();
+    let app = build_router(h.service.clone());
+    let large_content = "a".repeat(3 * 1024 * 1024);
+    let request_json = serde_json::json!({
+        "model": "x",
+        "messages": [{ "role": "user", "content": large_content }]
+    });
+    let request_bytes = serde_json::to_vec(&request_json).unwrap();
+    assert!(request_bytes.len() > 2 * 1024 * 1024);
+    assert!(request_bytes.len() < 32 * 1024 * 1024);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-upstream-verification", "none")
+                .body(Body::from(request_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        h.received.lock().unwrap().as_ref().map(Vec::len),
+        Some(request_bytes.len()),
+        "payload larger than axum's default 2 MB limit should reach the service"
+    );
+}
+
+#[tokio::test]
 async fn chat_x_request_hash_is_ignored() {
     let h = make_harness();
     let app = build_router(h.service.clone());

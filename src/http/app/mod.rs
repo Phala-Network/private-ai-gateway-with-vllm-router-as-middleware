@@ -75,7 +75,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
     response::Response,
@@ -100,6 +100,11 @@ use handlers::{
     embeddings_models, health, messages, metrics, models, models_subpath, receipt_by_chat_id,
     responses, root, upstream_status,
 };
+
+/// Request-body cap for the inference surface. Multimodal payloads with base64
+/// image parts can exceed axum's 2 MB default; keep the cap bounded because
+/// request bodies are buffered by the handlers.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -218,6 +223,7 @@ fn build_router_inner(
         // Outermost layer: it answers preflight OPTIONS before routing, which
         // otherwise 405s since the routes only declare GET/POST/PUT.
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 

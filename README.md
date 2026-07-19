@@ -452,6 +452,11 @@ Streaming responses stay streaming across backend, middleware, and frontend.
 Middleware-generated OpenAI-compatible responses are passed through downstream
 E2EE when the original user request used E2EE.
 
+The HTTP inference surface accepts bounded request bodies up to 32 MB. Router
+middleware failures emit structured `request_outcome` logs, while streaming
+body errors emit `stream_abort` and close gracefully instead of resetting the
+client connection.
+
 The middleware is configured by the `middleware` section of the static gateway
 config; see the [router middleware design](docs/router-middleware.md) and the
 [configuration reference](docs/configuration-reference.md#middleware).

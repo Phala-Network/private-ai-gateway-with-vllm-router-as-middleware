@@ -85,6 +85,21 @@ for the selection algorithm and security boundary.
 | `middleware.default_engine` | unset | Optional engine hint put into synthetic route candidates, for example `vllm` or `sglang`. |
 | `middleware.sse_keepalive_ms` | `10000` | Idle keep-alive interval for streaming responses; `0` disables the heartbeat. |
 
+The inference HTTP surface accepts request bodies up to 32 MB. This is a
+bounded increase over axum's 2 MB default so multimodal payloads with base64
+image parts are not rejected before the gateway can log or classify them.
+
+Request outcome observation is always on for the router middleware completion
+path. Failed requests that reach routing, shaping, upstream forwarding, or
+response finalization emit structured `request_outcome` tracing lines with
+request id, public model, selected route when known, attempt index,
+client-facing status, upstream status, phase, and duration. Final 429 responses
+are excluded from this log to avoid high-volume noise. Error detail is
+single-line and length-capped, and is emitted only when the `request_outcome`
+target is enabled at `debug` through `RUST_LOG`; the default info line keeps
+detail blank. Stream body errors additionally emit `stream_abort` and then end
+the HTTP body gracefully instead of forcing Hyper to reset the connection.
+
 ```json
 {
   "middleware": {

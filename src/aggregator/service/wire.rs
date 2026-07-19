@@ -70,7 +70,8 @@ pub struct ForwardResult {
 pub enum MiddlewareForwardResult {
     Forwarded(Box<MiddlewareForwarded>),
     Stream(Box<MiddlewareStreamingForwarded>),
-    UpstreamError(StreamingUpstreamError),
+    UpstreamError(Box<MiddlewareUpstreamError>),
+    AllFailed(Box<MiddlewareAllFailed>),
 }
 
 pub struct MiddlewareForwarded {
@@ -104,6 +105,17 @@ pub struct MiddlewareStreamingForwarded {
     /// observe every attempt, not just the one that served the response.
     pub failed_attempts: Vec<(String, u16)>,
     pub session_id: Option<String>,
+}
+
+pub struct MiddlewareUpstreamError {
+    pub error: StreamingUpstreamError,
+    pub selected_route: String,
+    pub failed_attempts: Vec<(String, u16)>,
+}
+
+pub struct MiddlewareAllFailed {
+    pub failed_attempts: Vec<(String, u16)>,
+    pub error: ServiceError,
 }
 
 pub struct MiddlewareReceiptDraft {

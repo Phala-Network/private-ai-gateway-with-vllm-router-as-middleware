@@ -154,6 +154,16 @@ requested public model. When a candidate route fails during the verified backend
 forward, the backend may try the remaining middleware-ordered candidates before
 finalizing the response.
 
+When every candidate fails without a relayable upstream HTTP response, the
+middleware returns one aggregate client error but keeps the full attempt chain
+internally for structured `request_outcome` logs. When the chain ends in an
+upstream HTTP response, including an all-429 chain, the gateway relays the
+terminal upstream status after normal response classification.
+
+Streaming response errors are handled at the body boundary. The gateway logs a
+`stream_abort` warning and ends the body normally, rather than surfacing a body
+error to Hyper and causing a client-visible connection reset.
+
 If all candidates are unavailable or PIG rejects because no capacity exists, the
 client sees an OpenAI/vLLM-shaped error response. The middleware should not mask
 real backend crashes as client errors.

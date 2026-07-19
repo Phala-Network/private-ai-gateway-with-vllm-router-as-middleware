@@ -6,7 +6,7 @@
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -50,6 +50,96 @@ pub struct CompletionInput {
     pub stream: bool,
 }
 
+const MAX_LOG_DETAIL_CHARS: usize = 240;
+
+#[derive(Clone, Copy)]
+struct OutcomeCtx<'a> {
+    request_id: &'a str,
+    model: &'a str,
+    started: Instant,
+}
+
+fn should_log_failure(status: u16) -> bool {
+    status != 429
+}
+
+fn sanitize_log_value(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars)
+        .collect()
+}
+
+fn detail_snippet_bytes(raw: &[u8]) -> String {
+    let capped = &raw[..raw.len().min(4 * MAX_LOG_DETAIL_CHARS)];
+    String::from_utf8_lossy(capped)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_LOG_DETAIL_CHARS)
+        .collect()
+}
+
+fn detail_snippet_text(raw: &str) -> String {
+    sanitize_log_value(raw, MAX_LOG_DETAIL_CHARS)
+}
+
+fn debug_gated_detail(detail: &str) -> &str {
+    if tracing::enabled!(target: "request_outcome", tracing::Level::DEBUG) {
+        detail
+    } else {
+        ""
+    }
+}
+
+fn log_generated_outcome(
+    ctx: OutcomeCtx<'_>,
+    phase: &'static str,
+    status: u16,
+    upstream_status: u16,
+    route: &str,
+    attempt: u32,
+    detail: &str,
+) {
+    if !should_log_failure(status) {
+        return;
+    }
+    tracing::info!(
+        target: "request_outcome",
+        request_id = %ctx.request_id,
+        model = %sanitize_log_value(ctx.model, 128),
+        route = %sanitize_log_value(route, 128),
+        attempt,
+        status,
+        upstream_status,
+        phase,
+        duration_ms = ctx.started.elapsed().as_millis() as u64,
+        detail = %debug_gated_detail(detail),
+        "request outcome"
+    );
+}
+
+fn log_failed_attempts(ctx: OutcomeCtx<'_>, attempts: &[(String, u16)], is_streaming: bool) {
+    for (index, (route, status)) in attempts.iter().enumerate() {
+        if !should_log_failure(*status) {
+            continue;
+        }
+        tracing::info!(
+            target: "request_outcome",
+            request_id = %ctx.request_id,
+            model = %sanitize_log_value(ctx.model, 128),
+            route = %sanitize_log_value(route, 128),
+            attempt = index as u32,
+            status = *status,
+            upstream_status = *status,
+            phase = "attempt_failed",
+            is_streaming,
+            duration_ms = ctx.started.elapsed().as_millis() as u64,
+            "middleware candidate failed"
+        );
+    }
+}
+
 pub(super) async fn run(
     service: &AciService,
     sse_keepalive_ms: Option<u64>,
@@ -57,6 +147,7 @@ pub(super) async fn run(
     candidates: Vec<RouteCandidate>,
     mut route_in_flight: Option<RouteInFlight>,
 ) -> Response {
+    let started = Instant::now();
     let CompletionInput {
         endpoint,
         endpoint_path,
@@ -73,8 +164,14 @@ pub(super) async fn run(
     } = input;
 
     let model = params.get("model").and_then(Value::as_str);
+    let outcome_ctx = OutcomeCtx {
+        request_id: &request_id,
+        model: model.unwrap_or(""),
+        started,
+    };
     if candidates.is_empty() {
         let message = format!("no route available for model {}", model.unwrap_or("(none)"));
+        log_generated_outcome(outcome_ctx, "routing", 400, 0, "", 0, &message);
         let body = errors::envelope_bytes(surface, "model_not_found", &message, Some(&request_id));
         return finalize_generated(surface, service, endpoint_path, 400, body, &[], e2ee);
     }
@@ -83,6 +180,7 @@ pub(super) async fn run(
         Ok(shaped) => shaped,
         Err(err) => {
             let message = format!("failed to shape provider request: {err}");
+            log_generated_outcome(outcome_ctx, "shaping", 500, 0, "", 0, &message);
             let body = errors::envelope_bytes(
                 surface,
                 errors::error_type(surface, 500),
@@ -101,14 +199,13 @@ pub(super) async fn run(
         .collect();
 
     let context = GatewayRequestContext {
-        request_id,
+        request_id: request_id.clone(),
         user_model,
         target_route_id: None,
         user_tier,
     };
 
     let journal = MiddlewareReceiptJournal::default();
-    let request_id = context.request_id.clone();
     let result = service
         .forward_chat_completion_for_middleware(
             ChatCompletionRequest {
@@ -145,6 +242,15 @@ pub(super) async fn run(
                     Ok(value) => value,
                     Err(_) => {
                         let message = "upstream returned a malformed success body";
+                        log_generated_outcome(
+                            outcome_ctx,
+                            "buffered_transform",
+                            502,
+                            upstream_status,
+                            &forward.selected_route,
+                            forward.failed_attempts.len() as u32,
+                            message,
+                        );
                         let body = errors::envelope_bytes(
                             surface,
                             errors::error_type(surface, 502),
@@ -180,6 +286,19 @@ pub(super) async fn run(
                     Some(&request_id),
                 )
             };
+            if client_status >= 400 {
+                log_failed_attempts(outcome_ctx, &forward.failed_attempts, false);
+                let detail = detail_snippet_bytes(&forward.upstream_body);
+                log_generated_outcome(
+                    outcome_ctx,
+                    "buffered_upstream",
+                    client_status,
+                    upstream_status,
+                    &forward.selected_route,
+                    forward.failed_attempts.len() as u32,
+                    &detail,
+                );
+            }
 
             match service.finalize_middleware_receipt(
                 forward.receipt,
@@ -198,6 +317,17 @@ pub(super) async fn run(
                     (status, headers, finalized.wire_body).into_response()
                 }
                 Err(err) => {
+                    let status = forward_error_status(&err);
+                    let detail = detail_snippet_text(&err.to_string());
+                    log_generated_outcome(
+                        outcome_ctx,
+                        "finalize_buffered",
+                        status,
+                        upstream_status,
+                        &forward.selected_route,
+                        forward.failed_attempts.len() as u32,
+                        &detail,
+                    );
                     service_error_response(surface, endpoint_path, service, &request_id, err, None)
                 }
             }
@@ -262,28 +392,99 @@ pub(super) async fn run(
                         inner: finalized.body,
                         _route_in_flight: route_in_flight.take(),
                     });
-                    let body = Body::from_stream(
-                        guarded
-                            .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string()))),
-                    );
+                    let stream_request_id = request_id.clone();
+                    let body = Body::from_stream(guarded.scan((), move |_, chunk| {
+                        std::future::ready(match chunk {
+                            Ok(bytes) => Some(Ok::<_, std::io::Error>(bytes)),
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "stream_abort",
+                                    request_id = %stream_request_id,
+                                    error = %err,
+                                    "response stream error; ending body gracefully"
+                                );
+                                None
+                            }
+                        })
+                    }));
                     (status, headers, body).into_response()
                 }
                 Err(err) => {
+                    let status = forward_error_status(&err);
+                    let detail = detail_snippet_text(&err.to_string());
+                    log_generated_outcome(
+                        outcome_ctx,
+                        "finalize_stream",
+                        status,
+                        upstream_status,
+                        &forward.selected_route,
+                        forward.failed_attempts.len() as u32,
+                        &detail,
+                    );
                     service_error_response(surface, endpoint_path, service, &request_id, err, None)
                 }
             }
         }
         Ok(MiddlewareForwardResult::UpstreamError(forward)) => {
+            if let Some(in_flight) = route_in_flight.as_mut() {
+                in_flight.retarget(&forward.selected_route);
+            }
             let (status, body) = errors::normalize_upstream_error_parts(
                 surface,
-                forward.upstream_status,
-                &forward.upstream_body,
+                forward.error.upstream_status,
+                &forward.error.upstream_body,
                 &received_body,
                 Some(&request_id),
             );
+            log_failed_attempts(outcome_ctx, &forward.failed_attempts, true);
+            let detail = detail_snippet_bytes(&forward.error.upstream_body);
+            log_generated_outcome(
+                outcome_ctx,
+                "stream_upstream",
+                status,
+                forward.error.upstream_status,
+                &forward.selected_route,
+                forward.failed_attempts.len() as u32,
+                &detail,
+            );
             finalize_generated(surface, service, endpoint_path, status, body, &[], e2ee)
         }
-        Err(err) => service_error_response(surface, endpoint_path, service, &request_id, err, e2ee),
+        Ok(MiddlewareForwardResult::AllFailed(forward)) => {
+            log_failed_attempts(outcome_ctx, &forward.failed_attempts, stream);
+            let status = forward_error_status(&forward.error);
+            let detail = detail_snippet_text(&forward.error.to_string());
+            log_generated_outcome(
+                outcome_ctx,
+                "all_candidates_failed",
+                status,
+                0,
+                "",
+                forward.failed_attempts.len() as u32,
+                &detail,
+            );
+            service_error_response(
+                surface,
+                endpoint_path,
+                service,
+                &request_id,
+                forward.error,
+                e2ee,
+            )
+        }
+        Err(err) => {
+            let status = forward_error_status(&err);
+            let detail = detail_snippet_text(&err.to_string());
+            log_generated_outcome(
+                outcome_ctx,
+                "forward_error",
+                status,
+                0,
+                "",
+                0,
+                &detail,
+            );
+            service_error_response(surface, endpoint_path, service, &request_id, err, e2ee)
+        }
     }
 }
 
