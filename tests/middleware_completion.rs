@@ -311,6 +311,15 @@ fn route_running(snapshot: &Value, route_id: &str) -> u64 {
         .unwrap()
 }
 
+fn route_snapshot<'a>(snapshot: &'a Value, route_id: &str) -> &'a Value {
+    snapshot["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|route| route["route_id"] == json!(route_id))
+        .unwrap_or_else(|| panic!("route {route_id} not found in snapshot: {snapshot}"))
+}
+
 #[tokio::test]
 async fn catalog_derives_single_public_model() {
     let calls = Arc::new(CapturedCalls::default());
@@ -593,6 +602,83 @@ async fn cache_aware_selection_keeps_similar_prefix_on_same_route() {
     assert_eq!(second_body["id"], json!("chat-a"));
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 2);
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 0);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(snapshot["cache_index"]["type"], json!("radix_tree"));
+    assert_eq!(snapshot["cache_index"]["models"], json!(1));
+    assert_eq!(snapshot["cache_index"]["records"], json!(2));
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(2)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["selected_by_cache"],
+        json!(1)
+    );
+}
+
+#[tokio::test]
+async fn disabled_upstream_cache_is_removed_before_selection() {
+    let calls_a = Arc::new(CapturedCalls::default());
+    let calls_b = Arc::new(CapturedCalls::default());
+    let upstream_a = spawn_openai_upstream(
+        "chat-a",
+        200,
+        json!({"object":"chat.completion","model":"up-a","choices":[]}),
+        calls_a.clone(),
+    )
+    .await;
+    let upstream_b = spawn_openai_upstream(
+        "chat-b",
+        200,
+        json!({"object":"chat.completion","model":"up-b","choices":[]}),
+        calls_b.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![
+        upstream_config("gpu-a", &upstream_a, "gpt-test", "up-a"),
+        upstream_config("gpu-b", &upstream_b, "gpt-test", "up-b"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager.clone(),
+        MiddlewareConfig {
+            cache_threshold: 0.25,
+            ..Default::default()
+        },
+    );
+
+    let (first_status, _, first_body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "alpha stable prefix one"))
+            .await,
+    )
+    .await;
+    assert_eq!(first_status, 200);
+    assert_eq!(first_body["id"], json!("chat-a"));
+
+    manager.set_enabled("gpu-a", false).unwrap();
+
+    let (second_status, _, second_body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "alpha stable prefix two"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(second_status, 200);
+    assert_eq!(second_body["id"], json!("chat-b"));
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["enabled"],
+        json!(false)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(0)
+    );
+    assert_eq!(snapshot["cache_index"]["removed_routes_total"], json!(1));
 }
 
 #[tokio::test]

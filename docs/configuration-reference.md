@@ -76,7 +76,7 @@ for the selection algorithm and security boundary.
 | `middleware.cache_threshold` | `0.30` | Minimum common-prefix match rate needed to prefer a previously warmed route when load is balanced. |
 | `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
 | `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
-| `middleware.max_history_per_route` | `256` | Maximum routing-text samples kept per public model and route for prefix matching. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
+| `middleware.max_history_per_route` | `256` | Maximum routing-text records kept per public model and route in the process-local radix cache index. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
 | `middleware.metrics_poll_ms` | `1000` | Background upstream metrics polling interval. Set to `0` to disable PIG-aware routing and use only gateway-local in-flight counters. |
 | `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling is concurrent, so one slow upstream does not serially delay the full target set. |
 | `middleware.metrics_stale_ms` | `3000` | Age after which a metrics sample is ignored and the route falls back to local in-flight state. |
@@ -125,10 +125,10 @@ admin bearer token. Dynamic enable/disable should use
 snapshots.
 The router exposes an authenticated
 `GET /v1/admin/router` snapshot with current route counters, in-flight counts,
-selection counters, history sample counts, redacted PIG metrics status, router
-config, and upstream config digest. The endpoint returns `404` when the admin
-token is unset or the middleware is not enabled. The snapshot never includes
-upstream bearer tokens.
+selection counters, cache index stats, per-route cache record counts, redacted
+PIG metrics status, router config, and upstream config digest. The endpoint
+returns `404` when the admin token is unset or the middleware is not enabled.
+The snapshot never includes upstream bearer tokens.
 
 Tier handling is deliberately fail-safe. The router can use PIG's basic and
 premium counters, but it trusts the caller's `x-user-tier` only when

@@ -18,6 +18,7 @@ use crate::aggregator::upstream_config::{
     UpstreamProvider,
 };
 
+use super::cache_index::CacheIndex;
 use super::completion::{self, CompletionInput};
 use super::config::MiddlewareConfig;
 use super::errors::{self, Surface};
@@ -43,12 +44,13 @@ struct RouteStats {
     selected_by_cache: u64,
     selected_by_load: u64,
     selected_by_order: u64,
+    cache_rejected_by_pressure: u64,
 }
 
 #[derive(Default)]
 struct RouterState {
     stats: HashMap<String, RouteStats>,
-    history: HashMap<String, HashMap<String, Vec<String>>>,
+    cache_index: CacheIndex,
     upstream_metrics: HashMap<String, UpstreamMetrics>,
 }
 
@@ -234,11 +236,7 @@ impl RouterBackend {
             for model in upstream.models.keys() {
                 let route_id = format!("{}:{model}", upstream.name);
                 let stats = state.stats.get(&route_id).cloned().unwrap_or_default();
-                let history_samples = state
-                    .history
-                    .get(model)
-                    .and_then(|by_route| by_route.get(&route_id))
-                    .map_or(0, Vec::len);
+                let cache_stats = state.cache_index.route_stats(model, &route_id);
                 routes.push(json!({
                     "route_id": route_id,
                     "enabled": upstream.enabled,
@@ -250,7 +248,9 @@ impl RouterBackend {
                     "selected_by_cache": stats.selected_by_cache,
                     "selected_by_load": stats.selected_by_load,
                     "selected_by_order": stats.selected_by_order,
-                    "history_samples": history_samples,
+                    "cache_rejected_by_pressure": stats.cache_rejected_by_pressure,
+                    "cache_records": cache_stats.records,
+                    "cache_chars": cache_stats.chars,
                     "bearer_token_configured": upstream.bearer_token_configured,
                     "pig_metrics": state.metrics_admin_json(&upstream.name, &self.config),
                 }));
@@ -266,6 +266,7 @@ impl RouterBackend {
             "purpose": "single_model_multi_backend_cache_and_load_aware_routing",
             "config": self.config,
             "routing_text_max_chars": MAX_ROUTING_HISTORY_CHARS,
+            "cache_index": state.cache_index_admin_json(),
             "public_model": public_model.as_ref().ok().and_then(Clone::clone),
             "config_error": public_model.err(),
             "upstream_config_digest": upstream_snapshot.config_digest,
@@ -589,16 +590,16 @@ impl RouterState {
         }
         for route in routes {
             self.stats.entry(route.route_id.clone()).or_default();
-            self.history
-                .entry(model.to_string())
-                .or_default()
-                .entry(route.route_id.clone())
-                .or_default();
         }
+        let active_routes = routes
+            .iter()
+            .map(|route| route.route_id.clone())
+            .collect::<HashSet<_>>();
+        self.cache_index.retain_model_routes(model, &active_routes);
         if routes.len() == 1 {
             let route_id = routes[0].route_id.clone();
             let running_at_select = self.stats.get(&route_id).map_or(0, |s| s.running);
-            self.record_history(model, &route_id, text, config.max_history_per_route);
+            self.record_cache(model, &route_id, text, config.max_history_per_route);
             return Some(RouteSelection {
                 route_id,
                 reason: "single",
@@ -635,7 +636,7 @@ impl RouterState {
             self.select_cache_aware(model, text, routes, config, tier)
         }?;
 
-        self.record_history(
+        self.record_cache(
             model,
             &selected.route_id,
             text,
@@ -645,60 +646,53 @@ impl RouterState {
     }
 
     fn select_cache_aware(
-        &self,
+        &mut self,
         model: &str,
         text: &str,
         routes: &[RouterRoute],
         config: &MiddlewareConfig,
         tier: UserTier,
     ) -> Option<RouteSelection> {
-        let input_chars = text.chars().count().max(1);
-        let history = self.history.get(model);
-        let mut best: Option<(&RouterRoute, f32, RouteOrderKey)> = None;
-        for route in routes {
-            let matched = history
-                .and_then(|by_route| by_route.get(&route.route_id))
-                .map(|samples| {
-                    samples
-                        .iter()
-                        .map(|sample| common_prefix_chars(sample, text))
-                        .max()
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0);
-            let rate = matched as f32 / input_chars as f32;
-            let order_key = self.route_order_key(route, config, tier);
-            let replace = match best.as_ref() {
-                None => true,
-                Some((_, best_rate, best_key)) => {
-                    rate > *best_rate || (rate == *best_rate && order_key < *best_key)
+        let matched = self.cache_index.match_prefix(model, text);
+        let input_chars = matched.as_ref().map_or_else(
+            || text.chars().count().max(1),
+            |matched| matched.input_chars,
+        );
+        let rate = matched.as_ref().map_or(0.0, |matched| {
+            matched.matched_chars as f32 / input_chars as f32
+        });
+        let least = self.least_loaded(routes, config, tier)?;
+        if let Some(matched) = matched {
+            if let Some(cache_route) = routes
+                .iter()
+                .find(|route| route.route_id == matched.route_id)
+            {
+                if rate > config.cache_threshold
+                    && self.cache_route_is_acceptable(cache_route, least, config, tier)
+                {
+                    let pressure = self.route_pressure(cache_route, config, tier);
+                    return Some(RouteSelection {
+                        route_id: cache_route.route_id.clone(),
+                        reason: "cache",
+                        cache_match_rate: rate,
+                        running_at_select: pressure.effective_running,
+                    });
                 }
-            };
-            if replace {
-                best = Some((route, rate, order_key));
+                if rate > config.cache_threshold {
+                    self.stats
+                        .entry(cache_route.route_id.clone())
+                        .or_default()
+                        .cache_rejected_by_pressure += 1;
+                }
             }
         }
-        let (cache_route, rate, _) = best?;
-        let least = self.least_loaded(routes, config, tier)?;
-        if rate > config.cache_threshold
-            && self.cache_route_is_acceptable(cache_route, least, config, tier)
-        {
-            let pressure = self.route_pressure(cache_route, config, tier);
-            Some(RouteSelection {
-                route_id: cache_route.route_id.clone(),
-                reason: "cache",
-                cache_match_rate: rate,
-                running_at_select: pressure.effective_running,
-            })
-        } else {
-            let pressure = self.route_pressure(least, config, tier);
-            Some(RouteSelection {
-                route_id: least.route_id.clone(),
-                reason: "least_running",
-                cache_match_rate: rate,
-                running_at_select: pressure.effective_running,
-            })
-        }
+        let pressure = self.route_pressure(least, config, tier);
+        Some(RouteSelection {
+            route_id: least.route_id.clone(),
+            reason: "least_running",
+            cache_match_rate: rate,
+            running_at_select: pressure.effective_running,
+        })
     }
 
     fn cache_route_is_acceptable(
@@ -734,22 +728,12 @@ impl RouterState {
         true
     }
 
-    fn record_history(&mut self, model: &str, route_id: &str, text: &str, max_samples: usize) {
-        if text.is_empty() || max_samples == 0 {
+    fn record_cache(&mut self, model: &str, route_id: &str, text: &str, max_records: usize) {
+        if text.is_empty() || max_records == 0 {
             return;
         }
         let text = limit_chars(text, MAX_ROUTING_HISTORY_CHARS);
-        let samples = self
-            .history
-            .entry(model.to_string())
-            .or_default()
-            .entry(route_id.to_string())
-            .or_default();
-        samples.push(text);
-        if samples.len() > max_samples {
-            let overflow = samples.len() - max_samples;
-            samples.drain(0..overflow);
-        }
+        self.cache_index.record(model, route_id, &text, max_records);
     }
 
     fn update_upstream_metrics(&mut self, upstream_name: String, metrics: UpstreamMetrics) {
@@ -780,6 +764,20 @@ impl RouterState {
             "basic_inflight": metrics.basic_inflight,
             "premium_inflight": metrics.premium_inflight,
             "age_ms": metrics.age_ms(),
+        })
+    }
+
+    fn cache_index_admin_json(&self) -> Value {
+        let stats = self.cache_index.stats();
+        json!({
+            "type": "radix_tree",
+            "models": stats.models,
+            "routes": stats.routes,
+            "records": stats.records,
+            "chars": stats.chars,
+            "nodes": stats.nodes,
+            "evictions_total": stats.evictions_total,
+            "removed_routes_total": stats.removed_routes_total,
         })
     }
 }
@@ -1107,10 +1105,6 @@ fn append_messages(out: &mut BoundedText, value: Option<&Value>) {
     }
 }
 
-fn common_prefix_chars(a: &str, b: &str) -> usize {
-    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,6 +1233,7 @@ mod tests {
             .unwrap();
         assert_eq!(selected.route_id, "b:m");
         assert_eq!(selected.reason, "least_running");
+        assert_eq!(state.stats["a:m"].cache_rejected_by_pressure, 1);
     }
 
     #[test]
@@ -1409,14 +1404,15 @@ mod tests {
     }
 
     #[test]
-    fn routing_history_is_bounded() {
+    fn routing_cache_records_are_bounded() {
         let mut state = RouterState::default();
         let long = "x".repeat(MAX_ROUTING_HISTORY_CHARS + 10);
 
-        state.record_history("m", "a:m", &long, 16);
+        state.record_cache("m", "a:m", &long, 16);
 
-        let len = state.history["m"]["a:m"][0].chars().count();
-        assert_eq!(len, MAX_ROUTING_HISTORY_CHARS);
+        let stats = state.cache_index.route_stats("m", "a:m");
+        assert_eq!(stats.records, 1);
+        assert_eq!(stats.chars, MAX_ROUTING_HISTORY_CHARS);
     }
 
     #[test]

@@ -222,7 +222,7 @@ storage decisions, and production compose wiring for concrete upstream policy.
 | Provider adapters | Implemented for Tinfoil, NEAR AI, Chutes, PhalaDirect, ACI service, and generic OpenAI-compatible upstreams |
 | Attested-session audit records | Implemented for upstream sessions; downstream sessions pending TLS/domain work |
 | Middleware framework | Implemented in-process as a single-model cache-aware router |
-| Receipt store | In-memory; receipt TTL is configurable. Receipts hold hashes, not request bodies. When router middleware is enabled, the gateway keeps only bounded in-memory routing-text samples for cache affinity; they are not persisted or exposed by admin APIs. |
+| Receipt store | In-memory; receipt TTL is configurable. Receipts hold hashes, not request bodies. When router middleware is enabled, the gateway keeps bounded routing-text records in a process-local radix cache index for affinity; they are not persisted or exposed by admin APIs. |
 | Public transparency log | Not implemented |
 
 The binary has no ephemeral-key or stub-quote startup mode. It loads identity,
@@ -439,11 +439,12 @@ Deployment files:
 The gateway runs in direct-upstream mode unless a `middleware` section is
 configured. When enabled, the middleware is the built-in single-model router: it
 derives candidates from the live upstream config and orders them in-process with
-cache-aware affinity, PIG metrics pressure handling, and processed-count
-tie-breaking for idle cold traffic. Basic requests treat both global PIG limit
-and basic-tier limit as capacity constraints; premium requests use global
-headroom so a basic-full node can still serve premium traffic. The inbound
-`x-user-tier` header is ignored and stripped by default; enable
+cache-aware affinity from a bounded radix cache index, PIG metrics pressure
+handling, and processed-count tie-breaking for idle cold traffic. Basic
+requests treat both global PIG limit and basic-tier limit as capacity
+constraints; premium requests use global headroom so a basic-full node can
+still serve premium traffic. The inbound `x-user-tier` header is ignored and
+stripped by default; enable
 `middleware.trusted_user_tier_header` only behind a trusted front door that
 sets or sanitizes it. This replaces the previous external adapter/vLLM Router
 hop and does not use a `proxy_url`.

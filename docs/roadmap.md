@@ -28,7 +28,7 @@ protocol evolution. This fork should stay small and operationally focused.
 | --- | --- | --- |
 | In-process router middleware | Done | Middleware runs inside the gateway process and orders candidates before the verified backend forward. |
 | Dynamic upstream config | Done | Live route set comes from `<state_dir>/upstreams.json`; admin `GET`/`PUT` updates do not require gateway restart. |
-| Cache-aware ordering | Done | Bounded in-memory routing-text history can prefer a warmed route when pressure is balanced. |
+| Cache-aware ordering | Done | Bounded in-memory radix cache index can prefer a warmed route when pressure is balanced. |
 | PIG pressure awareness | Done | Router polls upstream `/v1/metrics`, parses PIG running/waiting/limit/tier counters, and avoids pressured routes. |
 | Tier handling | Done | `trusted_user_tier_header` defaults to `false`; public callers cannot self-promote to premium. |
 | Verification chain | Done | Middleware does not mint verification facts; backend verification and receipt finalization remain unchanged. |

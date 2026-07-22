@@ -4,6 +4,7 @@
 //! `AciService`. It only orders candidate upstream routes. Provider verification,
 //! channel binding, forwarding, and receipt finalization stay in `AciService`.
 
+mod cache_index;
 pub mod completion;
 pub mod config;
 pub mod errors;

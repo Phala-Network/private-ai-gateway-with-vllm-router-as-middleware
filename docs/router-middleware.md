@@ -61,8 +61,8 @@ For each request, the router:
 
 1. Confirms that the requested `model` equals the configured public model.
 2. Builds candidates from the current upstream config.
-3. Reads local route state: in-flight count, processed count, and bounded prompt
-   history used for cache affinity.
+3. Reads local route state: in-flight count, processed count, and the bounded
+   radix-tree cache index used for prefix affinity.
 4. Reads the latest PIG metrics sample for each upstream when metrics polling is
    enabled and the sample is fresh.
 5. Classifies pressure.
@@ -73,7 +73,7 @@ PIG pressure always wins over cache affinity. A warmed-prefix route is preferred
 only when it is not waiting, not full, and not meaningfully more loaded than a
 healthier route.
 
-When routes are equally idle and no cache history exists, the router uses the
+When routes are equally idle and no cache match exists, the router uses the
 processed counter as a cold-traffic tie breaker so new traffic spreads across
 nodes over time.
 
@@ -132,17 +132,23 @@ or sets the header. In that mode:
 
 ## Cache Affinity
 
-The router stores bounded routing-text samples in memory per route. It compares
-new requests against those samples and prefers a route when the common-prefix
-match reaches `cache_threshold`.
+The router stores bounded routing-text records in a process-local radix tree
+per public model. Each tree node tracks the most recent route that reached that
+prefix, so a new request can find a warmed-prefix candidate without scanning all
+previous records. The route is preferred only when the matched-prefix rate
+reaches `cache_threshold` and the PIG pressure gate says that route is still
+acceptable.
 
-The history is intentionally limited:
+The index is intentionally limited:
 
 - It is process-local and lost on restart.
 - It is not persisted.
 - It is not exposed by admin APIs.
+- Each route keeps at most `max_history_per_route` routing-text records.
 - Each stored routing text is capped internally; the cap is visible in
   `/v1/admin/router` as `routing_text_max_chars`.
+- Disabled or removed routes are pruned from the model's cache index before
+  selection, so stale cache affinity cannot route to an inactive upstream.
 
 Cache affinity is an optimization, not a proof. Receipts still prove the
 selected route and upstream verification facts, not a cache-hit claim.
@@ -182,7 +188,7 @@ The snapshot includes:
 - Upstream config digest.
 - Per-route local running and processed counters.
 - Cache-selection and load-selection counters.
-- History sample counts.
+- Cache index type, aggregate index counters, and per-route cache record counts.
 - Redacted PIG metrics status, including sample age and parse errors.
 
 The snapshot is operational state only. It is not part of the ACI proof chain.
