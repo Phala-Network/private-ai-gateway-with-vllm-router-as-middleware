@@ -5,6 +5,7 @@
 //! forwards completions through the service in-process, and it relays model
 //! catalogs from the control plane.
 
+mod cache_index;
 pub mod completion;
 pub mod config;
 pub mod control;
