@@ -5,6 +5,7 @@
 //! across multiple configured upstreams with cache-aware and PIG-aware ordering.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::types::Engine;
 
@@ -30,6 +31,17 @@ pub struct MiddlewareConfig {
     /// disabled unless a trusted front door strips or sets the header.
     pub trusted_user_tier_header: bool,
     pub default_engine: Option<Engine>,
+    /// Optional control-plane URL used only for post-request usage reports.
+    /// Routing remains fully local to this middleware.
+    pub control_url: Option<String>,
+    /// Optional bearer token for post-request usage reports.
+    pub control_token: Option<String>,
+    /// Timeout for the best-effort post-request usage report. Defaults to
+    /// 10_000 ms.
+    pub control_post_timeout_ms: Option<u64>,
+    /// Optional static pricing block used to inject `usage.cost` into client
+    /// responses and echoed in `/consult/post` reports.
+    pub pricing: Option<Value>,
     /// SSE keep-alive interval for streaming responses. Defaults to 10_000 ms;
     /// `0` disables the heartbeat.
     pub sse_keepalive_ms: Option<u64>,
@@ -49,6 +61,10 @@ impl Default for MiddlewareConfig {
             metrics_path: "/v1/metrics".to_string(),
             trusted_user_tier_header: false,
             default_engine: None,
+            control_url: None,
+            control_token: None,
+            control_post_timeout_ms: None,
+            pricing: None,
             sse_keepalive_ms: None,
         }
     }

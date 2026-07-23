@@ -7,7 +7,9 @@
 mod cache_index;
 pub mod completion;
 pub mod config;
+mod control;
 pub mod errors;
+pub mod pricing;
 pub mod request_transform;
 pub mod response_transform;
 mod router;
@@ -29,6 +31,7 @@ use crate::aggregator::upstream_config::UpstreamConfigManager;
 /// Middleware handle held by the gateway's app state.
 pub struct Middleware {
     router: router::RouterBackend,
+    control: Option<control::ControlClient>,
 }
 
 impl Middleware {
@@ -36,8 +39,10 @@ impl Middleware {
         config: &MiddlewareConfig,
         upstream_config: Arc<UpstreamConfigManager>,
     ) -> Result<Self, String> {
+        let control = control::ControlClient::from_config(config)?;
         Ok(Self {
             router: router::RouterBackend::new(config, upstream_config)?,
+            control,
         })
     }
 
@@ -65,6 +70,8 @@ impl Middleware {
         service: &AciService,
         input: CompletionInput,
     ) -> Response {
-        self.router.handle_completion(service, input).await
+        self.router
+            .handle_completion(service, self.control.clone(), input)
+            .await
     }
 }

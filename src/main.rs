@@ -752,10 +752,6 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
                 "tls-certificate-paths",
                 r#"{"tls": {"certificate_paths": ["/cert.pem"]}}"#,
             ),
-            (
-                "middleware-control-url",
-                r#"{"middleware": {"control_url": "https://control.example"}}"#,
-            ),
             ("middleware-mode", r#"{"middleware": {"mode": "router"}}"#),
         ] {
             let config_path = temp_path(name);

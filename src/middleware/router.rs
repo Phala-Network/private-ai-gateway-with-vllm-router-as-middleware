@@ -21,6 +21,7 @@ use crate::aggregator::upstream_config::{
 use super::cache_index::CacheIndex;
 use super::completion::{self, CompletionInput};
 use super::config::MiddlewareConfig;
+use super::control::ControlClient;
 use super::errors::{self, Surface};
 use super::request_transform::Endpoint;
 use super::types::{ProviderFormat, RouteCandidate};
@@ -336,6 +337,7 @@ impl RouterBackend {
     pub async fn handle_completion(
         &self,
         service: &AciService,
+        control: Option<ControlClient>,
         input: CompletionInput,
     ) -> Response {
         let snapshot = self.upstream_config.snapshot();
@@ -379,6 +381,8 @@ impl RouterBackend {
         completion::run(
             service,
             self.config.sse_keepalive_ms,
+            control,
+            self.config.pricing.clone(),
             input,
             routes.into_iter().map(|route| route.candidate).collect(),
             route_in_flight,

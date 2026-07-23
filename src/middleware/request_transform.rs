@@ -129,7 +129,7 @@ pub fn transform_to_provider_request(
     engine: Option<Engine>,
 ) -> Result<Value, TransformError> {
     let mut params = params.clone();
-    inject_stream_options(&mut params);
+    inject_stream_usage_options(&mut params, endpoint);
     let config = select_config(format, endpoint, engine)?;
     transform_using_provider_config(&config, &params)
 }
@@ -259,17 +259,11 @@ fn set_nested_property(obj: &mut Value, path: &str, value: Value) {
         .insert(parts[parts.len() - 1].to_string(), value);
 }
 
-// Mutate `params` to request usage on streaming: only
-// when `stream === true` and `stream_options.include_usage` is not already true.
-fn inject_stream_options(params: &mut Value) {
+// Mutate `params` to request usage on streaming. We force the usage flags to
+// true because the gateway depends on usage-bearing stream events for metering
+// and downstream billing; a caller-provided false must not suppress them.
+fn inject_stream_usage_options(params: &mut Value, endpoint: Endpoint) {
     if params.get("stream") != Some(&Value::Bool(true)) {
-        return;
-    }
-    let already = params
-        .get("stream_options")
-        .and_then(|so| so.get("include_usage"))
-        == Some(&Value::Bool(true));
-    if already {
         return;
     }
     if let Some(obj) = params.as_object_mut() {
@@ -283,6 +277,10 @@ fn inject_stream_options(params: &mut Value) {
             .as_object_mut()
             .unwrap()
             .insert("include_usage".to_string(), Value::Bool(true));
+        obj.insert("continuous_usage_stats".to_string(), Value::Bool(true));
+        if endpoint == Endpoint::Complete {
+            obj.insert("include_usage".to_string(), Value::Bool(true));
+        }
     }
 }
 
@@ -933,6 +931,7 @@ fn openai_chat_complete_config(engine: Option<Engine>) -> ProviderConfig {
         ("logprobs", vec![pc("logprobs").with_default(json!(false))]),
         ("top_logprobs", vec![pc("top_logprobs")]),
         ("stream_options", vec![pc("stream_options")]),
+        ("continuous_usage_stats", vec![pc("continuous_usage_stats")]),
         ("service_tier", vec![pc("service_tier")]),
         ("parallel_tool_calls", vec![pc("parallel_tool_calls")]),
         ("max_completion_tokens", vec![pc("max_completion_tokens")]),
@@ -993,6 +992,8 @@ fn openai_complete_config() -> ProviderConfig {
         ("n", vec![pc("n").with_default(json!(1))]),
         ("stream", vec![pc("stream").with_default(json!(false))]),
         ("stream_options", vec![pc("stream_options")]),
+        ("include_usage", vec![pc("include_usage")]),
+        ("continuous_usage_stats", vec![pc("continuous_usage_stats")]),
         ("logprobs", vec![pc("logprobs").with_max(5)]),
         ("echo", vec![pc("echo").with_default(json!(false))]),
         ("stop", vec![pc("stop")]),
@@ -1218,12 +1219,14 @@ mod tests {
 
     #[test]
     fn stream_options_injected_for_chat_but_not_responses() {
+        let expected_stream_options = json!({ "include_usage": true });
         let chat_out = chat(
             ProviderFormat::Openai,
             json!({ "model": "m", "messages": [], "stream": true }),
             None,
         );
-        assert_eq!(chat_out["stream_options"], json!({ "include_usage": true }));
+        assert_eq!(chat_out["stream_options"], expected_stream_options);
+        assert_eq!(chat_out["continuous_usage_stats"], json!(true));
 
         // Legacy /v1/completions must also carry include_usage to upstream, or
         // usage-only streaming providers (e.g. vLLM) never emit a usage chunk
@@ -1239,6 +1242,8 @@ mod tests {
             complete_out["stream_options"],
             json!({ "include_usage": true })
         );
+        assert_eq!(complete_out["include_usage"], json!(true));
+        assert_eq!(complete_out["continuous_usage_stats"], json!(true));
 
         let responses = transform_to_provider_request(
             ProviderFormat::Openai,

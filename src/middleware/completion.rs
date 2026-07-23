@@ -5,6 +5,8 @@
 //! and finalizes receipts/E2EE.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -23,10 +25,11 @@ use crate::aggregator::service::{
     ServiceError, ServiceResponseStream,
 };
 
+use super::control::ControlClient;
 use super::errors::{self, Surface};
 use super::request_transform::{build_candidates, Endpoint};
 use super::router::RouteInFlight;
-use super::sse::KeepAliveStream;
+use super::sse::{KeepAliveStream, MeterStream, StreamReport};
 use super::stream_transform::SseTransformStream;
 use super::types::{ProviderFormat, RouteCandidate};
 use super::{response_transform, stream_transform};
@@ -59,8 +62,29 @@ struct OutcomeCtx<'a> {
     started: Instant,
 }
 
-fn should_log_failure(status: u16) -> bool {
+pub(super) fn should_log_failure(status: u16) -> bool {
     status != 429
+}
+
+const STANDARD_FINISH_REASONS: &[&str] = &[
+    "stop",
+    "length",
+    "tool_calls",
+    "function_call",
+    "content_filter",
+    "end_turn",
+    "max_tokens",
+    "stop_sequence",
+    "tool_use",
+    "pause_turn",
+    "refusal",
+    "model_context_window_exceeded",
+];
+
+pub(super) fn finish_reasons_anomalous<'a, I: IntoIterator<Item = &'a str>>(reasons: I) -> bool {
+    reasons
+        .into_iter()
+        .any(|reason| !STANDARD_FINISH_REASONS.contains(&reason))
 }
 
 fn sanitize_log_value(value: &str, max_chars: usize) -> String {
@@ -69,6 +93,14 @@ fn sanitize_log_value(value: &str, max_chars: usize) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(max_chars)
         .collect()
+}
+
+pub(super) fn sanitize_identifier(value: &str) -> String {
+    sanitize_log_value(value, 128)
+}
+
+pub(super) fn sanitize_reason(reason: &str) -> String {
+    sanitize_log_value(reason, 32)
 }
 
 fn detail_snippet_bytes(raw: &[u8]) -> String {
@@ -84,7 +116,11 @@ fn detail_snippet_text(raw: &str) -> String {
     sanitize_log_value(raw, MAX_LOG_DETAIL_CHARS)
 }
 
-fn debug_gated_detail(detail: &str) -> &str {
+pub(super) fn detail_snippet(raw: &[u8]) -> String {
+    detail_snippet_bytes(raw)
+}
+
+pub(super) fn debug_gated_detail(detail: &str) -> &str {
     if tracing::enabled!(target: "request_outcome", tracing::Level::DEBUG) {
         detail
     } else {
@@ -143,6 +179,8 @@ fn log_failed_attempts(ctx: OutcomeCtx<'_>, attempts: &[(String, u16)], is_strea
 pub(super) async fn run(
     service: &AciService,
     sse_keepalive_ms: Option<u64>,
+    control: Option<ControlClient>,
+    pricing: Option<Value>,
     input: CompletionInput,
     candidates: Vec<RouteCandidate>,
     mut route_in_flight: Option<RouteInFlight>,
@@ -342,6 +380,7 @@ pub(super) async fn run(
                 .cloned()
                 .unwrap_or_else(|| "text/event-stream".to_string());
             let upstream_status = forward.upstream_status;
+            let attempt_index = forward.failed_attempts.len() as u32;
             let selected_format = candidates
                 .iter()
                 .find(|c| c.route_id == forward.selected_route)
@@ -353,12 +392,34 @@ pub(super) async fn run(
                     Some(transform) => Box::pin(SseTransformStream::new(forward.body, transform)),
                     None => forward.body,
                 };
+            let downstream_abort = Arc::new(AtomicBool::new(false));
+            let meter_settled = Arc::new(AtomicBool::new(false));
+            let stream_report = StreamReport {
+                control: control.clone(),
+                request_id: request_id.clone(),
+                endpoint: endpoint_path.to_string(),
+                request_model: model.unwrap_or("").to_string(),
+                pricing: pricing.clone(),
+                spend_mode: None,
+                user_id: None,
+                virtual_key_id: None,
+                selected_route_id: Some(forward.selected_route.clone()),
+                attempt_index,
+                upstream_status,
+                started,
+                downstream_abort: downstream_abort.clone(),
+                settled: meter_settled.clone(),
+            };
+            let metered: ServiceResponseStream = Box::pin(MeterStream::new(
+                transformed,
+                stream_report,
+                crate::sse_protocol::sse_protocol(endpoint_path),
+            ));
             let keepalive = match sse_keepalive_ms.unwrap_or(10_000) {
                 0 => None,
                 ms => Some(Duration::from_millis(ms)),
             };
-            let kept: ServiceResponseStream =
-                Box::pin(KeepAliveStream::new(transformed, keepalive));
+            let kept: ServiceResponseStream = Box::pin(KeepAliveStream::new(metered, keepalive));
 
             let receipt_id = journal.peek_receipt_id();
             match service.finalize_middleware_response_stream(
@@ -393,16 +454,36 @@ pub(super) async fn run(
                         _route_in_flight: route_in_flight.take(),
                     });
                     let stream_request_id = request_id.clone();
+                    let stream_model = model.unwrap_or("").to_string();
+                    let stream_route = forward.selected_route.clone();
+                    let stream_started = started;
                     let body = Body::from_stream(guarded.scan((), move |_, chunk| {
                         std::future::ready(match chunk {
                             Ok(bytes) => Some(Ok::<_, std::io::Error>(bytes)),
                             Err(err) => {
+                                downstream_abort.store(true, Ordering::Relaxed);
                                 tracing::warn!(
                                     target: "stream_abort",
                                     request_id = %stream_request_id,
                                     error = %err,
                                     "response stream error; ending body gracefully"
                                 );
+                                if meter_settled.load(Ordering::Relaxed) {
+                                    let stream_ctx = OutcomeCtx {
+                                        request_id: &stream_request_id,
+                                        model: &stream_model,
+                                        started: stream_started,
+                                    };
+                                    log_generated_outcome(
+                                        stream_ctx,
+                                        "finalize_error",
+                                        502,
+                                        upstream_status,
+                                        &stream_route,
+                                        attempt_index,
+                                        &detail_snippet_text(&err.to_string()),
+                                    );
+                                }
                                 None
                             }
                         })
