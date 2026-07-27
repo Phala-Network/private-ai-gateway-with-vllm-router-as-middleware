@@ -1,6 +1,5 @@
 //! Plain OpenAI-compatible upstream backend.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -18,7 +17,6 @@ use crate::aci::receipt::{ChannelBinding, UpstreamVerifiedEvent};
 
 /// Version header required by the native Anthropic API on every request.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const MAX_PINNED_CLIENT_CACHE_ENTRIES: usize = 8;
 
 /// How the configured credential is attached to upstream requests.
 enum UpstreamAuth {
@@ -45,18 +43,45 @@ pub struct OpenAICompatibleBackend {
     path: String,
     auth: Option<UpstreamAuth>,
     client: reqwest::Client,
-    pinned_client_cache: Mutex<HashMap<PinnedClientKey, reqwest::Client>>,
+    pinned_client: PinnedClientCache,
     connect_timeout_seconds: u64,
     read_timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PinnedClientKey {
-    base_url: String,
+struct CachedPinnedClient {
     accepted_spkis: Vec<String>,
-    accepted_certificates: Vec<String>,
-    connect_timeout_seconds: u64,
-    read_timeout_seconds: u64,
+    client: reqwest::Client,
+}
+
+/// The backend has one immutable origin and timeout policy, so retaining only
+/// its current verified binding generation keeps the cache strictly bounded.
+#[derive(Default)]
+struct PinnedClientCache {
+    current: Mutex<Option<CachedPinnedClient>>,
+}
+
+impl PinnedClientCache {
+    fn get_or_build(
+        &self,
+        accepted_spkis: Vec<String>,
+        build: impl FnOnce(&[String]) -> Result<reqwest::Client, UpstreamError>,
+    ) -> Result<reqwest::Client, UpstreamError> {
+        // Build while holding the lock so concurrent misses for the same
+        // generation converge on one connection pool.
+        let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = current.as_ref() {
+            if cached.accepted_spkis == accepted_spkis {
+                return Ok(cached.client.clone());
+            }
+        }
+
+        let client = build(&accepted_spkis)?;
+        *current = Some(CachedPinnedClient {
+            accepted_spkis,
+            client: client.clone(),
+        });
+        Ok(client)
+    }
 }
 
 impl OpenAICompatibleBackend {
@@ -88,7 +113,7 @@ impl OpenAICompatibleBackend {
             path: "/v1/chat/completions".to_string(),
             auth: None,
             client,
-            pinned_client_cache: Mutex::new(HashMap::new()),
+            pinned_client: PinnedClientCache::default(),
             connect_timeout_seconds,
             read_timeout_seconds,
         })
@@ -284,7 +309,6 @@ impl OpenAICompatibleBackend {
             return Ok(self.client.clone());
         }
         let mut accepted_spkis = Vec::new();
-        let mut accepted_certificates = Vec::new();
         for binding in &event.channel_bindings {
             match binding {
                 ChannelBinding::TlsSpkiSha256 {
@@ -294,18 +318,6 @@ impl OpenAICompatibleBackend {
                 ChannelBinding::TlsSpkiSha256 { origin, .. } => {
                     return Err(UpstreamError::Transport(format!(
                         "verified TLS SPKI binding origin {origin:?} does not match upstream {:?}",
-                        self.base_url
-                    )));
-                }
-                ChannelBinding::TlsCertificateSha256 {
-                    origin,
-                    certificate_sha256,
-                } if origin == &self.base_url => {
-                    accepted_certificates.push(certificate_sha256.clone())
-                }
-                ChannelBinding::TlsCertificateSha256 { origin, .. } => {
-                    return Err(UpstreamError::Transport(format!(
-                        "verified TLS certificate binding origin {origin:?} does not match upstream {:?}",
                         self.base_url
                     )));
                 }
@@ -327,41 +339,15 @@ impl OpenAICompatibleBackend {
             ));
         }
         accepted_spkis.sort_unstable();
-        accepted_certificates.sort_unstable();
-        self.pinned_client_for_key(PinnedClientKey {
-            base_url: self.base_url.clone(),
-            accepted_spkis,
-            accepted_certificates,
-            connect_timeout_seconds: self.connect_timeout_seconds,
-            read_timeout_seconds: self.read_timeout_seconds,
-        })
-    }
-
-    fn pinned_client_for_key(
-        &self,
-        key: PinnedClientKey,
-    ) -> Result<reqwest::Client, UpstreamError> {
-        let mut cache = self
-            .pinned_client_cache
-            .lock()
-            .map_err(|_| UpstreamError::Transport("pinned client cache poisoned".to_string()))?;
-        if let Some(client) = cache.get(&key) {
-            return Ok(client.clone());
-        }
-
-        let client = pinned_spki_client(
-            key.accepted_spkis.clone(),
-            key.accepted_certificates.clone(),
-            key.connect_timeout_seconds,
-            key.read_timeout_seconds,
-        )?;
-        if cache.len() >= MAX_PINNED_CLIENT_CACHE_ENTRIES {
-            if let Some(oldest_key) = cache.keys().next().cloned() {
-                cache.remove(&oldest_key);
-            }
-        }
-        cache.insert(key, client.clone());
-        Ok(client)
+        accepted_spkis.dedup();
+        self.pinned_client
+            .get_or_build(accepted_spkis, |accepted_spkis| {
+                pinned_spki_client(
+                    accepted_spkis.to_vec(),
+                    self.connect_timeout_seconds,
+                    self.read_timeout_seconds,
+                )
+            })
     }
 
     async fn get(
@@ -415,12 +401,26 @@ impl OpenAICompatibleBackend {
 
     #[cfg(test)]
     fn pinned_client_cache_len(&self) -> usize {
-        self.pinned_client_cache.lock().unwrap().len()
+        usize::from(self.pinned_client.current.lock().unwrap().is_some())
+    }
+
+    #[cfg(test)]
+    fn pinned_client_accepted_spkis(&self) -> Vec<String> {
+        self.pinned_client
+            .current
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cached| cached.accepted_spkis.clone())
+            .unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
     use super::*;
     use crate::aci::receipt::VerificationResult;
 
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_tls_client_cache_canonicalizes_binding_order() {
+    fn client_for_event_canonicalizes_pin_sets() {
         let backend = OpenAICompatibleBackend::new("https://upstream.example").unwrap();
         let first = tls_spki_event_with_two_pins(
             "https://upstream.example",
@@ -483,6 +483,13 @@ mod tests {
         backend.client_for_event(&second).unwrap();
 
         assert_eq!(backend.pinned_client_cache_len(), 1);
+        assert_eq!(
+            backend.pinned_client_accepted_spkis(),
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -502,7 +509,50 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(backend.pinned_client_cache_len(), 2);
+        assert_eq!(backend.pinned_client_cache_len(), 1);
+        assert_eq!(
+            backend.pinned_client_accepted_spkis(),
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()]
+        );
+    }
+
+    #[test]
+    fn pinned_client_cache_converges_concurrent_misses_and_rotates() {
+        const THREADS: usize = 8;
+
+        let cache = Arc::new(PinnedClientCache::default());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles = (0..THREADS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let builds = Arc::clone(&builds);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_build(vec!["a".to_string()], |_| {
+                            builds.fetch_add(1, Ordering::SeqCst);
+                            Ok(reqwest::Client::new())
+                        })
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+
+        for _ in 0..2 {
+            cache
+                .get_or_build(vec!["b".to_string()], |_| {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Ok(reqwest::Client::new())
+                })
+                .unwrap();
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[test]
