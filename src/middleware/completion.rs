@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
@@ -51,6 +51,29 @@ pub struct CompletionInput {
     pub user_model: Option<String>,
     pub user_tier: Option<String>,
     pub stream: bool,
+}
+
+pub(super) fn rate_limited_by_router(
+    service: &AciService,
+    input: &CompletionInput,
+    message: &str,
+) -> Response {
+    let reset_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 + 1)
+        .unwrap_or(1);
+    let body =
+        errors::rate_limit_envelope_bytes(input.surface, message, Some(input.request_id.as_str()));
+    let headers = errors::rate_limit_headers(0, reset_at);
+    finalize_generated(
+        input.surface,
+        service,
+        input.endpoint_path,
+        429,
+        body,
+        &headers,
+        input.e2ee.clone(),
+    )
 }
 
 const MAX_LOG_DETAIL_CHARS: usize = 240;

@@ -1,5 +1,7 @@
 //! Plain OpenAI-compatible upstream backend.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +18,7 @@ use crate::aci::receipt::{ChannelBinding, UpstreamVerifiedEvent};
 
 /// Version header required by the native Anthropic API on every request.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const MAX_PINNED_CLIENT_CACHE_ENTRIES: usize = 8;
 
 /// How the configured credential is attached to upstream requests.
 enum UpstreamAuth {
@@ -42,6 +45,16 @@ pub struct OpenAICompatibleBackend {
     path: String,
     auth: Option<UpstreamAuth>,
     client: reqwest::Client,
+    pinned_client_cache: Mutex<HashMap<PinnedClientKey, reqwest::Client>>,
+    connect_timeout_seconds: u64,
+    read_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PinnedClientKey {
+    base_url: String,
+    accepted_spkis: Vec<String>,
+    accepted_certificates: Vec<String>,
     connect_timeout_seconds: u64,
     read_timeout_seconds: u64,
 }
@@ -75,6 +88,7 @@ impl OpenAICompatibleBackend {
             path: "/v1/chat/completions".to_string(),
             auth: None,
             client,
+            pinned_client_cache: Mutex::new(HashMap::new()),
             connect_timeout_seconds,
             read_timeout_seconds,
         })
@@ -312,12 +326,42 @@ impl OpenAICompatibleBackend {
                 "TLS channel binding requires an https upstream".to_string(),
             ));
         }
-        pinned_spki_client(
+        accepted_spkis.sort_unstable();
+        accepted_certificates.sort_unstable();
+        self.pinned_client_for_key(PinnedClientKey {
+            base_url: self.base_url.clone(),
             accepted_spkis,
             accepted_certificates,
-            self.connect_timeout_seconds,
-            self.read_timeout_seconds,
-        )
+            connect_timeout_seconds: self.connect_timeout_seconds,
+            read_timeout_seconds: self.read_timeout_seconds,
+        })
+    }
+
+    fn pinned_client_for_key(
+        &self,
+        key: PinnedClientKey,
+    ) -> Result<reqwest::Client, UpstreamError> {
+        let mut cache = self
+            .pinned_client_cache
+            .lock()
+            .map_err(|_| UpstreamError::Transport("pinned client cache poisoned".to_string()))?;
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+
+        let client = pinned_spki_client(
+            key.accepted_spkis.clone(),
+            key.accepted_certificates.clone(),
+            key.connect_timeout_seconds,
+            key.read_timeout_seconds,
+        )?;
+        if cache.len() >= MAX_PINNED_CLIENT_CACHE_ENTRIES {
+            if let Some(oldest_key) = cache.keys().next().cloned() {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(key, client.clone());
+        Ok(client)
     }
 
     async fn get(
@@ -368,11 +412,17 @@ impl OpenAICompatibleBackend {
         let builder = self.client.get(&url).header("accept", accept);
         self.apply_auth(builder)
     }
+
+    #[cfg(test)]
+    fn pinned_client_cache_len(&self) -> usize {
+        self.pinned_client_cache.lock().unwrap().len()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aci::receipt::VerificationResult;
 
     #[test]
     fn anthropic_auth_sends_x_api_key_not_bearer() {
@@ -399,5 +449,120 @@ mod tests {
             .unwrap();
         assert_eq!(req.headers().get("authorization").unwrap(), "Bearer tok");
         assert!(req.headers().get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn pinned_tls_client_cache_reuses_same_binding() {
+        let backend = OpenAICompatibleBackend::new("https://upstream.example").unwrap();
+        let event = tls_spki_event(
+            "https://upstream.example",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        backend.client_for_event(&event).unwrap();
+        backend.client_for_event(&event).unwrap();
+
+        assert_eq!(backend.pinned_client_cache_len(), 1);
+    }
+
+    #[test]
+    fn pinned_tls_client_cache_canonicalizes_binding_order() {
+        let backend = OpenAICompatibleBackend::new("https://upstream.example").unwrap();
+        let first = tls_spki_event_with_two_pins(
+            "https://upstream.example",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let second = tls_spki_event_with_two_pins(
+            "https://upstream.example",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        backend.client_for_event(&first).unwrap();
+        backend.client_for_event(&second).unwrap();
+
+        assert_eq!(backend.pinned_client_cache_len(), 1);
+    }
+
+    #[test]
+    fn pinned_tls_client_cache_rotates_on_binding_change() {
+        let backend = OpenAICompatibleBackend::new("https://upstream.example").unwrap();
+
+        backend
+            .client_for_event(&tls_spki_event(
+                "https://upstream.example",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .unwrap();
+        backend
+            .client_for_event(&tls_spki_event(
+                "https://upstream.example",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ))
+            .unwrap();
+
+        assert_eq!(backend.pinned_client_cache_len(), 2);
+    }
+
+    #[test]
+    fn pinned_tls_client_cache_rejects_origin_mismatch_without_caching() {
+        let backend = OpenAICompatibleBackend::new("https://upstream.example").unwrap();
+        let event = tls_spki_event(
+            "https://other.example",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        let err = backend.client_for_event(&event).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("does not match upstream \"https://upstream.example\""));
+        assert_eq!(backend.pinned_client_cache_len(), 0);
+    }
+
+    #[test]
+    fn no_channel_binding_uses_default_client_without_pinned_cache() {
+        let backend = OpenAICompatibleBackend::new("https://upstream.example").unwrap();
+        let event = UpstreamVerifiedEvent {
+            result: VerificationResult::Verified,
+            ..Default::default()
+        };
+
+        backend.client_for_event(&event).unwrap();
+
+        assert_eq!(backend.pinned_client_cache_len(), 0);
+    }
+
+    fn tls_spki_event(origin: &str, spki_sha256: &str) -> UpstreamVerifiedEvent {
+        UpstreamVerifiedEvent {
+            result: VerificationResult::Verified,
+            channel_bindings: vec![ChannelBinding::TlsSpkiSha256 {
+                origin: origin.to_string(),
+                spki_sha256: spki_sha256.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn tls_spki_event_with_two_pins(
+        origin: &str,
+        first_spki_sha256: &str,
+        second_spki_sha256: &str,
+    ) -> UpstreamVerifiedEvent {
+        UpstreamVerifiedEvent {
+            result: VerificationResult::Verified,
+            channel_bindings: vec![
+                ChannelBinding::TlsSpkiSha256 {
+                    origin: origin.to_string(),
+                    spki_sha256: first_spki_sha256.to_string(),
+                },
+                ChannelBinding::TlsSpkiSha256 {
+                    origin: origin.to_string(),
+                    spki_sha256: second_spki_sha256.to_string(),
+                },
+            ],
+            ..Default::default()
+        }
     }
 }

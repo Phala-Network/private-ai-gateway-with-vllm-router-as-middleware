@@ -181,25 +181,30 @@ impl RouterBackend {
         &self,
         public_model: &str,
         input: &CompletionInput,
-    ) -> (Vec<RouterRoute>, Option<RouteSelection>) {
+    ) -> (Vec<RouterRoute>, Option<RouteSelection>, usize) {
         let tier = self.request_tier(input);
         let requested_model = input.params.get("model").and_then(Value::as_str);
         if requested_model != Some(public_model) {
-            return (Vec::new(), None);
+            return (Vec::new(), None, 0);
         }
 
         let mut routes = self.model_routes(public_model);
+        let configured_count = routes.len();
         let routing_text = bounded_routing_text(&input.params, input.endpoint);
         let selected = {
             let mut state = self.state.lock().expect("router state poisoned");
             state.select(public_model, &routing_text, &routes, &self.config, tier)
         };
         let Some(selected) = selected.clone() else {
-            return (routes, None);
+            return (Vec::new(), None, configured_count);
         };
 
         let loads = {
             let state = self.state.lock().expect("router state poisoned");
+            let selectable = state
+                .selectable_route_ids(&routes, &self.config, tier)
+                .collect::<HashSet<_>>();
+            routes.retain(|route| selectable.contains(&route.route_id));
             routes
                 .iter()
                 .map(|route| {
@@ -225,7 +230,7 @@ impl RouterBackend {
                 .cmp(&b_load)
                 .then_with(|| a.route_id.cmp(&b.route_id))
         });
-        (routes, Some(selected))
+        (routes, Some(selected), configured_count)
     }
 
     pub(super) fn admin_snapshot_value(&self) -> Value {
@@ -355,10 +360,22 @@ impl RouterBackend {
             }
         };
         let mut input = input;
-        let (routes, selected) = self.ordered_routes(&public_model, &input);
+        let (routes, selected, configured_count) = self.ordered_routes(&public_model, &input);
         let user_tier = self.request_tier(&input);
         if !self.config.trusted_user_tier_header {
             input.user_tier = None;
+        }
+        if configured_count > 0 && selected.is_none() {
+            tracing::info!(
+                public_model,
+                user_tier = user_tier.as_str(),
+                "router middleware rejected request because no observable upstream has capacity"
+            );
+            return completion::rate_limited_by_router(
+                service,
+                &input,
+                "Rate limit exceeded. Please retry after some time.",
+            );
         }
         let route_in_flight = selected
             .as_ref()
@@ -480,6 +497,28 @@ impl RouterState {
         )
     }
 
+    fn route_selectable(
+        &self,
+        route: &RouterRoute,
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> bool {
+        let pressure = self.route_pressure(route, config, tier);
+        !pressure.blocked && (!pressure.metrics_missing || config.metrics_poll_ms == 0)
+    }
+
+    fn selectable_route_ids<'a>(
+        &'a self,
+        routes: &'a [RouterRoute],
+        config: &'a MiddlewareConfig,
+        tier: UserTier,
+    ) -> impl Iterator<Item = String> + 'a {
+        routes
+            .iter()
+            .filter(move |route| self.route_selectable(route, config, tier))
+            .map(|route| route.route_id.clone())
+    }
+
     fn route_pressure(
         &self,
         route: &RouterRoute,
@@ -537,6 +576,12 @@ impl RouterState {
         tier: UserTier,
     ) -> u8 {
         if routes.is_empty() {
+            return UPSTREAM_STATUS_RED;
+        }
+        if !routes
+            .iter()
+            .any(|route| self.route_selectable(route, config, tier))
+        {
             return UPSTREAM_STATUS_RED;
         }
         let mut saw_yellow = false;
@@ -600,13 +645,40 @@ impl RouterState {
             .map(|route| route.route_id.clone())
             .collect::<HashSet<_>>();
         self.cache_index.retain_model_routes(model, &active_routes);
+        let routes = routes
+            .iter()
+            .filter(|route| self.route_selectable(route, config, tier))
+            .cloned()
+            .collect::<Vec<_>>();
+        if routes.is_empty() {
+            return None;
+        }
         if routes.len() == 1 {
             let route_id = routes[0].route_id.clone();
             let running_at_select = self.stats.get(&route_id).map_or(0, |s| s.running);
+            if active_routes.len() > 1 && !text.is_empty() {
+                if let Some(matched) = self.cache_index.match_prefix(model, text) {
+                    let input_chars = matched.input_chars.max(1);
+                    let rate = matched.matched_chars as f32 / input_chars as f32;
+                    if rate > config.cache_threshold
+                        && matched.route_id != route_id
+                        && active_routes.contains(&matched.route_id)
+                    {
+                        self.stats
+                            .entry(matched.route_id)
+                            .or_default()
+                            .cache_rejected_by_pressure += 1;
+                    }
+                }
+            }
             self.record_cache(model, &route_id, text, config.max_history_per_route);
             return Some(RouteSelection {
                 route_id,
-                reason: "single",
+                reason: if active_routes.len() == 1 {
+                    "single"
+                } else {
+                    "least_running"
+                },
                 cache_match_rate: 0.0,
                 running_at_select,
             });
@@ -623,7 +695,7 @@ impl RouterState {
             && (max_load as f32) > (min_load as f32 * config.balance_rel_threshold);
 
         let selected = if imbalanced || text.is_empty() {
-            self.least_loaded(routes, config, tier).map(|route| {
+            self.least_loaded(&routes, config, tier).map(|route| {
                 let pressure = self.route_pressure(route, config, tier);
                 RouteSelection {
                     route_id: route.route_id.clone(),
@@ -637,7 +709,7 @@ impl RouterState {
                 }
             })
         } else {
-            self.select_cache_aware(model, text, routes, config, tier)
+            self.select_cache_aware(model, text, &routes, config, tier)
         }?;
 
         self.record_cache(
@@ -1137,6 +1209,7 @@ mod tests {
             balance_abs_threshold: 64,
             balance_rel_threshold: 1.5,
             max_history_per_route: 16,
+            metrics_poll_ms: 0,
             ..Default::default()
         };
         let routes = vec![test_route("a:m"), test_route("b:m")];
@@ -1164,6 +1237,7 @@ mod tests {
             balance_abs_threshold: 64,
             balance_rel_threshold: 1.5,
             max_history_per_route: 16,
+            metrics_poll_ms: 0,
             ..Default::default()
         };
         let routes = vec![test_route("a:m"), test_route("b:m")];
@@ -1196,6 +1270,8 @@ mod tests {
             ..Default::default()
         };
         let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.update_upstream_metrics("a".to_string(), test_metrics(1.0, 0.0, 10.0, 9.0, 1.0));
+        state.update_upstream_metrics("b".to_string(), test_metrics(1.0, 0.0, 10.0, 9.0, 1.0));
         assert_eq!(
             state
                 .select("m", "stable prefix one", &routes, &config, UserTier::Basic)
@@ -1321,6 +1397,39 @@ mod tests {
     }
 
     #[test]
+    fn metrics_error_route_is_not_selected_over_blocked_healthy_route() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.update_upstream_metrics("a".to_string(), test_metrics(10.0, 0.0, 10.0, 9.0, 9.0));
+        state.update_upstream_metrics(
+            "b".to_string(),
+            UpstreamMetrics::collected_error("fetch_error"),
+        );
+
+        assert!(state
+            .select("m", "cold-basic", &routes, &config, UserTier::Basic)
+            .is_none());
+    }
+
+    #[test]
+    fn metrics_error_route_is_ignored_when_healthy_route_has_capacity() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.update_upstream_metrics("a".to_string(), test_metrics(2.0, 0.0, 10.0, 9.0, 2.0));
+        state.update_upstream_metrics(
+            "b".to_string(),
+            UpstreamMetrics::collected_error("fetch_error"),
+        );
+
+        let selected = state
+            .select("m", "cold-basic", &routes, &config, UserTier::Basic)
+            .unwrap();
+        assert_eq!(selected.route_id, "a:m");
+    }
+
+    #[test]
     fn upstream_status_returns_green_when_any_route_has_capacity() {
         let mut state = RouterState::default();
         let config = MiddlewareConfig::default();
@@ -1335,15 +1444,22 @@ mod tests {
     }
 
     #[test]
-    fn upstream_status_returns_yellow_for_missing_or_near_full_metrics() {
-        let mut state = RouterState::default();
+    fn upstream_status_returns_red_when_all_metrics_are_missing() {
+        let state = RouterState::default();
         let config = MiddlewareConfig::default();
         let routes = vec![test_route("a:m")];
 
         assert_eq!(
             state.upstream_status_code(&routes, &config, UserTier::Basic),
-            UPSTREAM_STATUS_YELLOW
+            UPSTREAM_STATUS_RED
         );
+    }
+
+    #[test]
+    fn upstream_status_returns_yellow_for_near_full_metrics() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m")];
 
         state.update_upstream_metrics("a".to_string(), test_metrics(8.6, 0.0, 10.0, 9.0, 7.0));
         assert_eq!(

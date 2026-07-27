@@ -273,10 +273,9 @@ fn inject_stream_usage_options(params: &mut Value, endpoint: Endpoint) {
         if !stream_options.is_object() {
             *stream_options = json!({});
         }
-        stream_options
-            .as_object_mut()
-            .unwrap()
-            .insert("include_usage".to_string(), Value::Bool(true));
+        let stream_options = stream_options.as_object_mut().unwrap();
+        stream_options.insert("include_usage".to_string(), Value::Bool(true));
+        stream_options.insert("continuous_usage_stats".to_string(), Value::Bool(true));
         obj.insert("continuous_usage_stats".to_string(), Value::Bool(true));
         if endpoint == Endpoint::Complete {
             obj.insert("include_usage".to_string(), Value::Bool(true));
@@ -1219,7 +1218,8 @@ mod tests {
 
     #[test]
     fn stream_options_injected_for_chat_but_not_responses() {
-        let expected_stream_options = json!({ "include_usage": true });
+        let expected_stream_options =
+            json!({ "include_usage": true, "continuous_usage_stats": true });
         let chat_out = chat(
             ProviderFormat::Openai,
             json!({ "model": "m", "messages": [], "stream": true }),
@@ -1240,7 +1240,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             complete_out["stream_options"],
-            json!({ "include_usage": true })
+            json!({ "include_usage": true, "continuous_usage_stats": true })
         );
         assert_eq!(complete_out["include_usage"], json!(true));
         assert_eq!(complete_out["continuous_usage_stats"], json!(true));
