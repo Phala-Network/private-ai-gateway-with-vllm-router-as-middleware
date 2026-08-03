@@ -51,25 +51,39 @@ This is the smallest practical container config.
 
 ## Middleware
 
-The optional `middleware` section enables the built-in single-model router. The
-router reads the live upstream config, orders candidate routes with cache
-affinity plus PIG load/pressure signals, then forwards through the verified
-backend. It is in-process and does not introduce an out-of-process router hop.
-When the section is omitted the gateway serves the configured upstream directly.
+The optional `middleware` section runs middleware in the request path. The
+middleware is inside the gateway process, after frontend normalization and
+before the verified backend forward. It may choose routes or transform request
+and response payloads, but upstream verification, channel binding, forwarding,
+and receipt finalization remain backend responsibilities. When the section is
+omitted the gateway serves directly.
+
+This fork supports one middleware shape: a single public model routed across
+multiple configured upstreams with cache-aware and PIG-aware load ordering. The
+router polls each configured upstream's metrics endpoint in the background and
+uses PIG's observed running, waiting, global limit, and tier counters to avoid
+full or pressured nodes before forwarding. It attempts prefix-cache affinity
+first, accepts the matched route only when that route passes the load guard
+against the current least-loaded route, and otherwise falls back to lower-load
+routing. If upstream metrics are unavailable or stale, routing falls back to
+gateway-local in-flight counters instead of blocking traffic. It does not use
+`control_url`, `proxy_url`, or an external adapter/vLLM Router process. See
+[router-middleware.md](router-middleware.md) for the selection algorithm and
+security boundary.
 
 | Field | Default | Use |
 | --- | --- | --- |
-| `middleware.public_model` | derived | Public model id served by this router. If unset, the router derives it from enabled upstreams and requires exactly one public model. |
-| `middleware.cache_threshold` | `0.30` | Minimum matched-prefix ratio needed before cache affinity can select a route. |
-| `middleware.balance_abs_threshold` | `64` | Absolute load gap tolerated before a cache-matched route is rejected for being too loaded. |
-| `middleware.balance_rel_threshold` | `1.50` | Relative load ratio tolerated before a cache-matched route is rejected for being too loaded. |
-| `middleware.max_history_per_route` | `256` | Maximum routing-text history records kept per route in the process-local cache index. |
-| `middleware.metrics_poll_ms` | `1000` | PIG metrics polling interval. `0` disables metrics polling and falls back to gateway-local in-flight counters. |
-| `middleware.metrics_timeout_ms` | `800` | Per-upstream PIG metrics request timeout. |
-| `middleware.metrics_stale_ms` | `3000` | Maximum age for a PIG metrics sample before it is treated as stale. |
-| `middleware.metrics_path` | `/v1/metrics` | Metrics path on each upstream. |
-| `middleware.trusted_user_tier_header` | `false` | Trust inbound `x-user-tier` for routing and forward it to PIG. Keep disabled unless a trusted front door strips or sets the header. |
-| `middleware.default_engine` | unset | Optional default serving engine for OpenAI-compatible upstreams, such as `vllm` or `sglang`, used by request shaping. |
+| `middleware.public_model` | unset | Public model id served by this gateway. When unset, the router derives it from the live upstream config and requires exactly one unique public model. |
+| `middleware.cache_threshold` | `0.30` | Minimum common-prefix match rate needed to try a previously warmed route before load fallback. |
+| `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
+| `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
+| `middleware.max_history_per_route` | `256` | Maximum routing-text records kept per public model and route in the process-local radix cache index. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
+| `middleware.metrics_poll_ms` | `1000` | Background upstream metrics polling interval. Set to `0` to disable PIG-aware routing and use only gateway-local in-flight counters. |
+| `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling is concurrent, so one slow upstream does not serially delay the full target set. |
+| `middleware.metrics_stale_ms` | `3000` | Age after which a metrics sample is ignored and the route falls back to local in-flight state. |
+| `middleware.metrics_path` | `/v1/metrics` | Metrics path appended to each upstream base URL. The upstream's configured bearer token is used for metrics auth. |
+| `middleware.trusted_user_tier_header` | `false` | Whether inbound `x-user-tier` is trusted for routing and forwarding to PIG. Keep `false` for public endpoints unless a trusted front door strips or sets this header. With the default, all requests are routed as `basic` and no caller-supplied tier header is forwarded. |
+| `middleware.default_engine` | unset | Optional engine hint put into synthetic route candidates, for example `vllm` or `sglang`. |
 | `middleware.control_url` | unset | Optional control-plane URL for best-effort post-request usage reports only. Routing and catalog handling stay local. |
 | `middleware.control_token` | unset | Bearer token sent to the optional control-plane usage-report endpoint. |
 | `middleware.control_post_timeout_ms` | `10000` | Timeout for the fire-and-forget post-request usage report. |
