@@ -62,20 +62,21 @@ This fork supports one middleware shape: a single public model routed across
 multiple configured upstreams with cache-aware and PIG-aware load ordering. The
 router polls each configured upstream's metrics endpoint in the background and
 uses PIG's observed running, waiting, global limit, and tier counters to avoid
-full or pressured nodes before forwarding. Under balanced pressure it still
-prefers warmed prefixes; when equally idle it uses processed-count tie-breaking
-so cold traffic spreads across nodes. If upstream metrics are unavailable or
-stale, routing falls back to gateway-local in-flight counters instead of
-blocking traffic. It does not use `control_url`, `proxy_url`, or an external
-adapter/vLLM Router process. See [router-middleware.md](router-middleware.md)
-for the selection algorithm and security boundary.
+full or pressured nodes before forwarding. It attempts prefix-cache affinity
+first, accepts the matched route only when that route passes the load guard
+against the current least-loaded route, and otherwise falls back to lower-load
+routing. If upstream metrics are unavailable or stale, routing falls back to
+gateway-local in-flight counters instead of blocking traffic. It does not use
+`control_url`, `proxy_url`, or an external adapter/vLLM Router process. See
+[router-middleware.md](router-middleware.md) for the selection algorithm and
+security boundary.
 
 | Field | Default | Use |
 | --- | --- | --- |
 | `middleware.public_model` | unset | Public model id served by this gateway. When unset, the router derives it from the live upstream config and requires exactly one unique public model. |
-| `middleware.cache_threshold` | `0.30` | Minimum common-prefix match rate needed to prefer a previously warmed route when load is balanced. |
-| `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
-| `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which the router ignores cache affinity and drains toward the least-running route. |
+| `middleware.cache_threshold` | `0.30` | Minimum common-prefix match rate needed to try a previously warmed route before load fallback. |
+| `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
+| `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
 | `middleware.max_history_per_route` | `256` | Maximum routing-text records kept per public model and route in the process-local radix cache index. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
 | `middleware.metrics_poll_ms` | `1000` | Background upstream metrics polling interval. Set to `0` to disable PIG-aware routing and use only gateway-local in-flight counters. |
 | `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling is concurrent, so one slow upstream does not serially delay the full target set. |

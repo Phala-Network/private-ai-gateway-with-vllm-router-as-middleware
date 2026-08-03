@@ -65,16 +65,21 @@ For each request, the router:
    radix-tree cache index used for prefix affinity.
 4. Reads the latest PIG metrics sample for each upstream when metrics polling is
    enabled and the sample is fresh.
-5. Classifies pressure.
-6. Selects the best first candidate and returns the rest as fallback candidates
-   ordered by lower effective load.
+5. Classifies pressure and removes routes that are not selectable for the
+   request tier.
+6. Attempts a prefix-cache match when routing text is present.
+7. Accepts the matched route only if it is not waiting, not full, and not
+   meaningfully more loaded than the least-loaded route.
+8. Falls back to the least-loaded route when no prefix match exists or the
+   matched route fails the load guard.
+9. Returns the rest as fallback candidates ordered by lower effective load.
 
-PIG pressure always wins over cache affinity. A warmed-prefix route is preferred
-only when it is not waiting, not full, and not meaningfully more loaded than a
-healthier route.
+PIG pressure always wins over cache affinity. The router checks cache affinity
+before load fallback, but the matched route must still pass the load guard
+against the current least-loaded route.
 
-When routes are equally idle and no cache match exists, the router uses the
-processed counter as a cold-traffic tie breaker so new traffic spreads across
+When no cache match exists, the router uses lower effective running count and
+then processed count as cold-traffic tie breakers so new traffic spreads across
 nodes over time.
 
 ## PIG Metrics

@@ -684,26 +684,12 @@ impl RouterState {
             });
         }
 
-        let (min_load, max_load) = routes
-            .iter()
-            .fold((usize::MAX, 0usize), |(min, max), route| {
-                let load = self.route_pressure(route, config, tier).effective_running;
-                (min.min(load), max.max(load))
-            });
-        let min_load = if min_load == usize::MAX { 0 } else { min_load };
-        let imbalanced = max_load.saturating_sub(min_load) > config.balance_abs_threshold
-            && (max_load as f32) > (min_load as f32 * config.balance_rel_threshold);
-
-        let selected = if imbalanced || text.is_empty() {
+        let selected = if text.is_empty() {
             self.least_loaded(&routes, config, tier).map(|route| {
                 let pressure = self.route_pressure(route, config, tier);
                 RouteSelection {
                     route_id: route.route_id.clone(),
-                    reason: if imbalanced {
-                        "load_imbalance"
-                    } else {
-                        "no_text"
-                    },
+                    reason: "no_text",
                     cache_match_rate: 0.0,
                     running_at_select: pressure.effective_running,
                 }
@@ -1313,6 +1299,62 @@ mod tests {
             .unwrap();
         assert_eq!(selected.route_id, "b:m");
         assert_eq!(selected.reason, "least_running");
+        assert_eq!(state.stats["a:m"].cache_rejected_by_pressure, 1);
+    }
+
+    #[test]
+    fn cache_match_is_checked_before_unrelated_global_imbalance() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig {
+            cache_threshold: 0.25,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            max_history_per_route: 16,
+            ..Default::default()
+        };
+        let routes = vec![test_route("a:m"), test_route("b:m"), test_route("c:m")];
+        state.record_cache("m", "b:m", "stable prefix one", 16);
+        state.update_upstream_metrics("a".to_string(), test_metrics(20.0, 0.0, 200.0, 180.0, 20.0));
+        state.update_upstream_metrics("b".to_string(), test_metrics(1.0, 0.0, 200.0, 180.0, 1.0));
+        state.update_upstream_metrics(
+            "c".to_string(),
+            test_metrics(100.0, 0.0, 200.0, 180.0, 100.0),
+        );
+
+        let selected = state
+            .select("m", "stable prefix two", &routes, &config, UserTier::Basic)
+            .unwrap();
+
+        assert_eq!(selected.route_id, "b:m");
+        assert_eq!(selected.reason, "cache");
+        assert!(selected.cache_match_rate > config.cache_threshold);
+    }
+
+    #[test]
+    fn cache_match_falls_back_to_load_when_matched_route_is_too_loaded() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig {
+            cache_threshold: 0.25,
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            max_history_per_route: 16,
+            ..Default::default()
+        };
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        state.record_cache("m", "a:m", "stable prefix one", 16);
+        state.update_upstream_metrics(
+            "a".to_string(),
+            test_metrics(100.0, 0.0, 200.0, 180.0, 100.0),
+        );
+        state.update_upstream_metrics("b".to_string(), test_metrics(10.0, 0.0, 200.0, 180.0, 10.0));
+
+        let selected = state
+            .select("m", "stable prefix two", &routes, &config, UserTier::Basic)
+            .unwrap();
+
+        assert_eq!(selected.route_id, "b:m");
+        assert_eq!(selected.reason, "least_running");
+        assert!(selected.cache_match_rate > config.cache_threshold);
         assert_eq!(state.stats["a:m"].cache_rejected_by_pressure, 1);
     }
 
