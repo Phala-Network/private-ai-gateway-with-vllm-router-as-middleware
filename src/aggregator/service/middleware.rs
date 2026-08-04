@@ -29,11 +29,12 @@ use std::time::{Duration, Instant};
 
 // Provider statuses that make this candidate worth abandoning for the next one.
 // Beyond the transient 429/5xx signals, an auth/account failure specific to this
-// provider — 401 (invalid key), 402 (out of credit), 403 (key lacks access) — can
-// still be served by a sibling candidate on a different account. Request-level 4xx
-// (400/404/422) are excluded: they would fail identically on every candidate.
+// provider - 401 (invalid key), 402 (out of credit), 403 (key lacks access) -
+// can still be served by a sibling candidate on a different account. Provider
+// 404s are catalog misses and can succeed on siblings; request-level 400/422
+// stay terminal because they should fail identically on every candidate.
 fn is_retryable_provider_status(status: u16) -> bool {
-    matches!(status, 401 | 402 | 403 | 429 | 500 | 502 | 503 | 504)
+    matches!(status, 401 | 402 | 403 | 404 | 429 | 500 | 502 | 503 | 504)
 }
 
 // One delayed second pass for requests whose whole candidate chain died on
@@ -780,16 +781,16 @@ mod tests {
 
     #[test]
     fn retryable_covers_transient_and_account_specific_statuses() {
-        // Transient provider trouble (429/5xx) plus auth/account failures
-        // (401 invalid key, 402 out of credit, 403 no access) fail over.
-        for status in [401, 402, 403, 429, 500, 502, 503, 504] {
+        // Transient provider trouble (429/5xx), auth/account failures, and
+        // provider catalog misses fail over to sibling candidates.
+        for status in [401, 402, 403, 404, 429, 500, 502, 503, 504] {
             assert!(
                 is_retryable_provider_status(status),
                 "{status} should retry"
             );
         }
         // Request-level errors would fail identically on every candidate.
-        for status in [400, 404, 422] {
+        for status in [400, 422] {
             assert!(
                 !is_retryable_provider_status(status),
                 "{status} should not retry"

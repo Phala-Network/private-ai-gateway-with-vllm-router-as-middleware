@@ -171,13 +171,18 @@ internally for structured `request_outcome` logs. When the chain ends in an
 upstream HTTP response, including an all-429 chain, the gateway relays the
 terminal upstream status after normal response classification.
 
+An unknown or unroutable public model is a `404 model_not_found`, not a malformed
+request. A provider-side `404` for one selected candidate is treated as a
+catalog miss for that provider and can fail over to another candidate; request
+body errors such as `400` and `422` stay terminal.
+
 Streaming response errors are handled at the body boundary. The gateway logs a
 `stream_abort` warning and ends the body normally, rather than surfacing a body
 error to Hyper and causing a client-visible connection reset.
 
-If all candidates are unavailable or PIG rejects because no capacity exists, the
-client sees an OpenAI/vLLM-shaped error response. The middleware should not mask
-real backend crashes as client errors.
+If all configured candidates are unavailable or PIG rejects because no capacity
+exists, the client sees an OpenAI/vLLM-shaped capacity error, normally `429`.
+The middleware should not mask real backend crashes as client errors.
 
 ## Admin Snapshot
 

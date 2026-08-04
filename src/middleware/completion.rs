@@ -258,10 +258,12 @@ pub(super) async fn run(
         started,
     };
     if candidates.is_empty() {
+        // Not found, not malformed: model_not_found is an OpenAI-compatible
+        // 404. Capacity exhaustion is handled earlier by the router wrapper.
         let message = format!("no route available for model {}", model.unwrap_or("(none)"));
-        log_generated_outcome(outcome_ctx, "routing", 400, 0, "", 0, &message);
+        log_generated_outcome(outcome_ctx, "routing", 404, 0, "", 0, &message);
         let body = errors::envelope_bytes(surface, "model_not_found", &message, Some(&request_id));
-        return finalize_generated(surface, service, endpoint_path, 400, body, &[], e2ee);
+        return finalize_generated(surface, service, endpoint_path, 404, body, &[], e2ee);
     }
 
     let shaped = match build_candidates(

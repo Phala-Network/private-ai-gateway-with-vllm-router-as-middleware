@@ -24,6 +24,7 @@ Keep or port changes that directly improve the Phala path:
 | #107 TLS-pinned upstream client reuse | Already present in branch baseline | Phala Direct / ACI-pinned forwarding benefits from persistent clients and avoids repeated TCP/TLS setup. |
 | #112 reasoning normalization | Include | OpenAI-compatible Phala routes need consistent reasoning request shaping for vLLM/SGLang and optional reasoning exclusion. |
 | #114 `/v1/messages` stream EOF handling | Include | Streaming usage and client-visible SSE correctness matter for Phala gateway surfaces. |
+| #115 routing 404 semantics | Include | Unroutable model ids should be OpenAI-compatible `404 model_not_found`, while provider-side model-catalog 404s should fail over to sibling candidates. |
 | Provider-neutral SSE parser hardening | Include | It protects the streaming path used by Phala routes without changing provider policy. |
 
 Exclude changes that only serve third-party provider-specific integrations:
@@ -70,6 +71,8 @@ Functional coverage:
 | --- | --- |
 | Basic capacity exhaustion | Returns the existing OpenAI/vLLM-shaped 429 quickly. |
 | Premium capacity exhaustion | Retries capacity-only candidates once after a short delay, then preserves the best upstream response if still full. |
+| Unroutable public model | Returns `404 model_not_found`, not a malformed-request `400`. |
+| Provider catalog 404 | Fails over to sibling candidates before committing the 404 response. |
 | Real backend 5xx | Not disguised as client input or capacity unless the body matches the narrow capacity marker. |
 | Reasoning request fields | Normalized once before routing, then projected per candidate for vLLM/SGLang-compatible OpenAI routes. |
 | `include_reasoning=false` | Removes visible reasoning fields while preserving usage and reasoning-token counters. |

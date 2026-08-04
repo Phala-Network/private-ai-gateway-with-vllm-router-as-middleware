@@ -394,7 +394,7 @@ async fn wrong_model_returns_model_not_found_without_forwarding() {
     )
     .await;
 
-    assert_eq!(status, 400);
+    assert_eq!(status, 404);
     assert_eq!(body["error"]["type"], json!("model_not_found"));
     assert!(calls.bodies.lock().unwrap().is_empty());
 }
