@@ -94,13 +94,14 @@ impl UserTier {
 struct RoutePressure {
     blocked: bool,
     metrics_missing: bool,
+    metrics_error: bool,
     waiting: u64,
     fullness_milli: u64,
     effective_running: usize,
     processed: u64,
 }
 
-type RouteOrderKey = (u8, u8, u64, u64, usize, u64, String);
+type RouteOrderKey = (u8, u8, u8, u64, u64, usize, u64, String);
 
 pub(super) struct RouterBackend {
     upstream_config: Arc<UpstreamConfigManager>,
@@ -488,6 +489,7 @@ impl RouterState {
         let pressure = self.route_pressure(route, config, tier);
         (
             u8::from(pressure.blocked),
+            u8::from(pressure.metrics_error),
             u8::from(pressure.metrics_missing),
             pressure.waiting,
             pressure.fullness_milli,
@@ -504,7 +506,7 @@ impl RouterState {
         tier: UserTier,
     ) -> bool {
         let pressure = self.route_pressure(route, config, tier);
-        !pressure.blocked && (!pressure.metrics_missing || config.metrics_poll_ms == 0)
+        !pressure.blocked
     }
 
     fn selectable_route_ids<'a>(
@@ -531,16 +533,29 @@ impl RouterState {
             return RoutePressure {
                 blocked: false,
                 metrics_missing: true,
+                metrics_error: false,
                 waiting: 0,
                 fullness_milli: 0,
                 effective_running: local_running,
                 processed: stats.processed,
             };
         };
-        if metrics.is_stale(config) || !metrics.ok {
+        if metrics.is_stale(config) {
             return RoutePressure {
                 blocked: false,
                 metrics_missing: true,
+                metrics_error: false,
+                waiting: 0,
+                fullness_milli: 0,
+                effective_running: local_running,
+                processed: stats.processed,
+            };
+        }
+        if !metrics.ok {
+            return RoutePressure {
+                blocked: false,
+                metrics_missing: true,
+                metrics_error: true,
                 waiting: 0,
                 fullness_milli: 0,
                 effective_running: local_running,
@@ -562,6 +577,7 @@ impl RouterState {
         RoutePressure {
             blocked: observed_waiting > 0.0 || tier_fullness >= 1_000,
             metrics_missing: false,
+            metrics_error: false,
             waiting: observed_waiting.ceil() as u64,
             fullness_milli: tier_fullness,
             effective_running,
@@ -1037,6 +1053,7 @@ fn route_from_upstream(
             route_id,
             format: provider_format(upstream.provider),
             engine: config.default_engine,
+            effective_reasoning: None,
         },
     }
 }
@@ -1439,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_error_route_is_not_selected_over_blocked_healthy_route() {
+    fn metrics_error_route_is_selectable_when_every_measured_route_is_blocked() {
         let mut state = RouterState::default();
         let config = MiddlewareConfig::default();
         let routes = vec![test_route("a:m"), test_route("b:m")];
@@ -1449,9 +1466,10 @@ mod tests {
             UpstreamMetrics::collected_error("fetch_error"),
         );
 
-        assert!(state
+        let selected = state
             .select("m", "cold-basic", &routes, &config, UserTier::Basic)
-            .is_none());
+            .unwrap();
+        assert_eq!(selected.route_id, "b:m");
     }
 
     #[test]
@@ -1486,14 +1504,14 @@ mod tests {
     }
 
     #[test]
-    fn upstream_status_returns_red_when_all_metrics_are_missing() {
+    fn upstream_status_returns_yellow_when_all_metrics_are_missing() {
         let state = RouterState::default();
         let config = MiddlewareConfig::default();
         let routes = vec![test_route("a:m")];
 
         assert_eq!(
             state.upstream_status_code(&routes, &config, UserTier::Basic),
-            UPSTREAM_STATUS_RED
+            UPSTREAM_STATUS_YELLOW
         );
     }
 
@@ -1604,6 +1622,7 @@ mod tests {
                 route_id: route_id.to_string(),
                 format: ProviderFormat::Openai,
                 engine: None,
+                effective_reasoning: None,
             },
         }
     }

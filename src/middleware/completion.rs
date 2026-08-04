@@ -27,10 +27,11 @@ use crate::aggregator::service::{
 
 use super::control::ControlClient;
 use super::errors::{self, Surface};
+use super::reasoning;
 use super::request_transform::{build_candidates, Endpoint};
 use super::router::RouteInFlight;
 use super::sse::{KeepAliveStream, MeterStream, StreamReport};
-use super::stream_transform::SseTransformStream;
+use super::stream_transform::{SseTransformStream, StreamTransform};
 use super::types::{ProviderFormat, RouteCandidate};
 use super::{response_transform, stream_transform};
 
@@ -224,6 +225,32 @@ pub(super) async fn run(
         stream,
     } = input;
 
+    let (params, reasoning_requirements, exclude_reasoning) = if endpoint == Endpoint::ChatComplete
+    {
+        match reasoning::normalize_chat_request(&params) {
+            Ok(normalized) => normalized,
+            Err(err) => {
+                let model = params.get("model").and_then(Value::as_str).unwrap_or("");
+                let outcome_ctx = OutcomeCtx {
+                    request_id: &request_id,
+                    model,
+                    started,
+                };
+                let message = err.to_string();
+                log_generated_outcome(outcome_ctx, "request_validation", 400, 0, "", 0, &message);
+                let body = errors::envelope_bytes(
+                    surface,
+                    errors::error_type(surface, 400),
+                    &message,
+                    Some(&request_id),
+                );
+                return finalize_generated(surface, service, endpoint_path, 400, body, &[], e2ee);
+            }
+        }
+    } else {
+        (params, None, false)
+    };
+
     let model = params.get("model").and_then(Value::as_str);
     let outcome_ctx = OutcomeCtx {
         request_id: &request_id,
@@ -237,7 +264,12 @@ pub(super) async fn run(
         return finalize_generated(surface, service, endpoint_path, 400, body, &[], e2ee);
     }
 
-    let shaped = match build_candidates(&params, endpoint, &candidates) {
+    let shaped = match build_candidates(
+        &params,
+        endpoint,
+        &candidates,
+        reasoning_requirements.as_ref(),
+    ) {
         Ok(shaped) => shaped,
         Err(err) => {
             let message = format!("failed to shape provider request: {err}");
@@ -329,11 +361,14 @@ pub(super) async fn run(
                         );
                     }
                 };
-                let transformed = response_transform::transform_response(
+                let mut transformed = response_transform::transform_response(
                     selected_format,
                     endpoint,
                     upstream_json,
                 );
+                if exclude_reasoning {
+                    response_transform::exclude_reasoning(&mut transformed);
+                }
                 (
                     upstream_status,
                     serde_json::to_vec(&transformed).unwrap_or_default(),
@@ -415,6 +450,14 @@ pub(super) async fn run(
                     Some(transform) => Box::pin(SseTransformStream::new(forward.body, transform)),
                     None => forward.body,
                 };
+            let visible: ServiceResponseStream = if exclude_reasoning {
+                Box::pin(SseTransformStream::new(
+                    transformed,
+                    StreamTransform::ExcludeReasoning,
+                ))
+            } else {
+                transformed
+            };
             let downstream_abort = Arc::new(AtomicBool::new(false));
             let meter_settled = Arc::new(AtomicBool::new(false));
             let stream_report = StreamReport {
@@ -434,7 +477,7 @@ pub(super) async fn run(
                 settled: meter_settled.clone(),
             };
             let metered: ServiceResponseStream = Box::pin(MeterStream::new(
-                transformed,
+                visible,
                 stream_report,
                 crate::sse_protocol::sse_protocol(endpoint_path),
             ));

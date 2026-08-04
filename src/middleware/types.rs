@@ -23,6 +23,45 @@ pub enum Engine {
     Vllm,
 }
 
+/// Canonical public/control reasoning effort.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Max,
+    Xhigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Max => "max",
+            Self::Xhigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Route-relevant reasoning; response visibility remains gateway-local.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
 /// Billing mode, carried into the optional post-request usage report.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +83,9 @@ pub struct RouteCandidate {
     /// server. Absent for managed APIs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<Engine>,
+    /// Request-specific setting selected after capability filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning: Option<ReasoningConfig>,
 }
 
 /// Which component a gateway-synthesized failure is attributed to in reports.

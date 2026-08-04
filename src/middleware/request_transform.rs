@@ -13,7 +13,8 @@
 
 use serde_json::{json, Value};
 
-use super::types::{Engine, ProviderFormat, RouteCandidate};
+use super::reasoning::validate_effective;
+use super::types::{Engine, ProviderFormat, ReasoningConfig, ReasoningEffort, RouteCandidate};
 
 const PDF_MIME: &str = "application/pdf";
 const TXT_MIME: &str = "text/plain";
@@ -140,19 +141,96 @@ pub fn build_candidates(
     params: &Value,
     endpoint: Endpoint,
     candidates: &[RouteCandidate],
+    requested_reasoning: Option<&ReasoningConfig>,
 ) -> Result<Vec<(String, Value)>, TransformError> {
     candidates
         .iter()
         .map(|candidate| {
+            let candidate_params =
+                candidate_params(params, endpoint, candidate, requested_reasoning)?;
             let body = transform_to_provider_request(
                 candidate.format,
-                params,
+                &candidate_params,
                 endpoint,
                 candidate.engine,
             )?;
             Ok((candidate.route_id.clone(), body))
         })
         .collect()
+}
+
+fn candidate_params(
+    params: &Value,
+    endpoint: Endpoint,
+    candidate: &RouteCandidate,
+    requested_reasoning: Option<&ReasoningConfig>,
+) -> Result<Value, TransformError> {
+    let mut params = params.clone();
+    if endpoint != Endpoint::ChatComplete {
+        return Ok(params);
+    }
+    let object = params.as_object_mut().ok_or_else(|| {
+        TransformError::InvalidRequest("request body must be a JSON object".to_string())
+    })?;
+    for key in ["reasoning", "reasoning_effort", "include_reasoning"] {
+        object.remove(key);
+    }
+    let Some(effective) = candidate
+        .effective_reasoning
+        .as_ref()
+        .or(requested_reasoning)
+    else {
+        return Ok(params);
+    };
+    validate_effective(effective).map_err(|err| {
+        TransformError::InvalidRequest(format!(
+            "route {} returned invalid effective reasoning: {err}",
+            candidate.route_id
+        ))
+    })?;
+    match (candidate.format, candidate.engine) {
+        (ProviderFormat::Openai, None) => {
+            object.insert("reasoning".to_string(), reasoning_object(effective));
+        }
+        (ProviderFormat::Openai, Some(_)) => {
+            if effective.max_tokens.is_some() {
+                return invalid_reasoning(candidate, "cannot represent max_tokens");
+            }
+            let effort = effective
+                .effort
+                .or((effective.enabled == Some(false)).then_some(ReasoningEffort::None));
+            let Some(effort) = effort else {
+                return invalid_reasoning(candidate, "cannot represent enabled without effort");
+            };
+            object.insert(
+                "reasoning_effort".to_string(),
+                Value::String(effort.as_str().to_string()),
+            );
+        }
+        (ProviderFormat::Anthropic, _) => return invalid_reasoning(candidate, "has no adapter"),
+    }
+    Ok(params)
+}
+
+fn invalid_reasoning<T>(candidate: &RouteCandidate, message: &str) -> Result<T, TransformError> {
+    Err(TransformError::InvalidRequest(format!(
+        "route {} {message}",
+        candidate.route_id
+    )))
+}
+
+fn reasoning_object(config: &ReasoningConfig) -> Value {
+    let mut object = serde_json::Map::new();
+    if let Some(effort) = config.effort {
+        object.insert("effort".into(), effort.as_str().into());
+    }
+    if let Some(max_tokens) = config.max_tokens {
+        object.insert("max_tokens".into(), max_tokens.into());
+    }
+    if let Some(enabled) = config.enabled {
+        object.insert("enabled".into(), enabled.into());
+    }
+    Value::Object(object)
 }
 
 // ── Engine ───────────────────────────────────────────────────────────────────
@@ -939,6 +1017,7 @@ fn openai_chat_complete_config(engine: Option<Engine>) -> ProviderConfig {
         ("modalities", vec![pc("modalities")]),
         ("audio", vec![pc("audio")]),
         ("prediction", vec![pc("prediction")]),
+        ("reasoning", vec![pc("reasoning")]),
         ("reasoning_effort", vec![pc("reasoning_effort")]),
         ("web_search_options", vec![pc("web_search_options")]),
         ("prompt_cache_key", vec![pc("prompt_cache_key")]),
@@ -1191,7 +1270,9 @@ fn anthropic_messages_config() -> ProviderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::types::{Engine, ProviderFormat, RouteCandidate};
+    use crate::middleware::types::{
+        Engine, ProviderFormat, ReasoningConfig, ReasoningEffort, RouteCandidate,
+    };
 
     fn chat(format: ProviderFormat, params: Value, engine: Option<Engine>) -> Value {
         transform_to_provider_request(format, &params, Endpoint::ChatComplete, engine).unwrap()
@@ -1255,6 +1336,59 @@ mod tests {
         assert!(responses.get("stream_options").is_none());
     }
 
+    fn reasoning(effort: ReasoningEffort) -> Option<ReasoningConfig> {
+        Some(ReasoningConfig {
+            effort: Some(effort),
+            max_tokens: None,
+            enabled: Some(effort != ReasoningEffort::None),
+        })
+    }
+
+    #[test]
+    fn build_candidates_projects_reasoning_per_candidate() {
+        let params = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "low",
+            "include_reasoning": false,
+        });
+        let candidates = vec![
+            RouteCandidate {
+                route_id: "openai:a".into(),
+                format: ProviderFormat::Openai,
+                engine: None,
+                effective_reasoning: reasoning(ReasoningEffort::High),
+            },
+            RouteCandidate {
+                route_id: "openai:b".into(),
+                format: ProviderFormat::Openai,
+                engine: Some(Engine::Sglang),
+                effective_reasoning: reasoning(ReasoningEffort::Minimal),
+            },
+            RouteCandidate {
+                route_id: "openai:c".into(),
+                format: ProviderFormat::Openai,
+                engine: None,
+                effective_reasoning: None,
+            },
+        ];
+        let requested = reasoning(ReasoningEffort::Medium).unwrap();
+        let bodies = build_candidates(
+            &params,
+            Endpoint::ChatComplete,
+            &candidates,
+            Some(&requested),
+        )
+        .unwrap();
+        assert_eq!(bodies.len(), 3);
+        assert_eq!(bodies[0].1["reasoning"]["effort"], "high");
+        assert!(bodies[0].1.get("reasoning_effort").is_none());
+        assert_eq!(bodies[1].1["reasoning_effort"], "low");
+        assert!(bodies[1].1.get("reasoning").is_none());
+        assert_eq!(bodies[2].1["reasoning"]["effort"], "medium");
+        assert!(bodies[2].1.get("include_reasoning").is_none());
+    }
+
     #[test]
     fn build_candidates_emits_one_body_per_route_even_when_identical() {
         // This path consumes typed per-route bodies; it emits one body
@@ -1265,14 +1399,16 @@ mod tests {
                 route_id: "openai:a".into(),
                 format: ProviderFormat::Openai,
                 engine: None,
+                effective_reasoning: None,
             },
             RouteCandidate {
                 route_id: "openai:b".into(),
                 format: ProviderFormat::Openai,
                 engine: None,
+                effective_reasoning: None,
             },
         ];
-        let bodies = build_candidates(&params, Endpoint::ChatComplete, &candidates).unwrap();
+        let bodies = build_candidates(&params, Endpoint::ChatComplete, &candidates, None).unwrap();
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0].0, "openai:a");
         assert_eq!(bodies[1].0, "openai:b");
@@ -1298,14 +1434,16 @@ mod tests {
                 route_id: "openai:m".into(),
                 format: ProviderFormat::Openai,
                 engine: None,
+                effective_reasoning: None,
             },
             RouteCandidate {
                 route_id: "anthropic:m".into(),
                 format: ProviderFormat::Anthropic,
                 engine: None,
+                effective_reasoning: None,
             },
         ];
-        let bodies = build_candidates(&params, Endpoint::ChatComplete, &candidates).unwrap();
+        let bodies = build_candidates(&params, Endpoint::ChatComplete, &candidates, None).unwrap();
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[0].0, "openai:m");
         // OpenAI passthrough keeps messages as-is.

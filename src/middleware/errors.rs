@@ -340,6 +340,47 @@ pub fn image_input_error_parts(
     ))
 }
 
+/// Marker substring an upstream uses to signal it has no available capacity or
+/// targets to serve the request. Matched raw against the error body because the
+/// message can sit outside the usual `error`/`error.message` fields.
+const UPSTREAM_CAPACITY_MARKER: &[u8] = b"exhausted all available targets";
+
+/// Whether an upstream outcome is a capacity signal: a literal 429, or the
+/// recognized 5xx capacity/no-targets body that error normalization also
+/// surfaces to clients as 429.
+pub(crate) fn is_upstream_capacity_signal(status: u16, body: &[u8]) -> bool {
+    if status == 429 {
+        return true;
+    }
+    (500..600).contains(&status)
+        && body
+            .windows(UPSTREAM_CAPACITY_MARKER.len())
+            .any(|w| w == UPSTREAM_CAPACITY_MARKER)
+}
+
+fn capacity_error_parts(
+    surface: Surface,
+    upstream_status: u16,
+    upstream_body: &[u8],
+    request_id: Option<&str>,
+) -> Option<(u16, Vec<u8>)> {
+    if !(500..600).contains(&upstream_status) {
+        return None;
+    }
+    if !is_upstream_capacity_signal(upstream_status, upstream_body) {
+        return None;
+    }
+    Some((
+        429,
+        envelope_bytes(
+            surface,
+            error_type(surface, 429),
+            upstream_message(429),
+            request_id,
+        ),
+    ))
+}
+
 /// Normalize a non-2xx upstream response into the client-facing status and the
 /// surface-shaped error body bytes. For actionable client errors the provider's
 /// own message is re-wrapped at the original status; everything else gets a
@@ -356,6 +397,9 @@ pub fn normalize_upstream_error_parts(
     if let Some(parts) =
         image_input_error_parts(surface, received_body, upstream_status, body, request_id)
     {
+        return parts;
+    }
+    if let Some(parts) = capacity_error_parts(surface, upstream_status, body, request_id) {
         return parts;
     }
     if is_actionable_client_error(upstream_status) {
@@ -408,6 +452,20 @@ pub fn normalize_upstream_error(
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[test]
+    fn capacity_signal_is_429_or_the_marked_5xx_body() {
+        assert!(is_upstream_capacity_signal(429, b"anything"));
+        assert!(is_upstream_capacity_signal(
+            503,
+            br#"{"error":"exhausted all available targets"}"#
+        ));
+        assert!(!is_upstream_capacity_signal(503, br#"{"error":"boom"}"#));
+        assert!(!is_upstream_capacity_signal(
+            400,
+            b"exhausted all available targets"
+        ));
+    }
 
     async fn response_json(response: Response) -> (u16, Value) {
         let status = response.status().as_u16();

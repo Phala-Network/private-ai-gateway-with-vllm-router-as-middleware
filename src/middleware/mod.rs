@@ -10,6 +10,7 @@ pub mod config;
 mod control;
 pub mod errors;
 pub mod pricing;
+mod reasoning;
 pub mod request_transform;
 pub mod response_transform;
 mod router;
