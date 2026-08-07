@@ -18,7 +18,7 @@ pub mod sse;
 pub mod stream_transform;
 pub mod types;
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use serde_json::Value;
@@ -33,6 +33,7 @@ use crate::aggregator::upstream_config::UpstreamConfigManager;
 pub struct Middleware {
     router: router::RouterBackend,
     control: Option<control::ControlClient>,
+    tee_only_domains: HashSet<String>,
 }
 
 impl Middleware {
@@ -41,9 +42,11 @@ impl Middleware {
         upstream_config: Arc<UpstreamConfigManager>,
     ) -> Result<Self, String> {
         let control = control::ControlClient::from_config(config)?;
+        let tee_only_domains = config.normalized_tee_only_domains()?.into_iter().collect();
         Ok(Self {
             router: router::RouterBackend::new(config, upstream_config)?,
             control,
+            tee_only_domains,
         })
     }
 
@@ -57,6 +60,17 @@ impl Middleware {
 
     pub fn upstream_status_code(&self) -> u8 {
         self.router.upstream_status_code()
+    }
+
+    /// Whether this request host should require a verified TEE upstream.
+    ///
+    /// The caller must pass the normalized request `Host` domain. We match
+    /// exact domains only; no wildcard or suffix matching is supported.
+    pub fn is_tee_only_domain(&self, host_domain: Option<&str>) -> bool {
+        let Some(host_domain) = host_domain else {
+            return false;
+        };
+        self.tee_only_domains.contains(host_domain)
     }
 
     /// Serve `/v1/models` from the single public model selected by router

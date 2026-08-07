@@ -793,6 +793,8 @@ pub(super) async fn openai_completion_endpoint(
             .and_then(Value::as_bool)
             .unwrap_or(false);
     if let Some(middleware) = state.middleware.clone() {
+        let host_domain = request_host_domain(&headers);
+        let aci_required = aci.required || middleware.is_tee_only_domain(host_domain.as_deref());
         let endpoint = match endpoint_path {
             COMPLETIONS_PATH => Endpoint::Complete,
             EMBEDDINGS_PATH => Endpoint::Embed,
@@ -813,7 +815,7 @@ pub(super) async fn openai_completion_endpoint(
             received_body: service_body,
             requester,
             e2ee,
-            aci_required: aci.required,
+            aci_required,
             aci_session_ids: aci.session_ids,
             request_id: context.request_id,
             user_model: context.user_model,

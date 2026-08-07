@@ -716,6 +716,7 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
                 "middleware": {
                     "public_model": "gemma4-31b-it",
                     "cache_threshold": 0.4,
+                    "tee_only_domains": ["gemma4-31b-it.use2.phala.com"],
                     "default_engine": "vllm"
                 },
                 "api_token": "api-secret"
@@ -729,6 +730,10 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         let middleware = config.middleware.expect("middleware section must parse");
         assert_eq!(middleware.public_model.as_deref(), Some("gemma4-31b-it"));
         assert_eq!(middleware.cache_threshold, 0.4);
+        assert_eq!(
+            middleware.tee_only_domains,
+            vec!["gemma4-31b-it.use2.phala.com".to_string()]
+        );
         assert_eq!(
             middleware.default_engine,
             Some(private_ai_gateway::middleware::types::Engine::Vllm)

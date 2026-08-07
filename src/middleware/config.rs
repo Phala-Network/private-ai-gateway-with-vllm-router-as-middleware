@@ -30,6 +30,10 @@ pub struct MiddlewareConfig {
     /// Trust inbound `x-user-tier` for routing and upstream forwarding. Keep
     /// disabled unless a trusted front door strips or sets the header.
     pub trusted_user_tier_header: bool,
+    /// Public domains where every upstream hop must be TEE-verified. This
+    /// mirrors Redpill's middleware `tee_only_domains` policy and is matched
+    /// against the request `Host` domain, not forwarded host headers.
+    pub tee_only_domains: Vec<String>,
     pub default_engine: Option<Engine>,
     /// Optional control-plane URL used only for post-request usage reports.
     /// Routing remains fully local to this middleware.
@@ -60,12 +64,92 @@ impl Default for MiddlewareConfig {
             metrics_stale_ms: 3_000,
             metrics_path: "/v1/metrics".to_string(),
             trusted_user_tier_header: false,
+            tee_only_domains: Vec::new(),
             default_engine: None,
             control_url: None,
             control_token: None,
             control_post_timeout_ms: None,
             pricing: None,
             sse_keepalive_ms: None,
+        }
+    }
+}
+
+impl MiddlewareConfig {
+    pub fn normalized_tee_only_domains(&self) -> Result<Vec<String>, String> {
+        let mut domains = Vec::new();
+        for raw in &self.tee_only_domains {
+            let Some(domain) = normalize_tee_only_domain(raw) else {
+                return Err(format!(
+                    "middleware.tee_only_domains entry {raw:?} must be a plain domain"
+                ));
+            };
+            if !domains.contains(&domain) {
+                domains.push(domain);
+            }
+        }
+        Ok(domains)
+    }
+}
+
+fn normalize_tee_only_domain(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('.');
+    if trimmed.is_empty()
+        || trimmed.contains("://")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains(':')
+        || trimmed.contains('=')
+        || trimmed.contains(',')
+        || trimmed.contains('*')
+        || trimmed.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+
+    let domain = trimmed.to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.split('.').any(str::is_empty)
+        || !domain
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+    {
+        return None;
+    }
+    Some(domain)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_tee_only_domain, MiddlewareConfig};
+
+    #[test]
+    fn tee_only_domains_are_normalized_and_deduped() {
+        let config = MiddlewareConfig {
+            tee_only_domains: vec![
+                "Gemma4-31B-IT.Use2.Phala.Com.".to_string(),
+                "gemma4-31b-it.use2.phala.com".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.normalized_tee_only_domains().unwrap(),
+            vec!["gemma4-31b-it.use2.phala.com"]
+        );
+    }
+
+    #[test]
+    fn tee_only_domains_reject_urls_wildcards_ports_and_paths() {
+        for value in [
+            "https://gemma4-31b-it.use2.phala.com",
+            "*.phala.com",
+            "gemma4-31b-it.use2.phala.com:443",
+            "gemma4-31b-it.use2.phala.com/v1",
+            "gemma4-31b-it use2.phala.com",
+            "gemma4-31b-it.use2.phala.com,evil.example",
+        ] {
+            assert_eq!(normalize_tee_only_domain(value), None, "{value}");
         }
     }
 }

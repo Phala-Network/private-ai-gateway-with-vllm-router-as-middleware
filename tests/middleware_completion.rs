@@ -344,6 +344,27 @@ fn route_snapshot<'a>(snapshot: &'a Value, route_id: &str) -> &'a Value {
 }
 
 #[tokio::test]
+async fn tee_only_domain_policy_matches_request_host_exactly() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls).await;
+    let manager = upstream_manager(vec![upstream_config(
+        "gpu-a", &upstream, "gpt-test", "up-a",
+    )]);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            tee_only_domains: vec!["gemma4-31b-it.use2.phala.com".to_string()],
+            ..Default::default()
+        },
+    );
+
+    assert!(mw.is_tee_only_domain(Some("gemma4-31b-it.use2.phala.com")));
+    assert!(!mw.is_tee_only_domain(Some("api.gemma4-31b-it.use2.phala.com")));
+    assert!(!mw.is_tee_only_domain(Some("evil.example")));
+    assert!(!mw.is_tee_only_domain(None));
+}
+
+#[tokio::test]
 async fn catalog_derives_single_public_model() {
     let calls = Arc::new(CapturedCalls::default());
     let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls).await;
