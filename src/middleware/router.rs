@@ -1073,6 +1073,7 @@ fn provider_name(provider: UpstreamProvider) -> &'static str {
         UpstreamProvider::Chutes => "chutes",
         UpstreamProvider::Tinfoil => "tinfoil",
         UpstreamProvider::NearAi => "near-ai",
+        UpstreamProvider::SecretAi => "secret-ai",
         UpstreamProvider::PhalaDirect => "phala-direct",
     }
 }

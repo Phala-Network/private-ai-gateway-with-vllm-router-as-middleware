@@ -18,6 +18,7 @@ fn test_upstream_config(
 ) -> UpstreamConfig {
     UpstreamConfig {
         name: name.to_string(),
+        enabled: true,
         provider,
         base_url: format!("https://{name}.example"),
         path: None,
@@ -284,6 +285,7 @@ async fn prewarm_verification_deduplicates_upstream_models() {
     let invalidations = Arc::new(AtomicUsize::new(0));
     let config = vec![UpstreamConfig {
         name: "provider-a".to_string(),
+        enabled: true,
         // Per-model provider (not a router): two public models sharing one
         // upstream model dedup to one target; a third yields a second.
         provider: UpstreamProvider::PhalaDirect,
