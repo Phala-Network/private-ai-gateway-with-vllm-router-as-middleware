@@ -54,11 +54,12 @@ pub use receipt_store::{InMemoryReceiptStore, ReceiptStore};
 pub use wire::{
     ChatCompletionRequest, E2eePreparedRequest, E2eeRequestContext, E2eeRequestParts,
     E2eeResponseInfo, ForwardCandidate, ForwardResult, GatewayRequestContext,
-    LegacySignatureResult, MiddlewareAllFailed, MiddlewareForwardResult, MiddlewareForwarded,
-    MiddlewareGeneratedFinalization, MiddlewareReceiptDraft, MiddlewareReceiptFinalization,
-    MiddlewareReceiptJournal, MiddlewareStreamFinalization, MiddlewareStreamingForwarded,
-    MiddlewareUpstreamError, ServiceResponseStream, StreamingForwardResult, StreamingForwardStream,
-    StreamingUpstreamError, UpstreamVerificationRequest, UpstreamVerifier,
+    LegacySignatureResult, MiddlewareAllFailed, MiddlewareAttemptObserver, MiddlewareForwardResult,
+    MiddlewareForwarded, MiddlewareGeneratedFinalization, MiddlewareReceiptDraft,
+    MiddlewareReceiptFinalization, MiddlewareReceiptJournal, MiddlewareStreamFinalization,
+    MiddlewareStreamingForwarded, MiddlewareUpstreamError, ServiceResponseStream,
+    StreamingForwardResult, StreamingForwardStream, StreamingUpstreamError,
+    UpstreamVerificationRequest, UpstreamVerifier,
 };
 
 pub struct AciService {

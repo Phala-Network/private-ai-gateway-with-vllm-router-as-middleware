@@ -21,8 +21,8 @@ use serde_json::Value;
 use crate::aci::upstream::UpstreamError;
 use crate::aggregator::service::{
     AciService, ChatCompletionRequest, E2eeRequestContext, E2eeResponseInfo, ForwardCandidate,
-    GatewayRequestContext, MiddlewareForwardResult, MiddlewareReceiptJournal, ReceiptOwner,
-    ServiceError, ServiceResponseStream,
+    GatewayRequestContext, MiddlewareAttemptObserver, MiddlewareForwardResult,
+    MiddlewareReceiptJournal, ReceiptOwner, ServiceError, ServiceResponseStream,
 };
 
 use super::control::ControlClient;
@@ -302,7 +302,7 @@ pub(super) async fn run(
 
     let journal = MiddlewareReceiptJournal::default();
     let result = service
-        .forward_chat_completion_for_middleware(
+        .forward_chat_completion_for_middleware_observed(
             ChatCompletionRequest {
                 context,
                 endpoint_path,
@@ -316,6 +316,9 @@ pub(super) async fn run(
             forward_candidates,
             stream,
             journal.clone(),
+            route_in_flight
+                .as_mut()
+                .map(|observer| observer as &mut dyn MiddlewareAttemptObserver),
         )
         .await;
 
