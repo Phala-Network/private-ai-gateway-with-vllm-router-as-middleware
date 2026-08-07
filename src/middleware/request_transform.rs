@@ -1,11 +1,12 @@
 //! Request transforms: shape a downstream request body into each candidate
 //! upstream's request format.
 //!
-//! The design uses a config-driven engine: each ordered `ParamConfig` names its
-//! input key and output parameter. For every present input, the engine applies
-//! an optional transform, substitutes the `"gateway-default"` sentinel, clamps
-//! numeric values, and writes the result to the output (including dot-paths).
-//! Required entries with defaults backfill absent inputs.
+//! The design uses a config-driven engine: a provider config is
+//! an ordered list of `(input_key, [ParamConfig])` entries. For each input key
+//! present in the request, the engine computes a value (optional transform, then
+//! a `"gateway-default"` sentinel substitution, then numeric clamping) and writes
+//! it to the output under the config's output param (dot-paths supported). A
+//! required entry with a default backfills when the input key is absent.
 //!
 //! Strongly typed endpoint structs may replace `serde_json::Value` later; for now
 //! the dynamic shape keeps behavior aligned with the source.
@@ -13,9 +14,7 @@
 use serde_json::{json, Value};
 
 use super::reasoning::validate_effective;
-use super::types::{
-    Engine, ProviderFormat, ReasoningConfig, ReasoningEffort, ReasoningFormat, RouteCandidate,
-};
+use super::types::{Engine, ProviderFormat, ReasoningConfig, ReasoningEffort, RouteCandidate};
 
 const PDF_MIME: &str = "application/pdf";
 const TXT_MIME: &str = "text/plain";
@@ -76,7 +75,6 @@ type TransformFn = fn(&Value) -> Result<Option<Value>, TransformError>;
 
 #[derive(Clone)]
 struct ParamConfig {
-    input: &'static str,
     param: &'static str,
     default: Option<Value>,
     min: Option<i64>,
@@ -85,10 +83,9 @@ struct ParamConfig {
     transform: Option<TransformFn>,
 }
 
-fn pc(input: &'static str) -> ParamConfig {
+fn pc(param: &'static str) -> ParamConfig {
     ParamConfig {
-        input,
-        param: input,
+        param,
         default: None,
         min: None,
         max: None,
@@ -98,10 +95,6 @@ fn pc(input: &'static str) -> ParamConfig {
 }
 
 impl ParamConfig {
-    fn to(mut self, param: &'static str) -> Self {
-        self.param = param;
-        self
-    }
     fn with_default(mut self, value: Value) -> Self {
         self.default = Some(value);
         self
@@ -124,19 +117,7 @@ impl ParamConfig {
     }
 }
 
-type ProviderConfig = Vec<ParamConfig>;
-
-macro_rules! p {
-    ($input:literal $(=> $output:literal)? $(, $method:ident $(($arg:expr))? )* $(,)?) => {
-        pc($input)$(.to($output))?$(.$method($($arg)?))*
-    };
-}
-
-macro_rules! pass {
-    ($($key:literal),* $(,)?) => {
-        vec![$(pc($key)),*]
-    };
-}
+type ProviderConfig = Vec<(&'static str, Vec<ParamConfig>)>;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -149,7 +130,7 @@ pub fn transform_to_provider_request(
     engine: Option<Engine>,
 ) -> Result<Value, TransformError> {
     let mut params = params.clone();
-    inject_stream_options(&mut params);
+    inject_stream_usage_options(&mut params, endpoint);
     let config = select_config(format, endpoint, engine)?;
     transform_using_provider_config(&config, &params)
 }
@@ -207,18 +188,11 @@ fn candidate_params(
             candidate.route_id
         ))
     })?;
-    let reasoning_format = candidate.reasoning_format.unwrap_or_else(|| {
-        if candidate.engine.is_some() {
-            ReasoningFormat::ReasoningEffort
-        } else {
-            ReasoningFormat::Reasoning
-        }
-    });
-    match (candidate.format, reasoning_format) {
-        (ProviderFormat::Openai, ReasoningFormat::Reasoning) => {
+    match (candidate.format, candidate.engine) {
+        (ProviderFormat::Openai, None) => {
             object.insert("reasoning".to_string(), reasoning_object(effective));
         }
-        (ProviderFormat::Openai, ReasoningFormat::ReasoningEffort) => {
+        (ProviderFormat::Openai, Some(_)) => {
             if effective.max_tokens.is_some() {
                 return invalid_reasoning(candidate, "cannot represent max_tokens");
             }
@@ -289,24 +263,30 @@ fn transform_using_provider_config(
     params: &Value,
 ) -> Result<Value, TransformError> {
     let mut out = json!({});
-    for cfg in config {
-        if params.get(cfg.input).is_some() {
-            if let Some(value) = get_value(params, cfg)? {
-                set_nested_property(&mut out, cfg.param, value);
-            }
-        } else if cfg.required {
-            if let Some(default) = &cfg.default {
-                set_nested_property(&mut out, cfg.param, default.clone());
+    for (input_key, param_configs) in config {
+        for cfg in param_configs {
+            if params.get(input_key).is_some() {
+                if let Some(value) = get_value(input_key, params, cfg)? {
+                    set_nested_property(&mut out, cfg.param, value);
+                }
+            } else if cfg.required {
+                if let Some(default) = &cfg.default {
+                    set_nested_property(&mut out, cfg.param, default.clone());
+                }
             }
         }
     }
     Ok(out)
 }
 
-fn get_value(params: &Value, cfg: &ParamConfig) -> Result<Option<Value>, TransformError> {
+fn get_value(
+    input_key: &str,
+    params: &Value,
+    cfg: &ParamConfig,
+) -> Result<Option<Value>, TransformError> {
     let mut value: Option<Value> = match cfg.transform {
         Some(transform) => transform(params)?,
-        None => params.get(cfg.input).cloned(),
+        None => params.get(input_key).cloned(),
     };
 
     // "gateway-default" sentinel: substitute the configured default.
@@ -357,17 +337,11 @@ fn set_nested_property(obj: &mut Value, path: &str, value: Value) {
         .insert(parts[parts.len() - 1].to_string(), value);
 }
 
-// Mutate `params` to request usage on streaming: only
-// when `stream === true` and `stream_options.include_usage` is not already true.
-fn inject_stream_options(params: &mut Value) {
+// Mutate `params` to request usage on streaming. We force the usage flags to
+// true because the gateway depends on usage-bearing stream events for metering
+// and downstream billing; a caller-provided false must not suppress them.
+fn inject_stream_usage_options(params: &mut Value, endpoint: Endpoint) {
     if params.get("stream") != Some(&Value::Bool(true)) {
-        return;
-    }
-    let already = params
-        .get("stream_options")
-        .and_then(|so| so.get("include_usage"))
-        == Some(&Value::Bool(true));
-    if already {
         return;
     }
     if let Some(obj) = params.as_object_mut() {
@@ -377,10 +351,13 @@ fn inject_stream_options(params: &mut Value) {
         if !stream_options.is_object() {
             *stream_options = json!({});
         }
-        stream_options
-            .as_object_mut()
-            .unwrap()
-            .insert("include_usage".to_string(), Value::Bool(true));
+        let stream_options = stream_options.as_object_mut().unwrap();
+        stream_options.insert("include_usage".to_string(), Value::Bool(true));
+        stream_options.insert("continuous_usage_stats".to_string(), Value::Bool(true));
+        obj.insert("continuous_usage_stats".to_string(), Value::Bool(true));
+        if endpoint == Endpoint::Complete {
+            obj.insert("include_usage".to_string(), Value::Bool(true));
+        }
     }
 }
 
@@ -988,234 +965,314 @@ fn map_sglang_reasoning_effort(params: &Value) -> Result<Option<Value>, Transfor
 // ── Config tables ────────────────────────────────────────────────────────────
 
 fn openai_chat_complete_config(engine: Option<Engine>) -> ProviderConfig {
-    let mut config = pass!(
-        "functions",
-        "function_call",
-        "stop",
-        "logit_bias",
-        "user",
-        "seed",
-        "tools",
-        "tool_choice",
-        "response_format",
-        "top_logprobs",
-        "stream_options",
-        "service_tier",
-        "parallel_tool_calls",
-        "max_completion_tokens",
-        "store",
-        "metadata",
-        "modalities",
-        "audio",
-        "prediction",
-        "reasoning",
-        "reasoning_effort",
-        "web_search_options",
-        "prompt_cache_key",
-        "safety_identifier",
-        "verbosity",
-    );
-    config.extend([
-        p!("model", with_default(json!("gpt-3.5-turbo")), required),
-        p!("messages", with_default(json!(""))),
-        p!("max_tokens", with_default(json!(100)), with_min(0)),
-        p!(
-            "temperature",
-            with_default(json!(1)),
-            with_min(0),
-            with_max(2)
+    let mut config: ProviderConfig = vec![
+        (
+            "model",
+            vec![pc("model").with_default(json!("gpt-3.5-turbo")).required()],
         ),
-        p!("top_p", with_default(json!(1)), with_min(0), with_max(1)),
-        p!("n", with_default(json!(1))),
-        p!("stream", with_default(json!(false))),
-        p!("presence_penalty", with_min(-2), with_max(2)),
-        p!("frequency_penalty", with_min(-2), with_max(2)),
-        p!("logprobs", with_default(json!(false))),
-    ]);
+        ("messages", vec![pc("messages").with_default(json!(""))]),
+        ("functions", vec![pc("functions")]),
+        ("function_call", vec![pc("function_call")]),
+        (
+            "max_tokens",
+            vec![pc("max_tokens").with_default(json!(100)).with_min(0)],
+        ),
+        (
+            "temperature",
+            vec![pc("temperature")
+                .with_default(json!(1))
+                .with_min(0)
+                .with_max(2)],
+        ),
+        (
+            "top_p",
+            vec![pc("top_p").with_default(json!(1)).with_min(0).with_max(1)],
+        ),
+        ("n", vec![pc("n").with_default(json!(1))]),
+        ("stream", vec![pc("stream").with_default(json!(false))]),
+        ("stop", vec![pc("stop")]),
+        (
+            "presence_penalty",
+            vec![pc("presence_penalty").with_min(-2).with_max(2)],
+        ),
+        (
+            "frequency_penalty",
+            vec![pc("frequency_penalty").with_min(-2).with_max(2)],
+        ),
+        ("logit_bias", vec![pc("logit_bias")]),
+        ("user", vec![pc("user")]),
+        ("seed", vec![pc("seed")]),
+        ("tools", vec![pc("tools")]),
+        ("tool_choice", vec![pc("tool_choice")]),
+        ("response_format", vec![pc("response_format")]),
+        ("logprobs", vec![pc("logprobs").with_default(json!(false))]),
+        ("top_logprobs", vec![pc("top_logprobs")]),
+        ("stream_options", vec![pc("stream_options")]),
+        ("continuous_usage_stats", vec![pc("continuous_usage_stats")]),
+        ("service_tier", vec![pc("service_tier")]),
+        ("parallel_tool_calls", vec![pc("parallel_tool_calls")]),
+        ("max_completion_tokens", vec![pc("max_completion_tokens")]),
+        ("store", vec![pc("store")]),
+        ("metadata", vec![pc("metadata")]),
+        ("modalities", vec![pc("modalities")]),
+        ("audio", vec![pc("audio")]),
+        ("prediction", vec![pc("prediction")]),
+        ("reasoning", vec![pc("reasoning")]),
+        ("reasoning_effort", vec![pc("reasoning_effort")]),
+        ("web_search_options", vec![pc("web_search_options")]),
+        ("prompt_cache_key", vec![pc("prompt_cache_key")]),
+        ("safety_identifier", vec![pc("safety_identifier")]),
+        ("verbosity", vec![pc("verbosity")]),
+    ];
+
     if let Some(engine) = engine {
-        config.extend(pass!(
-            "top_k",
-            "min_p",
-            "repetition_penalty",
-            "chat_template_kwargs",
-        ));
+        config.push(("top_k", vec![pc("top_k")]));
+        config.push(("min_p", vec![pc("min_p")]));
+        config.push(("repetition_penalty", vec![pc("repetition_penalty")]));
+        config.push(("chat_template_kwargs", vec![pc("chat_template_kwargs")]));
         if engine == Engine::Sglang {
-            *config
-                .iter_mut()
-                .find(|config| config.input == "reasoning_effort")
-                .unwrap() = p!(
-                "reasoning_effort",
-                with_transform(map_sglang_reasoning_effort)
-            );
+            for entry in config.iter_mut() {
+                if entry.0 == "reasoning_effort" {
+                    entry.1 =
+                        vec![pc("reasoning_effort").with_transform(map_sglang_reasoning_effort)];
+                }
+            }
         }
     }
+
     config
 }
 
 fn openai_complete_config() -> ProviderConfig {
-    let mut config = pass!(
-        "stream_options",
-        "stop",
-        "best_of",
-        "logit_bias",
-        "user",
-        "seed",
-        "suffix",
-    );
-    config.extend([
-        p!("model", with_default(json!("text-davinci-003")), required),
-        p!("prompt", with_default(json!(""))),
-        p!("max_tokens", with_default(json!(100)), with_min(0)),
-        p!(
-            "temperature",
-            with_default(json!(1)),
-            with_min(0),
-            with_max(2)
+    vec![
+        (
+            "model",
+            vec![pc("model")
+                .with_default(json!("text-davinci-003"))
+                .required()],
         ),
-        p!("top_p", with_default(json!(1)), with_min(0), with_max(1)),
-        p!("n", with_default(json!(1))),
-        p!("stream", with_default(json!(false))),
-        p!("logprobs", with_max(5)),
-        p!("echo", with_default(json!(false))),
-        p!("presence_penalty", with_min(-2), with_max(2)),
-        p!("frequency_penalty", with_min(-2), with_max(2)),
-    ]);
-    config
+        ("prompt", vec![pc("prompt").with_default(json!(""))]),
+        (
+            "max_tokens",
+            vec![pc("max_tokens").with_default(json!(100)).with_min(0)],
+        ),
+        (
+            "temperature",
+            vec![pc("temperature")
+                .with_default(json!(1))
+                .with_min(0)
+                .with_max(2)],
+        ),
+        (
+            "top_p",
+            vec![pc("top_p").with_default(json!(1)).with_min(0).with_max(1)],
+        ),
+        ("n", vec![pc("n").with_default(json!(1))]),
+        ("stream", vec![pc("stream").with_default(json!(false))]),
+        ("stream_options", vec![pc("stream_options")]),
+        ("include_usage", vec![pc("include_usage")]),
+        ("continuous_usage_stats", vec![pc("continuous_usage_stats")]),
+        ("logprobs", vec![pc("logprobs").with_max(5)]),
+        ("echo", vec![pc("echo").with_default(json!(false))]),
+        ("stop", vec![pc("stop")]),
+        (
+            "presence_penalty",
+            vec![pc("presence_penalty").with_min(-2).with_max(2)],
+        ),
+        (
+            "frequency_penalty",
+            vec![pc("frequency_penalty").with_min(-2).with_max(2)],
+        ),
+        ("best_of", vec![pc("best_of")]),
+        ("logit_bias", vec![pc("logit_bias")]),
+        ("user", vec![pc("user")]),
+        ("seed", vec![pc("seed")]),
+        ("suffix", vec![pc("suffix")]),
+    ]
 }
 
 fn openai_embed_config() -> ProviderConfig {
-    let mut config = pass!("encoding_format", "dimensions", "user");
-    config.extend([
-        p!(
+    vec![
+        (
             "model",
-            with_default(json!("text-embedding-ada-002")),
-            required
+            vec![pc("model")
+                .with_default(json!("text-embedding-ada-002"))
+                .required()],
         ),
-        p!("input", required),
-    ]);
-    config
+        ("input", vec![pc("input").required()]),
+        ("encoding_format", vec![pc("encoding_format")]),
+        ("dimensions", vec![pc("dimensions")]),
+        ("user", vec![pc("user")]),
+    ]
 }
 
 fn openai_create_model_response_config() -> ProviderConfig {
-    let mut config = pass!(
-        "background",
-        "include",
-        "instructions",
-        "max_output_tokens",
-        "metadata",
-        "modalities",
-        "parallel_tool_calls",
-        "previous_response_id",
-        "prompt",
-        "prompt_cache_key",
-        "reasoning",
-        "store",
-        "stream",
-        "temperature",
-        "text",
-        "tool_choice",
-        "tools",
-        "top_p",
-        "truncation",
-        "user",
-        "verbosity",
-    );
-    config.extend([p!("input", required), p!("model", required)]);
-    config
+    vec![
+        ("input", vec![pc("input").required()]),
+        ("model", vec![pc("model").required()]),
+        ("background", vec![pc("background")]),
+        ("include", vec![pc("include")]),
+        ("instructions", vec![pc("instructions")]),
+        ("max_output_tokens", vec![pc("max_output_tokens")]),
+        ("metadata", vec![pc("metadata")]),
+        ("modalities", vec![pc("modalities")]),
+        ("parallel_tool_calls", vec![pc("parallel_tool_calls")]),
+        ("previous_response_id", vec![pc("previous_response_id")]),
+        ("prompt", vec![pc("prompt")]),
+        ("prompt_cache_key", vec![pc("prompt_cache_key")]),
+        ("reasoning", vec![pc("reasoning")]),
+        ("store", vec![pc("store")]),
+        ("stream", vec![pc("stream")]),
+        ("temperature", vec![pc("temperature")]),
+        ("text", vec![pc("text")]),
+        ("tool_choice", vec![pc("tool_choice")]),
+        ("tools", vec![pc("tools")]),
+        ("top_p", vec![pc("top_p")]),
+        ("truncation", vec![pc("truncation")]),
+        ("user", vec![pc("user")]),
+        ("verbosity", vec![pc("verbosity")]),
+    ]
 }
 
 fn openai_to_anthropic_messages_config() -> ProviderConfig {
     vec![
-        p!("model", required),
-        p!("messages", required, with_transform(oai_transform_messages)),
-        p!("max_tokens", required),
-        p!("temperature", with_min(0), with_max(2)),
-        p!("top_p", with_min(0), with_max(1)),
-        p!("top_k"),
-        p!("stream", with_default(json!(false))),
-        p!("stream_options"),
-        p!("stop_sequences" => "stop", with_transform(oai_transform_stop_sequences)),
-        p!("tools", with_transform(oai_transform_tools)),
-        p!("tool_choice", with_transform(oai_transform_tool_choice)),
-        p!("metadata" => "user", with_transform(oai_user_from_metadata)),
+        ("model", vec![pc("model").required()]),
+        (
+            "messages",
+            vec![pc("messages")
+                .required()
+                .with_transform(oai_transform_messages)],
+        ),
+        ("max_tokens", vec![pc("max_tokens").required()]),
+        (
+            "temperature",
+            vec![pc("temperature").with_min(0).with_max(2)],
+        ),
+        ("top_p", vec![pc("top_p").with_min(0).with_max(1)]),
+        ("top_k", vec![pc("top_k")]),
+        ("stream", vec![pc("stream").with_default(json!(false))]),
+        ("stream_options", vec![pc("stream_options")]),
+        (
+            "stop_sequences",
+            vec![pc("stop").with_transform(oai_transform_stop_sequences)],
+        ),
+        (
+            "tools",
+            vec![pc("tools").with_transform(oai_transform_tools)],
+        ),
+        (
+            "tool_choice",
+            vec![pc("tool_choice").with_transform(oai_transform_tool_choice)],
+        ),
+        (
+            "metadata",
+            vec![pc("user").with_transform(oai_user_from_metadata)],
+        ),
     ]
 }
 
 fn anthropic_chat_complete_config() -> ProviderConfig {
     vec![
-        p!("model", with_default(json!("claude-2.1")), required),
-        p!("messages", required, with_transform(anthropic_messages)),
-        p!("messages" => "system", with_transform(anthropic_system)),
-        p!("tools", with_transform(anthropic_tools)),
-        p!("tool_choice", with_transform(anthropic_tool_choice)),
-        p!("max_tokens", required),
-        p!("max_completion_tokens" => "max_tokens"),
-        p!(
-            "temperature",
-            with_default(json!(1)),
-            with_min(0),
-            with_max(1)
+        (
+            "model",
+            vec![pc("model").with_default(json!("claude-2.1")).required()],
         ),
-        p!("top_p", with_default(json!(-1)), with_min(-1)),
-        p!("top_k", with_default(json!(-1))),
-        p!("stop" => "stop_sequences"),
-        p!("stream", with_default(json!(false))),
-        p!("user" => "metadata.user_id"),
-        p!("thinking"),
+        (
+            "messages",
+            vec![
+                pc("messages").required().with_transform(anthropic_messages),
+                pc("system").with_transform(anthropic_system),
+            ],
+        ),
+        ("tools", vec![pc("tools").with_transform(anthropic_tools)]),
+        (
+            "tool_choice",
+            vec![pc("tool_choice").with_transform(anthropic_tool_choice)],
+        ),
+        ("max_tokens", vec![pc("max_tokens").required()]),
+        ("max_completion_tokens", vec![pc("max_tokens")]),
+        (
+            "temperature",
+            vec![pc("temperature")
+                .with_default(json!(1))
+                .with_min(0)
+                .with_max(1)],
+        ),
+        (
+            "top_p",
+            vec![pc("top_p").with_default(json!(-1)).with_min(-1)],
+        ),
+        ("top_k", vec![pc("top_k").with_default(json!(-1))]),
+        ("stop", vec![pc("stop_sequences")]),
+        ("stream", vec![pc("stream").with_default(json!(false))]),
+        ("user", vec![pc("metadata.user_id")]),
+        ("thinking", vec![pc("thinking")]),
     ]
 }
 
 fn anthropic_complete_config() -> ProviderConfig {
     vec![
-        p!("model", with_default(json!("claude-instant-1")), required),
-        p!(
+        (
+            "model",
+            vec![pc("model")
+                .with_default(json!("claude-instant-1"))
+                .required()],
+        ),
+        (
             "prompt",
-            required,
-            with_transform(anthropic_complete_prompt)
+            vec![pc("prompt")
+                .required()
+                .with_transform(anthropic_complete_prompt)],
         ),
-        p!("max_tokens" => "max_tokens_to_sample", required),
-        p!(
+        ("max_tokens", vec![pc("max_tokens_to_sample").required()]),
+        (
             "temperature",
-            with_default(json!(1)),
-            with_min(0),
-            with_max(1)
+            vec![pc("temperature")
+                .with_default(json!(1))
+                .with_min(0)
+                .with_max(1)],
         ),
-        p!("top_p", with_default(json!(-1)), with_min(-1)),
-        p!("top_k", with_default(json!(-1))),
-        p!("stop" => "stop_sequences", with_transform(anthropic_complete_stop)),
-        p!("stream", with_default(json!(false))),
-        p!("user" => "metadata.user_id"),
+        (
+            "top_p",
+            vec![pc("top_p").with_default(json!(-1)).with_min(-1)],
+        ),
+        ("top_k", vec![pc("top_k").with_default(json!(-1))]),
+        (
+            "stop",
+            vec![pc("stop_sequences").with_transform(anthropic_complete_stop)],
+        ),
+        ("stream", vec![pc("stream").with_default(json!(false))]),
+        ("user", vec![pc("metadata.user_id")]),
     ]
 }
 
 fn anthropic_messages_config() -> ProviderConfig {
-    let mut config = pass!(
-        "container",
-        "mcp_servers",
-        "metadata",
-        "service_tier",
-        "stop_sequences",
-        "stream",
-        "system",
-        "temperature",
-        "thinking",
-        "tool_choice",
-        "tools",
-        "top_k",
-        "top_p",
-    );
-    config.extend([
-        p!("model", required),
-        p!("messages", required),
-        p!("max_tokens", required),
-    ]);
-    config
+    vec![
+        ("model", vec![pc("model").required()]),
+        ("messages", vec![pc("messages").required()]),
+        ("max_tokens", vec![pc("max_tokens").required()]),
+        ("container", vec![pc("container")]),
+        ("mcp_servers", vec![pc("mcp_servers")]),
+        ("metadata", vec![pc("metadata")]),
+        ("service_tier", vec![pc("service_tier")]),
+        ("stop_sequences", vec![pc("stop_sequences")]),
+        ("stream", vec![pc("stream")]),
+        ("system", vec![pc("system")]),
+        ("temperature", vec![pc("temperature")]),
+        ("thinking", vec![pc("thinking")]),
+        ("tool_choice", vec![pc("tool_choice")]),
+        ("tools", vec![pc("tools")]),
+        ("top_k", vec![pc("top_k")]),
+        ("top_p", vec![pc("top_p")]),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::middleware::types::{Engine, ProviderFormat, RouteCandidate};
+    use crate::middleware::types::{
+        Engine, ProviderFormat, ReasoningConfig, ReasoningEffort, RouteCandidate,
+    };
 
     fn chat(format: ProviderFormat, params: Value, engine: Option<Engine>) -> Value {
         transform_to_provider_request(format, &params, Endpoint::ChatComplete, engine).unwrap()
@@ -1242,12 +1299,15 @@ mod tests {
 
     #[test]
     fn stream_options_injected_for_chat_but_not_responses() {
+        let expected_stream_options =
+            json!({ "include_usage": true, "continuous_usage_stats": true });
         let chat_out = chat(
             ProviderFormat::Openai,
             json!({ "model": "m", "messages": [], "stream": true }),
             None,
         );
-        assert_eq!(chat_out["stream_options"], json!({ "include_usage": true }));
+        assert_eq!(chat_out["stream_options"], expected_stream_options);
+        assert_eq!(chat_out["continuous_usage_stats"], json!(true));
 
         // Legacy /v1/completions must also carry include_usage to upstream, or
         // usage-only streaming providers (e.g. vLLM) never emit a usage chunk
@@ -1261,8 +1321,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             complete_out["stream_options"],
-            json!({ "include_usage": true })
+            json!({ "include_usage": true, "continuous_usage_stats": true })
         );
+        assert_eq!(complete_out["include_usage"], json!(true));
+        assert_eq!(complete_out["continuous_usage_stats"], json!(true));
 
         let responses = transform_to_provider_request(
             ProviderFormat::Openai,
@@ -1274,35 +1336,39 @@ mod tests {
         assert!(responses.get("stream_options").is_none());
     }
 
+    fn reasoning(effort: ReasoningEffort) -> Option<ReasoningConfig> {
+        Some(ReasoningConfig {
+            effort: Some(effort),
+            max_tokens: None,
+            enabled: Some(effort != ReasoningEffort::None),
+        })
+    }
+
     #[test]
-    fn build_candidates_uses_effective_or_requested_reasoning() {
-        let params = json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 8 });
-        let reasoning = |effort| {
-            Some(ReasoningConfig {
-                effort: Some(effort),
-                ..Default::default()
-            })
-        };
+    fn build_candidates_projects_reasoning_per_candidate() {
+        let params = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "low",
+            "include_reasoning": false,
+        });
         let candidates = vec![
             RouteCandidate {
                 route_id: "openai:a".into(),
                 format: ProviderFormat::Openai,
                 engine: None,
-                reasoning_format: Some(ReasoningFormat::Reasoning),
                 effective_reasoning: reasoning(ReasoningEffort::High),
             },
             RouteCandidate {
                 route_id: "openai:b".into(),
                 format: ProviderFormat::Openai,
                 engine: Some(Engine::Sglang),
-                reasoning_format: None,
                 effective_reasoning: reasoning(ReasoningEffort::Minimal),
             },
             RouteCandidate {
                 route_id: "openai:c".into(),
                 format: ProviderFormat::Openai,
                 engine: None,
-                reasoning_format: None,
                 effective_reasoning: None,
             },
         ];
@@ -1320,63 +1386,33 @@ mod tests {
         assert_eq!(bodies[1].1["reasoning_effort"], "low");
         assert!(bodies[1].1.get("reasoning").is_none());
         assert_eq!(bodies[2].1["reasoning"]["effort"], "medium");
-        assert!(bodies[2].1.get("reasoning_effort").is_none());
+        assert!(bodies[2].1.get("include_reasoning").is_none());
     }
 
     #[test]
-    fn explicit_candidate_reasoning_format_uses_openai_parameter() {
-        let request = json!({
-            "model": "gpt-5",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "reasoning_effort": "high"
-        });
-        let (params, requested, _) =
-            crate::middleware::reasoning::normalize_chat_request(&request).unwrap();
-        let candidate: RouteCandidate = serde_json::from_value(json!({
-            "routeId": "openai:gpt-5",
-            "format": "openai",
-            "reasoningFormat": "reasoning_effort"
-        }))
-        .unwrap();
-
-        let bodies = build_candidates(
-            &params,
-            Endpoint::ChatComplete,
-            &[candidate],
-            requested.as_ref(),
-        )
-        .unwrap();
-
-        assert_eq!(bodies[0].1["reasoning_effort"], "high");
-        assert!(bodies[0].1.get("reasoning").is_none());
-    }
-
-    #[test]
-    fn managed_candidate_without_dialect_preserves_reasoning_budget() {
-        let request = json!({
-            "model": "m",
-            "messages": [{ "role": "user", "content": "hi" }],
-            "reasoning": { "max_tokens": 1000 }
-        });
-        let (params, requested, _) =
-            crate::middleware::reasoning::normalize_chat_request(&request).unwrap();
-        let candidate: RouteCandidate = serde_json::from_value(json!({
-            "routeId": "compatible:m",
-            "format": "openai"
-        }))
-        .unwrap();
-
-        let bodies = build_candidates(
-            &params,
-            Endpoint::ChatComplete,
-            &[candidate],
-            requested.as_ref(),
-        )
-        .unwrap();
-
-        assert_eq!(bodies[0].1["reasoning"]["max_tokens"], 1000);
-        assert_eq!(bodies[0].1["reasoning"]["enabled"], true);
-        assert!(bodies[0].1.get("reasoning_effort").is_none());
+    fn build_candidates_emits_one_body_per_route_even_when_identical() {
+        // This path consumes typed per-route bodies; it emits one body
+        // per route and does not collapse identical candidates into a shared body.
+        let params = json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 8 });
+        let candidates = vec![
+            RouteCandidate {
+                route_id: "openai:a".into(),
+                format: ProviderFormat::Openai,
+                engine: None,
+                effective_reasoning: None,
+            },
+            RouteCandidate {
+                route_id: "openai:b".into(),
+                format: ProviderFormat::Openai,
+                engine: None,
+                effective_reasoning: None,
+            },
+        ];
+        let bodies = build_candidates(&params, Endpoint::ChatComplete, &candidates, None).unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].0, "openai:a");
+        assert_eq!(bodies[1].0, "openai:b");
+        assert_eq!(bodies[0].1, bodies[1].1);
     }
 
     #[test]
@@ -1398,14 +1434,12 @@ mod tests {
                 route_id: "openai:m".into(),
                 format: ProviderFormat::Openai,
                 engine: None,
-                reasoning_format: None,
                 effective_reasoning: None,
             },
             RouteCandidate {
                 route_id: "anthropic:m".into(),
                 format: ProviderFormat::Anthropic,
                 engine: None,
-                reasoning_format: None,
                 effective_reasoning: None,
             },
         ];

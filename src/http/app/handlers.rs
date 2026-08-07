@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use axum::{
     body::Bytes,
     extract::{Path, Query, RawQuery, State},
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -38,13 +38,13 @@ use super::error_responses::{
     unsupported_e2ee_response, upstream_config_error_response,
 };
 use super::util::{
-    enforce_admin, enforce_owner, extract_bearer, force_tee_true, has_e2ee_headers, header_str,
+    enforce_admin, enforce_api, enforce_owner, extract_bearer, has_e2ee_headers, header_str,
     request_host_domain,
 };
 use super::AppState;
 use crate::middleware::errors::Surface;
 use crate::middleware::request_transform::Endpoint;
-use crate::middleware::{hash_api_key, CompletionInput, Middleware};
+use crate::middleware::CompletionInput;
 
 #[derive(Deserialize)]
 pub(super) struct AttestationQuery {
@@ -65,6 +65,12 @@ pub(super) struct SessionListQuery {
     model: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct UpstreamPatchRequest {
+    enabled: Option<bool>,
+}
+
 // Liveness probe for load balancers and orchestrators. Unauthenticated and
 // version-independent: it reports only that the process is serving requests.
 pub(super) async fn health() -> Json<Value> {
@@ -78,9 +84,6 @@ pub(super) async fn root(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-// Catalog filters (e.g. `?zdr=true`) are the control plane's to interpret, so
-// the query string is relayed verbatim rather than parsed here. Without this the
-// gateway would silently drop it and serve an unfiltered catalog.
 fn catalog_path(base: &str, query: Option<String>) -> String {
     match query.as_deref().filter(|q| !q.is_empty()) {
         Some(q) => format!("{base}?{q}"),
@@ -88,29 +91,16 @@ fn catalog_path(base: &str, query: Option<String>) -> String {
     }
 }
 
-/// On a TEE-only host, rewrite the relayed catalog query to force `?tee=true`
-/// (see `force_tee_true`); otherwise pass the client's query through unchanged.
-fn tee_only_catalog_query(
-    middleware: &Middleware,
-    headers: &HeaderMap,
-    query: Option<String>,
-) -> Option<String> {
-    match request_host_domain(headers) {
-        Some(host) if middleware.is_tee_only_domain(&host) => Some(force_tee_true(query)),
-        _ => query,
-    }
-}
-
 pub(super) async fn models(
     State(state): State<AppState>,
     headers: HeaderMap,
-    RawQuery(query): RawQuery,
+    RawQuery(_query): RawQuery,
 ) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     if let Some(middleware) = state.middleware.clone() {
-        let query = tee_only_catalog_query(&middleware, &headers, query);
-        return middleware
-            .handle_catalog(&catalog_path("/v1/models", query))
-            .await;
+        return middleware.handle_catalog("/v1/models").await;
     }
     match state.service.upstream().models().await {
         Ok(upstream) => upstream_direct_response(upstream, "application/json"),
@@ -128,6 +118,9 @@ pub(super) async fn models_subpath(
     Path(rest): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     let Some(middleware) = state.middleware.clone() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -135,7 +128,6 @@ pub(super) async fn models_subpath(
             "model sub-catalogs are not available in direct-upstream mode",
         );
     };
-    let query = tee_only_catalog_query(&middleware, &headers, query);
     middleware
         .handle_catalog(&catalog_path(&format!("/v1/models/{rest}"), query))
         .await
@@ -148,6 +140,9 @@ pub(super) async fn embeddings_models(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     let Some(middleware) = state.middleware.clone() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -155,13 +150,15 @@ pub(super) async fn embeddings_models(
             "embedding model catalog is not available in direct-upstream mode",
         );
     };
-    let query = tee_only_catalog_query(&middleware, &headers, query);
     middleware
         .handle_catalog(&catalog_path("/v1/embeddings/models", query))
         .await
 }
 
-pub(super) async fn metrics(State(state): State<AppState>) -> Response {
+pub(super) async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
     match state.service.metrics() {
         Ok(snapshot) => {
             let mut headers = HeaderMap::new();
@@ -170,6 +167,23 @@ pub(super) async fn metrics(State(state): State<AppState>) -> Response {
         }
         Err(err) => internal_error_response(err),
     }
+}
+
+pub(super) async fn upstream_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
+    let code = state
+        .middleware
+        .as_ref()
+        .map(|middleware| middleware.upstream_status_code())
+        .unwrap_or(3);
+    let mut response = format!("{code}\n").into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 pub(super) async fn admin_get_upstreams(
@@ -240,6 +254,80 @@ pub(super) async fn admin_put_upstreams(
             Json(snapshot).into_response()
         }
         Err(e) => upstream_config_error_response(e),
+    }
+}
+
+pub(super) async fn admin_patch_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<UpstreamPatchRequest>,
+) -> Response {
+    if let Some(resp) = enforce_admin(&state, &headers) {
+        return resp;
+    }
+    let Some(manager) = &state.upstream_config else {
+        return admin_not_found_response();
+    };
+    let Some(enabled) = body.enabled else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_upstream_config",
+            "PATCH /v1/admin/upstreams/{name} currently requires an enabled boolean",
+        );
+    };
+    match manager.set_enabled(&name, enabled) {
+        Ok(snapshot) => {
+            if enabled {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    let results = manager.prewarm_upstream_verification().await;
+                    for result in results {
+                        match result.reason {
+                            Some(reason) => tracing::warn!(
+                                upstream = %result.upstream_name,
+                                model = %result.model_id,
+                                origin = ?result.url_origin,
+                                verifier = %result.verifier_id,
+                                result = %result.result,
+                                reason = %reason,
+                                "upstream verification prewarm finished"
+                            ),
+                            None => tracing::info!(
+                                upstream = %result.upstream_name,
+                                model = %result.model_id,
+                                origin = ?result.url_origin,
+                                verifier = %result.verifier_id,
+                                result = %result.result,
+                                "upstream verification prewarm finished"
+                            ),
+                        }
+                    }
+                });
+            }
+            Json(snapshot).into_response()
+        }
+        Err(e) => upstream_config_error_response(e),
+    }
+}
+
+pub(super) async fn admin_router_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(resp) = enforce_admin(&state, &headers) {
+        return resp;
+    }
+    let Some(middleware) = state.middleware.as_ref() else {
+        return admin_not_found_response();
+    };
+    match middleware.admin_snapshot() {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "router middleware is not enabled",
+        ),
     }
 }
 
@@ -607,6 +695,10 @@ pub(super) async fn openai_completion_endpoint(
     endpoint_path: &'static str,
     force_buffered: bool,
 ) -> Response {
+    if let Some(resp) = enforce_api(&state, &headers) {
+        return resp;
+    }
+
     let has_e2ee = has_e2ee_headers(&headers);
     // `supported_e2ee_versions` advertises ACI E2EE (§6). The inherited
     // dstack-vllm-proxy path predates it and is identified by
@@ -671,6 +763,12 @@ pub(super) async fn openai_completion_endpoint(
     let requester = extract_bearer(&headers)
         .as_deref()
         .map(ReceiptOwner::from_bearer);
+    let user_tier = headers
+        .get("x-user-tier")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let context = GatewayRequestContext {
         request_id: generate_request_id(),
         // The receipt `model` is the model the client requested: under E2EE
@@ -685,7 +783,7 @@ pub(super) async fn openai_completion_endpoint(
                     .map(str::to_string)
             }),
         target_route_id: None,
-        // Populated from the x-user-tier header on the internal-forward path.
+        // Middleware mode sanitizes and forwards trusted tier headers itself.
         user_tier: None,
     };
 
@@ -707,35 +805,20 @@ pub(super) async fn openai_completion_endpoint(
         } else {
             Surface::Openai
         };
-        let api_key_hash = extract_bearer(&headers).as_deref().map(hash_api_key);
-        // TEE-only host: force attested serving. The `tee_only` flag is carried
-        // to the control plane so a non-TEE model is a 404 before any forward,
-        // while `aci_required` makes verification fail closed at serve time.
-        // Client `provider.aci_verified:false` is ignored.
-        let tee_only = match request_host_domain(&headers).as_deref() {
-            Some(host) => middleware.is_tee_only_domain(host),
-            // §1.2 fail closed: with TEE-only hosts configured, a request
-            // whose host cannot be resolved is treated as TEE-only rather
-            // than unrestricted. The component in front must forward the
-            // original `Host` (see the deployment guide).
-            None => middleware.has_tee_only_domains(),
-        };
-        let aci_required = aci.required || tee_only;
         let input = CompletionInput {
             endpoint,
             endpoint_path,
             surface,
             params: parsed,
             received_body: service_body,
-            api_key_hash,
             requester,
             e2ee,
-            aci_required,
+            aci_required: aci.required,
             aci_session_ids: aci.session_ids,
             request_id: context.request_id,
             user_model: context.user_model,
+            user_tier,
             stream,
-            tee_only,
         };
         return middleware.handle_completion(&state.service, input).await;
     }

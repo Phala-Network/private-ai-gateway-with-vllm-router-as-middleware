@@ -36,6 +36,8 @@ use validation::{
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     pub name: String,
+    #[serde(default = "default_enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub provider: UpstreamProvider,
     pub base_url: String,
@@ -86,6 +88,7 @@ pub struct UpstreamConfig {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PublicUpstreamConfig {
     pub name: String,
+    pub enabled: bool,
     pub provider: UpstreamProvider,
     pub base_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,6 +130,7 @@ impl UpstreamConfig {
     pub fn redacted(&self) -> PublicUpstreamConfig {
         PublicUpstreamConfig {
             name: self.name.clone(),
+            enabled: self.enabled,
             provider: self.provider,
             base_url: self.base_url.clone(),
             path: self.path.clone(),
@@ -149,6 +153,14 @@ impl UpstreamConfig {
             chutes_e2ee_discovery_interval_seconds: self.chutes_e2ee_discovery_interval_seconds,
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -275,6 +287,18 @@ pub struct AttestationUpstreamTarget {
     pub read_timeout_seconds: u64,
 }
 
+/// Connection details for polling an upstream node's serving metrics. This is
+/// intentionally not part of [`UpstreamConfigSnapshot`] because it carries the
+/// upstream bearer token.
+#[derive(Debug, Clone)]
+pub struct UpstreamMetricsTarget {
+    pub upstream_name: String,
+    pub base_url: String,
+    pub bearer_token: Option<String>,
+    pub connect_timeout_seconds: u64,
+    pub read_timeout_seconds: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UpstreamConfigSnapshot {
     pub config_path: String,
@@ -387,6 +411,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.models.contains_key(model) || cfg.models.values().any(|v| v == model))
             .map(|cfg| cfg.name.clone())
             .collect()
@@ -398,7 +423,7 @@ impl UpstreamConfigManager {
     /// Returns `None` when no configured upstream serves `model`.
     pub fn attestation_upstream_target(&self, model: &str) -> Option<AttestationUpstreamTarget> {
         let state = self.state.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let cfg = state.config.iter().find(|cfg| {
+        let cfg = state.config.iter().filter(|cfg| cfg.enabled).find(|cfg| {
             cfg.models.contains_key(model) || cfg.models.values().any(|v| v == model)
         })?;
         // `model` is either a public alias (mapped to an upstream id) or already
@@ -421,6 +446,26 @@ impl UpstreamConfigManager {
                 .read_timeout_seconds
                 .unwrap_or(self.options.read_timeout_seconds),
         })
+    }
+
+    pub fn metrics_targets(&self) -> Vec<UpstreamMetricsTarget> {
+        let state = self.state.read().unwrap_or_else(|p| p.into_inner()).clone();
+        state
+            .config
+            .iter()
+            .filter(|cfg| cfg.enabled)
+            .map(|cfg| UpstreamMetricsTarget {
+                upstream_name: cfg.name.clone(),
+                base_url: cfg.base_url.trim_end_matches('/').to_string(),
+                bearer_token: cfg.bearer_token.clone(),
+                connect_timeout_seconds: cfg
+                    .connect_timeout_seconds
+                    .unwrap_or(self.options.connect_timeout_seconds),
+                read_timeout_seconds: cfg
+                    .read_timeout_seconds
+                    .unwrap_or(self.options.read_timeout_seconds),
+            })
+            .collect()
     }
 
     pub fn snapshot(&self) -> UpstreamConfigSnapshot {
@@ -446,6 +491,28 @@ impl UpstreamConfigManager {
         Ok(snapshot_for(&self.path, &next))
     }
 
+    pub fn set_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<UpstreamConfigSnapshot, UpstreamConfigError> {
+        let mut config = {
+            let state = self
+                .state
+                .read()
+                .expect("upstream config manager state poisoned")
+                .clone();
+            state.config.clone()
+        };
+        let Some(upstream) = config.iter_mut().find(|cfg| cfg.name == name) else {
+            return Err(UpstreamConfigError::InvalidConfig(format!(
+                "upstream {name:?} not found"
+            )));
+        };
+        upstream.enabled = enabled;
+        self.replace(config)
+    }
+
     pub async fn prewarm_upstream_verification(&self) -> Vec<UpstreamPrewarmResult> {
         self.run_upstream_verification(false).await
     }
@@ -464,6 +531,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter_map(|cfg| verification_refresh_seconds(cfg, &self.options))
             .min()
     }
@@ -478,6 +546,7 @@ impl UpstreamConfigManager {
         state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.provider == UpstreamProvider::Chutes)
             .filter_map(session_refresh_seconds)
             .min()
@@ -556,6 +625,7 @@ impl UpstreamConfigManager {
         for cfg in state
             .config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.provider == UpstreamProvider::Chutes)
             .filter(|cfg| session_refresh_seconds(cfg).is_some())
         {
@@ -654,6 +724,7 @@ impl ProviderSessionRegistry {
     fn new(config: &[UpstreamConfig]) -> Self {
         let chutes = config
             .iter()
+            .filter(|cfg| cfg.enabled)
             .filter(|cfg| cfg.provider == UpstreamProvider::Chutes)
             .map(|cfg| (cfg.name.clone(), Arc::new(ChutesSessionStore::new())))
             .collect();

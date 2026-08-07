@@ -64,7 +64,7 @@ fn metered_status(outcome: Outcome, upstream_status: u16) -> u16 {
 
 /// Fixed fields for the post-stream usage report; `settle` fills in the rest.
 pub struct StreamReport {
-    pub control: ControlClient,
+    pub control: Option<ControlClient>,
     pub request_id: String,
     pub endpoint: String,
     pub request_model: String,
@@ -115,14 +115,26 @@ impl StreamReport {
             error_message: downstream
                 .then(|| "downstream finalizer aborted the response".to_string()),
         };
-        let control = self.control.clone();
-        // Fire-and-forget. Guard against being called from a drop that runs
-        // outside a Tokio runtime (e.g. during shutdown teardown), where
-        // `tokio::spawn` would panic and abort the process.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                control.consult_post(&report).await;
-            });
+        match self.control.clone() {
+            Some(control) => {
+                // Fire-and-forget. Guard against being called from a drop that
+                // runs outside a Tokio runtime (e.g. during shutdown teardown),
+                // where `tokio::spawn` would panic and abort the process.
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        control.consult_post(&report).await;
+                    });
+                }
+            }
+            None => {
+                tracing::debug!(
+                    request_id = %self.request_id,
+                    status = report.status,
+                    is_streaming = true,
+                    selected_route_id = ?report.selected_route_id,
+                    "stream usage report skipped because middleware.control_url is unset"
+                );
+            }
         }
     }
 }
@@ -827,13 +839,10 @@ mod tests {
     }
 
     fn test_meter_for(protocol: crate::sse_protocol::SseProtocol) -> MeterStream {
-        let control = ControlClient::new(&MiddlewareConfig {
-            control_url: "http://control.invalid".to_string(),
-            control_token: None,
-            control_timeout_ms: Some(200),
+        let control = ControlClient::from_config(&MiddlewareConfig {
+            control_url: Some("http://control.invalid".to_string()),
             control_post_timeout_ms: Some(200),
-            sse_keepalive_ms: None,
-            tee_only_domains: Vec::new(),
+            ..Default::default()
         })
         .unwrap();
         let report = StreamReport {

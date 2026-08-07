@@ -14,13 +14,12 @@
 //!   Buffered-only; any client-sent `stream:true` is forced back to
 //!   buffered before forwarding. The aggregator hashes the body and
 //!   issues a receipt the same way as `/v1/chat/completions`.
-//! * `GET  /v1/models` - proxy the upstream OpenAI-compatible model list.
-//! * `GET  /v1/models/*` - relay model sub-catalogs to the middleware, which
-//!   owns the routing: `/v1/models/:namespace` (alias-prefix catalog) and
-//!   `/v1/models/providers/:provider` (provider catalog). Control-plane
-//!   middleware only.
-//! * `GET  /v1/embeddings/models` - embedding model catalog (control-plane
-//!   middleware only).
+//! * `GET  /v1/models` - proxy the upstream OpenAI-compatible model list, or
+//!   serve the single public router model when router middleware is enabled.
+//! * `GET  /v1/models/*` - relay model sub-catalogs to middleware. The built-in
+//!   router middleware currently serves only `/v1/models`.
+//! * `GET  /v1/embeddings/models` - embedding model catalog. The built-in
+//!   router middleware currently returns `404` here.
 //! * `GET  /health` - unauthenticated liveness probe for load balancers and
 //!   orchestrators; reports only that the process is serving requests.
 //! * `GET  /v1/metrics` - expose aggregator-owned Prometheus metrics.
@@ -28,6 +27,10 @@
 //!   current upstream config, with secrets redacted.
 //! * `PUT  /v1/admin/upstreams` - authenticated admin replacement of
 //!   the single upstream config file.
+//! * `PATCH /v1/admin/upstreams/{name}` - authenticated admin enable/disable
+//!   toggle for one upstream without replacing the full config.
+//! * `GET  /v1/admin/router` - authenticated middleware router status when
+//!   router middleware mode is enabled.
 //!
 //! ACI verification artifacts live under the `/v1/aci/` namespace so they do
 //! not pollute the OpenAI surface. The id parameter accepts the gateway
@@ -64,7 +67,7 @@ use axum::{
     http::{HeaderName, HeaderValue},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -87,9 +90,10 @@ mod util;
 
 use handlers::{
     aci_attestation_report, aci_list_sessions, aci_receipt, admin_get_upstreams,
-    admin_put_upstreams, attestation_report, attested_session, chat_completions, completions,
-    embeddings, embeddings_models, health, messages, metrics, models, models_subpath,
-    receipt_by_chat_id, responses, root,
+    admin_patch_upstream, admin_put_upstreams, admin_router_status, attestation_report,
+    attested_session, chat_completions, completions, embeddings, embeddings_models, health,
+    messages, metrics, models, models_subpath, receipt_by_chat_id, responses, root,
+    upstream_status,
 };
 
 #[derive(Clone)]
@@ -97,11 +101,12 @@ pub struct AppState {
     pub service: Arc<AciService>,
     pub upstream_config: Option<Arc<UpstreamConfigManager>>,
     pub admin_token: Option<String>,
-    middleware: Option<Arc<Middleware>>,
+    pub api_token: Option<String>,
+    pub middleware: Option<Arc<Middleware>>,
 }
 
 pub fn build_router(service: Arc<AciService>) -> Router {
-    build_router_inner(service, None, None, None)
+    build_router_inner(service, None, None, None, None)
 }
 
 pub fn build_router_with_admin(
@@ -109,7 +114,16 @@ pub fn build_router_with_admin(
     upstream_config: Arc<UpstreamConfigManager>,
     admin_token: Option<String>,
 ) -> Router {
-    build_router_inner(service, Some(upstream_config), admin_token, None)
+    build_router_inner(service, Some(upstream_config), admin_token, None, None)
+}
+
+pub fn build_router_with_admin_and_api(
+    service: Arc<AciService>,
+    upstream_config: Arc<UpstreamConfigManager>,
+    admin_token: Option<String>,
+    api_token: Option<String>,
+) -> Router {
+    build_router_inner(service, Some(upstream_config), admin_token, api_token, None)
 }
 
 /// Build the gateway router with the middleware, which consults the
@@ -120,10 +134,27 @@ pub fn build_router_with_admin_and_middleware(
     admin_token: Option<String>,
     middleware: Arc<Middleware>,
 ) -> Router {
+    build_router_with_admin_api_and_middleware(
+        service,
+        upstream_config,
+        admin_token,
+        None,
+        middleware,
+    )
+}
+
+pub fn build_router_with_admin_api_and_middleware(
+    service: Arc<AciService>,
+    upstream_config: Arc<UpstreamConfigManager>,
+    admin_token: Option<String>,
+    api_token: Option<String>,
+    middleware: Arc<Middleware>,
+) -> Router {
     build_router_inner(
         service,
         Some(upstream_config),
         admin_token,
+        api_token,
         Some(middleware),
     )
 }
@@ -132,12 +163,14 @@ fn build_router_inner(
     service: Arc<AciService>,
     upstream_config: Option<Arc<UpstreamConfigManager>>,
     admin_token: Option<String>,
+    api_token: Option<String>,
     middleware: Option<Arc<Middleware>>,
 ) -> Router {
     let state = AppState {
         service,
         upstream_config,
         admin_token,
+        api_token,
         middleware,
     };
     Router::new()
@@ -154,10 +187,13 @@ fn build_router_inner(
         .route("/v1/responses", post(responses))
         // Gateway operations.
         .route("/v1/metrics", get(metrics))
+        .route("/v1/upstream-status", get(upstream_status))
         .route(
             "/v1/admin/upstreams",
             get(admin_get_upstreams).put(admin_put_upstreams),
         )
+        .route("/v1/admin/upstreams/:name", patch(admin_patch_upstream))
+        .route("/v1/admin/router", get(admin_router_status))
         // Canonical ACI verification surface (clean shapes).
         .route("/v1/aci/attestation", get(aci_attestation_report))
         .route("/v1/aci/receipts/:id", get(aci_receipt))

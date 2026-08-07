@@ -415,19 +415,21 @@ The gateway runs in no-middleware mode unless middleware is configured. In
 middleware mode the middleware runs in-process, between the frontend and
 backend:
 
-- Public `/v1/models` and its sub-catalogs are served from the control plane.
+- Public `/v1/models` is served from the configured single router model.
 - Public inference requests are decrypted and normalized by the frontend, then
-  handed to the middleware, which consults the control plane to
-  authorize and route the request and shapes the provider request.
-- The middleware selects a configured target route, forwards through the
-  backend, transforms the response, injects usage cost, and reports usage back
-  to the control plane. Verification facts still come from the backend.
+  handed to the middleware, which orders configured upstream candidates with
+  cache affinity plus PIG load/pressure signals and shapes the provider request.
+- The middleware forwards through the backend, transforms the response, can
+  inject usage cost, and can send a best-effort post-request usage report when
+  `middleware.control_url` is configured. Verification facts still come from the
+  backend.
 - Streaming responses stay streaming across backend, middleware, and frontend.
 - Middleware-generated OpenAI-compatible responses are passed through downstream
   E2EE when the original user request used E2EE.
 
 The middleware is configured by the `middleware` section of the static gateway
-config; see the [configuration reference](docs/configuration-reference.md#middleware).
+config; see the [configuration reference](docs/configuration-reference.md#middleware)
+and [router middleware design](docs/router-middleware.md).
 
 ## API Surface
 

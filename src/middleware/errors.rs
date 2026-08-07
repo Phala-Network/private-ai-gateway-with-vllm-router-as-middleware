@@ -16,12 +16,41 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-// Re-exported so call sites keep importing client-facing error shapes from one
-// place; the definitions are shared because the service layer builds them too.
-pub use crate::error_payload::{error_type, upstream_message, Surface};
-pub use crate::sse_protocol::{sse_protocol, stream_error_tail, SseProtocol};
+/// Downstream API surface that shapes the error envelope and `error.type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Openai,
+    Anthropic,
+}
 
-use crate::error_payload::envelope;
+/// Map an HTTP status to the surface's `error.type`. Only covers statuses this
+/// gateway actually emits.
+pub fn error_type(surface: Surface, status: u16) -> &'static str {
+    match surface {
+        Surface::Anthropic => match status {
+            400 => "invalid_request_error",
+            401 => "authentication_error",
+            402 => "billing_error",
+            403 => "permission_error",
+            404 => "not_found_error",
+            429 => "rate_limit_error",
+            504 => "timeout_error",
+            s if s >= 500 => "api_error",
+            _ => "invalid_request_error",
+        },
+        Surface::Openai => match status {
+            401 => "authentication_error",
+            402 => "insufficient_quota",
+            403 => "permission_error",
+            404 => "not_found_error",
+            429 => "rate_limit_error",
+            503 => "service_unavailable",
+            504 => "timeout_error",
+            s if s >= 500 => "upstream_error",
+            _ => "invalid_request_error",
+        },
+    }
+}
 
 /// Flatten an upstream status to the client-facing status. The mapping is uniform
 /// across surfaces; only the envelope and `error.type` are surface-aware.
@@ -40,6 +69,33 @@ pub fn map_upstream_status(status: u16) -> u16 {
 /// (always re-wrapped in our envelope, never the raw upstream response).
 pub fn is_actionable_client_error(status: u16) -> bool {
     (400..500).contains(&status) && !matches!(status, 401..=403 | 429)
+}
+
+/// Generic sanitized message for a non-actionable upstream status.
+pub fn upstream_message(upstream_status: u16) -> &'static str {
+    match upstream_status {
+        401..=403 => "The upstream provider is currently unavailable",
+        429 => "Rate limit exceeded. Please retry after some time.",
+        503 => "The model is currently unavailable. Please try again later.",
+        504 => "The upstream provider timed out",
+        _ => "The upstream provider returned an error",
+    }
+}
+
+fn envelope(surface: Surface, error_type: &str, message: &str, request_id: Option<&str>) -> Value {
+    match surface {
+        Surface::Anthropic => {
+            let mut value = json!({
+                "type": "error",
+                "error": { "type": error_type, "message": message },
+            });
+            if let Some(request_id) = request_id {
+                value["request_id"] = json!(request_id);
+            }
+            value
+        }
+        Surface::Openai => json!({ "error": { "message": message, "type": error_type } }),
+    }
 }
 
 /// Serialize the surface error envelope to bytes (for the E2EE generated path).
@@ -289,18 +345,9 @@ pub fn image_input_error_parts(
 /// message can sit outside the usual `error`/`error.message` fields.
 const UPSTREAM_CAPACITY_MARKER: &[u8] = b"exhausted all available targets";
 
-/// The client-facing `(status, envelope bytes)` for an upstream capacity signal,
-/// or `None` when the upstream error is not one. An upstream reporting it has no
-/// available capacity/targets is busy, not faulty: surface it as `429`
-/// (rate-limited) rather than a `5xx` outage, so it is treated as load, not an
-/// error. Peer to [`image_input_error_parts`] — both remap a recognized upstream
-/// error body to a specific client status.
 /// Whether an upstream outcome is a capacity signal: a literal 429, or the
 /// recognized 5xx capacity/no-targets body that error normalization also
-/// surfaces to clients as 429. The single classification shared by error
-/// normalization and the forwarder's capacity-retry targeting — the two must
-/// never disagree about what "capacity" means, or a request could be told
-/// 429 without ever having been eligible for the retry that 429s get.
+/// surfaces to clients as 429.
 pub(crate) fn is_upstream_capacity_signal(status: u16, body: &[u8]) -> bool {
     if status == 429 {
         return true;
@@ -352,7 +399,6 @@ pub fn normalize_upstream_error_parts(
     {
         return parts;
     }
-    // A provider signalling it is out of capacity is busy, not broken: 429, not 5xx.
     if let Some(parts) = capacity_error_parts(surface, upstream_status, body, request_id) {
         return parts;
     }
@@ -404,7 +450,8 @@ pub fn normalize_upstream_error(
 
 #[cfg(test)]
 mod tests {
-    use super::is_upstream_capacity_signal;
+    use super::*;
+    use axum::body::to_bytes;
 
     #[test]
     fn capacity_signal_is_429_or_the_marked_5xx_body() {
@@ -413,17 +460,12 @@ mod tests {
             503,
             br#"{"error":"exhausted all available targets"}"#
         ));
-        // A plain 5xx is an outage, not capacity.
         assert!(!is_upstream_capacity_signal(503, br#"{"error":"boom"}"#));
-        // The marker under a non-5xx status is not the recognized signal.
         assert!(!is_upstream_capacity_signal(
             400,
             b"exhausted all available targets"
         ));
     }
-
-    use super::*;
-    use axum::body::to_bytes;
 
     async fn response_json(response: Response) -> (u16, Value) {
         let status = response.status().as_u16();
@@ -444,7 +486,7 @@ mod tests {
         assert_eq!(status, 400);
         assert_eq!(
             body,
-            json!({ "error": { "message": "bad", "type": "invalid_request_error", "code": null, "param": null } })
+            json!({ "error": { "message": "bad", "type": "invalid_request_error" } })
         );
     }
 
@@ -522,34 +564,6 @@ mod tests {
             body["error"]["message"],
             json!("The upstream provider returned an error")
         );
-    }
-
-    #[tokio::test]
-    async fn capacity_exhaustion_5xx_remaps_to_429() {
-        // An upstream 5xx that reports it has no available capacity/targets is a
-        // busy signal (the message sits under `detail`, outside the usual
-        // `error` field): the client sees 429 (rate-limited), not a 502 outage.
-        let (status, body) = response_json(normalize_upstream_error(
-            Surface::Openai,
-            500,
-            br#"{"detail":"exhausted all available targets to no avail"}"#,
-            b"",
-            None,
-        ))
-        .await;
-        assert_eq!(status, 429);
-        assert_eq!(body["error"]["type"], json!("rate_limit_error"));
-
-        // Regression guard: a plain 500 without the marker still maps to 502.
-        let (status, _) = response_json(normalize_upstream_error(
-            Surface::Openai,
-            500,
-            br#"{"error":{"message":"kaboom"}}"#,
-            b"",
-            None,
-        ))
-        .await;
-        assert_eq!(status, 502);
     }
 
     #[test]

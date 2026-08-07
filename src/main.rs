@@ -18,9 +18,8 @@
 //! attested-session log `sessions.jsonl`.
 //!
 //! When the static config includes a `middleware` section, the gateway runs the
-//! middleware: it consults the control plane at `middleware.control_url`
-//! and calls the service directly. Without the section the gateway serves the
-//! upstream directly.
+//! built-in single-model router middleware and orders upstream candidates
+//! in-process. Without the section the gateway serves the upstream directly.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -42,7 +41,9 @@ use private_ai_gateway::aggregator::upstream_config::{
     parse_config_text, UpstreamConfigManager, UpstreamRuntimeOptions, UpstreamVerifierMode,
 };
 use private_ai_gateway::dstack::{DstackAciProvider, DstackAciProviderConfig};
-use private_ai_gateway::http::{build_router_with_admin, build_router_with_admin_and_middleware};
+use private_ai_gateway::http::{
+    build_router_with_admin_and_api, build_router_with_admin_api_and_middleware,
+};
 use private_ai_gateway::middleware::{Middleware, MiddlewareConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -68,6 +69,7 @@ struct GatewayConfigFile {
     state_dir: Option<String>,
     upstream_config_seed_path: Option<String>,
     admin_token: Option<String>,
+    api_token: Option<String>,
     /// Keyset lifetime in seconds: `not_after` = launch time + this (§3.4).
     /// Defaults to [`DEFAULT_KEYSET_NOT_AFTER_SECONDS`] (30 days).
     keyset_not_after_seconds: Option<u64>,
@@ -351,6 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_log_path = session_log_path(&state_dir);
     let upstream_config_seed_path = gateway_config.upstream_config_seed_path.clone();
     let admin_token = gateway_config.admin_token.clone();
+    let api_token = gateway_config.api_token.clone();
     let source_provenance = resolve_source_provenance()?;
     let tls_public_keys = resolve_tls_public_keys(&gateway_config.tls)?;
     let dstack_endpoint = gateway_config.dstack_endpoint.clone();
@@ -498,14 +501,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_upstream_lifecycle(upstream_config.clone());
 
     let app = if let Some(middleware_config) = middleware_config {
-        let middleware = Arc::new(Middleware::new(&middleware_config).map_err(invalid_input)?);
+        let middleware = Arc::new(
+            Middleware::new(&middleware_config, upstream_config.clone()).map_err(invalid_input)?,
+        );
         tracing::info!(
-            control_url = %middleware_config.control_url,
+            mode = %middleware.name(),
             "private-ai-gateway middleware enabled"
         );
-        build_router_with_admin_and_middleware(service, upstream_config, admin_token, middleware)
+        build_router_with_admin_api_and_middleware(
+            service,
+            upstream_config,
+            admin_token,
+            api_token,
+            middleware,
+        )
     } else {
-        build_router_with_admin(service, upstream_config, admin_token)
+        build_router_with_admin_and_api(service, upstream_config, admin_token, api_token)
     };
 
     tracing::info!(%bind, "private-ai-gateway listening");
@@ -703,20 +714,25 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
             &config_path,
             r#"{
                 "middleware": {
-                    "control_url": "https://control.example",
-                    "control_token": "secret"
-                }
+                    "public_model": "gemma4-31b-it",
+                    "cache_threshold": 0.4,
+                    "default_engine": "vllm"
+                },
+                "api_token": "api-secret"
             }"#,
         )
         .unwrap();
 
         let config = load_gateway_config(config_path.to_str().unwrap()).unwrap();
 
+        assert_eq!(config.api_token.as_deref(), Some("api-secret"));
         let middleware = config.middleware.expect("middleware section must parse");
-        assert_eq!(middleware.control_url, "https://control.example");
-        assert_eq!(middleware.control_token.as_deref(), Some("secret"));
-        // Optional timeouts default to None and fall back inside the client.
-        assert_eq!(middleware.control_timeout_ms, None);
+        assert_eq!(middleware.public_model.as_deref(), Some("gemma4-31b-it"));
+        assert_eq!(middleware.cache_threshold, 0.4);
+        assert_eq!(
+            middleware.default_engine,
+            Some(private_ai_gateway::middleware::types::Engine::Vllm)
+        );
         let _ = std::fs::remove_file(config_path);
     }
 

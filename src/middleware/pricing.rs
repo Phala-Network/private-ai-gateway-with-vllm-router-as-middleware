@@ -47,7 +47,7 @@ fn resolve_usage(usage: &Value) -> ResolvedUsage {
     // `input_tokens` excludes them (cache_read/cache_creation are separate,
     // additive buckets). Normalize to the OpenAI convention (prompt includes
     // cache) so the uncached-input subtraction in `compute_cost` is correct for
-    // either family — otherwise native Anthropic usage under-counts input.
+    // either family; otherwise native Anthropic usage under-counts input.
     let prompt = match token_value(usage, "prompt_tokens") {
         Some(prompt_tokens) => prompt_tokens,
         None => token_value(usage, "input_tokens").unwrap_or(0) + cache_read + cache_creation,
@@ -61,7 +61,7 @@ fn resolve_usage(usage: &Value) -> ResolvedUsage {
 }
 
 // Parse a per-token rate. Numbers are parsed from their shortest string form for
-// exact Decimal parsing. null/empty → unset.
+// exact Decimal parsing. null/empty means unset.
 fn rate(pricing: &Value, key: &str) -> Option<Decimal> {
     match pricing.get(key) {
         Some(Value::String(s)) if !s.is_empty() => Decimal::from_str(s).ok(),

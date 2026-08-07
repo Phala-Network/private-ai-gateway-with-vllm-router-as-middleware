@@ -65,16 +65,21 @@ For each request, the router:
    radix-tree cache index used for prefix affinity.
 4. Reads the latest PIG metrics sample for each upstream when metrics polling is
    enabled and the sample is fresh.
-5. Classifies pressure.
-6. Selects the best first candidate and returns the rest as fallback candidates
-   ordered by lower effective load.
+5. Classifies pressure and removes routes that are not selectable for the
+   request tier.
+6. Attempts a prefix-cache match when routing text is present.
+7. Accepts the matched route only if it is not waiting, not full, and not
+   meaningfully more loaded than the least-loaded route.
+8. Falls back to the least-loaded route when no prefix match exists or the
+   matched route fails the load guard.
+9. Returns the rest as fallback candidates ordered by lower effective load.
 
-PIG pressure always wins over cache affinity. A warmed-prefix route is preferred
-only when it is not waiting, not full, and not meaningfully more loaded than a
-healthier route.
+PIG pressure always wins over cache affinity. The router checks cache affinity
+before load fallback, but the matched route must still pass the load guard
+against the current least-loaded route.
 
-When routes are equally idle and no cache match exists, the router uses the
-processed counter as a cold-traffic tie breaker so new traffic spreads across
+When no cache match exists, the router uses lower effective running count and
+then processed count as cold-traffic tie breakers so new traffic spreads across
 nodes over time.
 
 ## PIG Metrics
@@ -166,13 +171,18 @@ internally for structured `request_outcome` logs. When the chain ends in an
 upstream HTTP response, including an all-429 chain, the gateway relays the
 terminal upstream status after normal response classification.
 
+An unknown or unroutable public model is a `404 model_not_found`, not a malformed
+request. A provider-side `404` for one selected candidate is treated as a
+catalog miss for that provider and can fail over to another candidate; request
+body errors such as `400` and `422` stay terminal.
+
 Streaming response errors are handled at the body boundary. The gateway logs a
 `stream_abort` warning and ends the body normally, rather than surfacing a body
 error to Hyper and causing a client-visible connection reset.
 
-If all candidates are unavailable or PIG rejects because no capacity exists, the
-client sees an OpenAI/vLLM-shaped error response. The middleware should not mask
-real backend crashes as client errors.
+If all configured candidates are unavailable or PIG rejects because no capacity
+exists, the client sees an OpenAI/vLLM-shaped capacity error, normally `429`.
+The middleware should not mask real backend crashes as client errors.
 
 ## Admin Snapshot
 
