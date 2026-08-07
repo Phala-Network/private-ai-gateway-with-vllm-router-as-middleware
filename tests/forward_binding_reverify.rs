@@ -253,6 +253,25 @@ impl UpstreamBackend for CapacityBackend {
         Some(UPSTREAM_ORIGIN)
     }
 
+    fn prepare(&self, req: UpstreamRequest) -> Result<PreparedUpstreamRequest, UpstreamError> {
+        let model_id = serde_json::from_slice::<serde_json::Value>(&req.body)
+            .ok()
+            .and_then(|body| {
+                body.get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        Ok(PreparedUpstreamRequest {
+            request: req,
+            upstream_name: UPSTREAM_NAME.to_string(),
+            url_origin: Some(UPSTREAM_ORIGIN.to_string()),
+            model_id,
+            route_id: None,
+            is_tee: Some(true),
+        })
+    }
+
     async fn forward(&self, _req: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(Self::response())
