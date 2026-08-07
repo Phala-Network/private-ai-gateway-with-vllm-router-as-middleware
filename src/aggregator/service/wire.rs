@@ -86,6 +86,14 @@ pub enum MiddlewareForwardResult {
     AllFailed(Box<MiddlewareAllFailed>),
 }
 
+/// Bounded lifecycle notifications for middleware-owned route accounting.
+/// The generic forwarding service reports attempts without depending on a
+/// particular routing policy or metrics implementation.
+pub trait MiddlewareAttemptObserver: Send {
+    fn attempt_started(&mut self, route_id: &str);
+    fn attempt_response(&mut self, route_id: &str, status: u16);
+}
+
 pub struct MiddlewareAllFailed {
     /// Every candidate attempted, as (route_id, status), in the order tried.
     /// Non-HTTP failures (prepare/verification/transport) record 502; HTTP

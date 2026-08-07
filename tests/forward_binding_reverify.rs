@@ -11,6 +11,7 @@ mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use private_ai_gateway::aci::receipt::{ChannelBinding, UpstreamVerifiedEvent, VerificationResult};
@@ -20,8 +21,9 @@ use private_ai_gateway::aci::upstream::{
 };
 use private_ai_gateway::aggregator::service::{
     AciService, AciServiceConfig, ChatCompletionRequest, FixedClock, ForwardCandidate,
-    GatewayRequestContext, InMemoryReceiptStore, MiddlewareForwardResult, MiddlewareReceiptJournal,
-    ServiceError, UpstreamVerificationError, UpstreamVerificationRequest, UpstreamVerifier,
+    GatewayRequestContext, InMemoryReceiptStore, MiddlewareAttemptObserver,
+    MiddlewareForwardResult, MiddlewareReceiptJournal, ServiceError, UpstreamVerificationError,
+    UpstreamVerificationRequest, UpstreamVerifier,
 };
 
 use common::{event_from_request, verified_event, StaticKeyProvider, StubQuoter};
@@ -224,8 +226,65 @@ impl UpstreamBackend for MismatchingBackend {
     }
 }
 
+#[derive(Default)]
+struct CapacityBackend {
+    calls: AtomicUsize,
+}
+
+impl CapacityBackend {
+    fn response() -> UpstreamResponse {
+        UpstreamResponse {
+            status_code: 429,
+            body: br#"{"error":{"type":"rate_limit_error","message":"predictive capacity protected"}}"#
+                .to_vec(),
+            headers: std::collections::HashMap::new(),
+            served_instance_id: None,
+        }
+    }
+}
+
+#[async_trait]
+impl UpstreamBackend for CapacityBackend {
+    fn name(&self) -> &str {
+        UPSTREAM_NAME
+    }
+
+    fn url_origin(&self) -> Option<&str> {
+        Some(UPSTREAM_ORIGIN)
+    }
+
+    async fn forward(&self, _req: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Self::response())
+    }
+
+    async fn forward_verified_prepared(
+        &self,
+        _req: PreparedUpstreamRequest,
+        _event: &UpstreamVerifiedEvent,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Self::response())
+    }
+}
+
+#[derive(Default)]
+struct RecordingAttemptObserver {
+    events: Vec<(String, Option<u16>)>,
+}
+
+impl MiddlewareAttemptObserver for RecordingAttemptObserver {
+    fn attempt_started(&mut self, route_id: &str) {
+        self.events.push((route_id.to_string(), None));
+    }
+
+    fn attempt_response(&mut self, route_id: &str, status: u16) {
+        self.events.push((route_id.to_string(), Some(status)));
+    }
+}
+
 fn build_service(
-    backend: Arc<MismatchingBackend>,
+    backend: Arc<dyn UpstreamBackend>,
     verifier: Arc<RecordingVerifier>,
 ) -> Arc<AciService> {
     Arc::new(
@@ -243,8 +302,8 @@ fn build_service(
 }
 
 /// Canned passing event the caller "owns" — mirrors what the recording verifier
-/// would have produced, so the fail-closed gate (upstream_required defaults to
-/// true) is satisfied and the flow reaches the forward step.
+/// would have produced, so an `aci_required` request satisfies the
+/// fail-closed gate and the flow reaches the forward step.
 fn caller_event() -> UpstreamVerifiedEvent {
     UpstreamVerifiedEvent {
         url_origin: Some(UPSTREAM_ORIGIN.to_string()),
@@ -430,4 +489,55 @@ async fn reverify_cannot_escape_the_requested_aci_session() {
         3,
         "seed + pinned initial verify + one refresh"
     );
+}
+
+#[tokio::test]
+async fn middleware_capacity_failover_is_single_pass_without_delayed_retry() {
+    let backend = Arc::new(CapacityBackend::default());
+    let verifier = Arc::new(RecordingVerifier::default());
+    let service = build_service(backend.clone(), verifier);
+    let candidates = vec![
+        ForwardCandidate {
+            route_id: "route-a".to_string(),
+            body: CHAT_BODY.to_vec(),
+        },
+        ForwardCandidate {
+            route_id: "route-b".to_string(),
+            body: CHAT_BODY.to_vec(),
+        },
+    ];
+    let mut observer = RecordingAttemptObserver::default();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        service.forward_chat_completion_for_middleware_observed(
+            forward_request(None),
+            candidates,
+            false,
+            MiddlewareReceiptJournal::default(),
+            Some(&mut observer),
+        ),
+    )
+    .await
+    .expect("capacity failover unexpectedly waited for the removed 2-4 second retry")
+    .expect("capacity responses should be returned as middleware outcomes");
+
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        observer.events,
+        vec![
+            ("route-a".to_string(), None),
+            ("route-a".to_string(), Some(429)),
+            ("route-b".to_string(), None),
+            ("route-b".to_string(), Some(429)),
+        ]
+    );
+    match result {
+        MiddlewareForwardResult::Forwarded(forward) => {
+            assert_eq!(forward.selected_route, "route-b");
+            assert_eq!(forward.upstream_status, 429);
+            assert_eq!(forward.failed_attempts, vec![("route-a".to_string(), 429)]);
+        }
+        _ => panic!("all-capacity rejection should return the final real upstream response"),
+    }
 }

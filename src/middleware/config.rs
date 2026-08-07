@@ -55,7 +55,7 @@ impl Default for MiddlewareConfig {
             balance_abs_threshold: 64,
             balance_rel_threshold: 1.50,
             max_history_per_route: 256,
-            metrics_poll_ms: 1_000,
+            metrics_poll_ms: 500,
             metrics_timeout_ms: 800,
             metrics_stale_ms: 3_000,
             metrics_path: "/v1/metrics".to_string(),
