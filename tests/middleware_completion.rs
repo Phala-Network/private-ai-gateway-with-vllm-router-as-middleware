@@ -19,7 +19,7 @@ use axum::{routing::post, Json, Router};
 use futures_util::{stream, StreamExt};
 use private_ai_gateway::aci::receipt::{UpstreamVerifiedEvent, VerificationResult};
 use private_ai_gateway::aci::upstream::{
-    UpstreamBackend, UpstreamError, UpstreamRequest, UpstreamResponse,
+    PreparedUpstreamRequest, UpstreamBackend, UpstreamError, UpstreamRequest, UpstreamResponse,
 };
 use private_ai_gateway::aggregator::service::{
     AciService, AciServiceConfig, FixedClock, InMemoryReceiptStore, UpstreamVerificationRequest,
@@ -56,6 +56,27 @@ impl UpstreamBackend for MockUpstream {
 
     fn url_origin(&self) -> Option<&str> {
         Some("https://mock-upstream.example")
+    }
+
+    fn prepare(&self, req: UpstreamRequest) -> Result<PreparedUpstreamRequest, UpstreamError> {
+        let route_id = req.target_route_id.clone();
+        let model_id = serde_json::from_slice::<Value>(&req.body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        Ok(PreparedUpstreamRequest {
+            request: req,
+            upstream_name: self.name().to_string(),
+            url_origin: self.url_origin().map(str::to_string),
+            model_id,
+            route_id,
+            is_tee: Some(true),
+        })
     }
 
     async fn forward(&self, _req: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
@@ -285,7 +306,7 @@ fn chat_input(model: &str, content: &str) -> CompletionInput {
         params,
         requester: None,
         e2ee: None,
-        aci_required: true,
+        aci_required: false,
         aci_session_ids: Vec::new(),
         request_id: "req-1".to_string(),
         user_model: Some(model.to_string()),
@@ -721,12 +742,11 @@ async fn upstream_verification_failure_fails_closed_before_forwarding() {
         "gpu-a", &upstream, "gpt-test", "up-a",
     )]);
     let mw = middleware(manager, MiddlewareConfig::default());
+    let mut input = chat_input("gpt-test", "hello");
+    input.aci_required = true;
 
-    let (status, _, body) = response_parts(
-        mw.handle_completion(&service_failing_verify(), chat_input("gpt-test", "hello"))
-            .await,
-    )
-    .await;
+    let (status, _, body) =
+        response_parts(mw.handle_completion(&service_failing_verify(), input).await).await;
 
     assert_eq!(status, 503);
     assert_eq!(body["error"]["type"], json!("service_unavailable"));
