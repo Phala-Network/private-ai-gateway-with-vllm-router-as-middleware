@@ -25,6 +25,8 @@ Start here:
 
 - [Router middleware design](docs/router-middleware.md) — the core design and
   routing algorithm.
+- [PAG / Router transparent forwarding plan](docs/pag-router-transparent-forwarding-plan.md)
+  — the current refactor plan and responsibility boundary.
 - [Configuration reference](docs/configuration-reference.md) — static config,
   dynamic upstreams, admin APIs, metrics, and route status.
 - [ACI spec](spec/aci.md) — the inherited proof-chain protocol.

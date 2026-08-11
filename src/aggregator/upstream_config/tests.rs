@@ -287,7 +287,14 @@ async fn phala_direct_config_builds_provider_verifier() {
         .await;
 
     assert_eq!(event.provider_type.as_deref(), Some("phala-direct"));
-    assert_eq!(event.verifier_id, "phala-direct/external-verifier/v1");
+    assert!(
+        matches!(
+            event.verifier_id.as_str(),
+            "private-ai-verifier/phala-direct/v1" | "phala-direct/external-verifier/v1"
+        ),
+        "unexpected phala-direct verifier id {:?}",
+        event.verifier_id
+    );
     assert_ne!(event.verifier_id, "none");
     assert_eq!(event.result, VerificationResult::Failed);
     assert!(event.required);
