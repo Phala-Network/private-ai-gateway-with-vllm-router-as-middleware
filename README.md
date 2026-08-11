@@ -17,9 +17,9 @@ Redpill / Client
 
 The downstream PAG owns the public client boundary, request normalization,
 billing-oriented JSON mutations, and user-facing E2EE termination if E2EE is
-enabled. This Router receives the already-normalized cleartext request bytes
-from that downstream PAG, reads them only for routing, and forwards those same
-bytes to the selected upstream.
+enabled. E2EE ends there. This Router receives the already-normalized cleartext
+request bytes from downstream PAG, reads them only for routing, and forwards
+those same bytes to the selected upstream.
 
 Start here:
 
@@ -65,11 +65,11 @@ config, a downstream PAG can verify these facts:
 
 - It is not the public client gateway in the Phala Router deployment. The
   public client boundary belongs to the downstream PAG.
-- It does not terminate, implement, require, or interpret user-facing E2EE. If
-  E2EE is used, it terminates at the downstream PAG before this Router is
-  called. Router middleware treats the downstream PAG's request body as the
-  already-cleartext routing input and never enters inherited E2EE compatibility
-  paths.
+- It does not terminate, implement, require, interpret, or compatibility-handle
+  user-facing E2EE. If E2EE is used, it terminates at downstream PAG before this
+  Router is called. Router middleware treats the downstream PAG's request body
+  as already-cleartext routing input and the middleware path must never enter
+  inherited E2EE handling.
 - It does not normalize, rewrite, rebuild, or reserialize request bodies in the
   middleware-selected path. Any JSON mutation must happen in downstream PAG.
 - It does not make an arbitrary upstream private. An upstream is acceptable only

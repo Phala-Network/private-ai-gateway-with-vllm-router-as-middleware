@@ -698,6 +698,9 @@ pub(super) async fn openai_completion_endpoint(
     }
 
     let middleware_mode = state.middleware.is_some();
+    // In Phala's router topology, client-facing E2EE terminates at downstream
+    // PAG before this Router is called. Middleware mode only sees cleartext
+    // bytes from that PAG and must not enter inherited E2EE request handling.
     let has_e2ee = !middleware_mode && has_e2ee_headers(&headers);
 
     // `supported_e2ee_versions` advertises ACI E2EE (§6). The inherited

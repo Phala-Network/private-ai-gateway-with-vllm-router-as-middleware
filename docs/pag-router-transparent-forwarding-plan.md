@@ -25,7 +25,10 @@ for successful middleware-selected forwards.
 
 ## Boundary Correction
 
-User-facing E2EE is not a Router middleware feature in this deployment.
+User-facing E2EE is not a Router middleware feature in this deployment. It ends
+at the downstream PAG. From this Router's perspective, E2EE is already over:
+the Router receives cleartext bytes from downstream PAG, builds a read-only
+routing view, and forwards those same bytes to the selected upstream.
 
 ```text
 Client / Redpill
@@ -43,9 +46,11 @@ Client / Redpill
   -> vLLM or SGLang
 ```
 
-Router middleware must not decrypt, encrypt, interpret, or compatibility-handle
-user-facing E2EE. Inherited PAG E2EE code may remain for non-middleware PAG
-paths, but the middleware-selected path must not enter it.
+Router middleware must not decrypt, encrypt, interpret, compatibility-handle, or
+document any client-facing E2EE behavior as its own feature. The only Router
+requirements related to E2EE are negative requirements: middleware mode must
+not enter inherited PAG E2EE handling, and client-facing E2EE headers must not
+leak to upstreams.
 
 ## Architecture
 
@@ -55,7 +60,7 @@ flowchart TD
 
   subgraph downstream["Downstream PAG"]
     ingress["Public ingress and auth"]
-    e2ee["User-facing E2EE boundary if enabled"]
+    e2ee["Downstream PAG E2EE boundary if enabled"]
     mutate["JSON normalization and usage injection"]
   end
 
@@ -74,7 +79,7 @@ flowchart TD
   client --> ingress
   ingress --> e2ee
   e2ee --> mutate
-  mutate -->|"normalized cleartext bytes"| view
+  mutate -->|"normalized cleartext bytes<br/>E2EE no longer in scope"| view
   aci -. "verified by downstream PAG" .-> downstream
   view --> choose
   choose --> forward
@@ -84,14 +89,15 @@ flowchart TD
 
 ## Implementation Rules
 
-1. Middleware mode must bypass inherited PAG user-facing E2EE request handling.
+1. Middleware mode must bypass inherited PAG user-facing E2EE request handling
+   because E2EE terminates at downstream PAG before this Router is called.
 2. Middleware may parse the body only into a temporary routing view.
 3. Middleware must not rewrite, rebuild, or reserialize the forwarded request
    body.
 4. Router-side model mapping must not trigger a body rewrite on
    middleware-selected forwards.
-5. Client-facing headers, user-facing E2EE headers, and untrusted tier headers
-   must not leak upstream.
+5. Client-facing auth headers, user-facing E2EE headers, and untrusted tier
+   headers must not leak upstream.
 6. Upstream authorization must come from upstream configuration, not from the
    downstream request.
 7. The selected upstream must pass required `phala-direct` verification before
@@ -128,7 +134,7 @@ Router keeps only these deployment-specific behaviors:
 Router does not own:
 
 - public client authentication policy;
-- user-facing E2EE;
+- user-facing E2EE or any E2EE compatibility behavior;
 - OpenAI request compatibility rewrites;
 - billing usage injection;
 - provider-specific model JSON cleanup;
@@ -137,7 +143,7 @@ Router does not own:
 ## Source Review Checklist
 
 - `src/http/app/handlers.rs` keeps middleware mode out of inherited E2EE
-  request handling.
+  request handling because downstream PAG already owns that boundary.
 - `src/middleware/completion.rs` forwards candidates with the received body
   bytes.
 - `src/aci/upstream/router.rs` skips model body rewrite for
