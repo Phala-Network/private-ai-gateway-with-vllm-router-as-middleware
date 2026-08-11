@@ -1110,6 +1110,10 @@ async fn raw_capture_chat_handler(
             br#"{"object":"list","data":[],"model":"up-a","usage":{"prompt_tokens":1,"total_tokens":1}}"#
                 .to_vec()
         }
+        "/v1/messages" => {
+            br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#
+                .to_vec()
+        }
         _ => br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[]}"#
             .to_vec(),
     };
@@ -1159,6 +1163,7 @@ async fn serve_raw_capture_openai_upstream() -> (String, CapturedRawRequest) {
         .route("/v1/completions", post(raw_capture_chat_handler))
         .route("/v1/responses", post(raw_capture_chat_handler))
         .route("/v1/embeddings", post(raw_capture_chat_handler))
+        .route("/v1/messages", post(raw_capture_chat_handler))
         .with_state(captured.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1475,6 +1480,68 @@ async fn middleware_http_embeddings_path_preserves_raw_request_body_bytes() {
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
         .expect("middleware embeddings receipt should be retained");
+    assert_middleware_passthrough_hashes(&receipt, &raw_body);
+    assert_eq!(
+        payload_event(&receipt, "route.selected")["target_route_id"],
+        serde_json::json!("raw-a:gpt-test")
+    );
+}
+
+#[tokio::test]
+async fn middleware_http_messages_path_preserves_raw_request_body_bytes() {
+    let (base, captured) = serve_raw_capture_openai_upstream().await;
+    let config = format!(
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","path":"/v1/messages","models":{{"gpt-test":"up-a"}},"bearer_token":"upstream-token"}}]"#
+    );
+    let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "model": "gpt-test",
+  "messages": [
+    { "role": "user", "content": "anthropic messages raw body" }
+  ],
+  "max_tokens": 64,
+  "metadata": { "z": 1, "a": ["kept", "ordered"] }
+}"#
+    .to_vec();
+
+    let resp = app
+        .oneshot(middleware_request_with_sensitive_headers(
+            "/v1/messages",
+            raw_body.clone(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-e2ee-applied").is_none());
+    assert!(resp.headers().get("x-e2ee-version").is_none());
+    assert!(resp.headers().get("x-e2ee-algo").is_none());
+    let receipt_id = resp
+        .headers()
+        .get("x-receipt-id")
+        .expect("middleware HTTP messages path must issue a receipt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = body_bytes(resp.into_body()).await;
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream should receive one messages request");
+    assert_eq!(
+        captured.path, "/v1/messages",
+        "configured messages upstream path must be used without request-body conversion"
+    );
+    assert_eq!(
+        captured.body, raw_body,
+        "messages middleware path must forward the exact request bytes"
+    );
+    assert_sensitive_downstream_headers_do_not_leak(&captured.headers);
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("middleware messages receipt should be retained");
     assert_middleware_passthrough_hashes(&receipt, &raw_body);
     assert_eq!(
         payload_event(&receipt, "route.selected")["target_route_id"],
