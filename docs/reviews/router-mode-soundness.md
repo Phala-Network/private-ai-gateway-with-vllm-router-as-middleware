@@ -239,13 +239,17 @@ missing.
    support). The gateway should treat router-mode as "trust this accepted
    router TEE version to verify model TEEs on our behalf", not as "the model
    TEE is directly verified by the gateway".
-2. **Plaintext crosses the trust boundary inside the router.** For both
-   providers the user's request body is decrypted at the router TLS
-   termination and re-encrypted under a different transport when forwarded
-   downstream. The router does observe and may serialize/inspect the
-   payload (tool-call rewriting, file conversion, auto-redact, billing token
-   extraction). Anything that escapes the attested process - DB writes,
-   telemetry, billing - is a privacy edge.
+2. **Plaintext crosses the trust boundary inside the reviewed provider
+   routers.** For the provider routers reviewed in this document, the user's
+   request body is decrypted at the router TLS termination and re-encrypted
+   under a different transport when forwarded downstream. The router observes
+   and may serialize/inspect the payload (tool-call rewriting, file conversion,
+   auto-redact, billing token extraction). Anything that escapes the attested
+   process - DB writes, telemetry, billing - is a privacy edge. This is not the
+   Phala Router middleware deployment boundary: in that chain user-facing E2EE,
+   if enabled, terminates at downstream PAG before this Router is called, and
+   Router middleware treats the PAG-supplied cleartext bytes as read-only
+   routing input.
 3. **No "selected backend" proof returned to the user.** Tinfoil returns
    `Tinfoil-Enclave: <host>` as a header (so the user can match it against
    `/.well-known/tinfoil-proxy`'s model entry - a one-step but provider-

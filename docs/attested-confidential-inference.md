@@ -217,6 +217,12 @@ ACI E2EE requests are decrypted inside the attested gateway. If middleware is
 enabled, middleware is part of the same deployment trust boundary and can see
 plaintext after gateway decryption.
 
+In the Phala Router deployment, this user-facing E2EE boundary belongs to the
+downstream PAG that calls the Router. Router middleware is not a second
+user-facing E2EE endpoint: it receives the already-normalized cleartext bytes
+from downstream PAG, reads them only for routing, and forwards those same bytes
+through the verified backend to the selected upstream.
+
 Upstream model providers are verified before the gateway forwards request bytes.
 The receipt records the upstream verification outcome in `upstream.verified`;
 the enforced channel binding is recorded on the cited session. Some upstreams
