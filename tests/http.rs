@@ -970,7 +970,7 @@ fn setup_with_config_inner(
 
 /// Records the query string and `Authorization` header the stub received.
 type CapturedRequest = Arc<Mutex<Option<(String, Option<String>)>>>;
-type CapturedBody = Arc<Mutex<Option<Vec<u8>>>>;
+type CapturedRawRequest = Arc<Mutex<Option<(Vec<u8>, std::collections::HashMap<String, String>)>>>;
 
 #[derive(Clone)]
 struct PhalaStubState {
@@ -1010,8 +1010,21 @@ async fn serve_phala_stub(nvidia_payload: Option<String>) -> (String, CapturedRe
     (format!("http://{addr}"), captured)
 }
 
-async fn raw_capture_chat_handler(State(captured): State<CapturedBody>, body: Bytes) -> Response {
-    *captured.lock().unwrap() = Some(body.to_vec());
+async fn raw_capture_chat_handler(
+    State(captured): State<CapturedRawRequest>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let captured_headers = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect();
+    *captured.lock().unwrap() = Some((body.to_vec(), captured_headers));
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -1023,7 +1036,7 @@ async fn raw_capture_chat_handler(State(captured): State<CapturedBody>, body: By
         .into_response()
 }
 
-async fn serve_raw_capture_openai_upstream() -> (String, CapturedBody) {
+async fn serve_raw_capture_openai_upstream() -> (String, CapturedRawRequest) {
     let captured = Arc::new(Mutex::new(None));
     let app = Router::new()
         .route("/v1/chat/completions", post(raw_capture_chat_handler))
@@ -1040,7 +1053,7 @@ async fn serve_raw_capture_openai_upstream() -> (String, CapturedBody) {
 async fn middleware_http_path_preserves_raw_request_body_bytes() {
     let (base, captured) = serve_raw_capture_openai_upstream().await;
     let config = format!(
-        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}}}}]"#
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}},"bearer_token":"upstream-token"}}]"#
     );
     let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
     let raw_body = br#"{
@@ -1061,7 +1074,13 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
                 .method("POST")
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
+                .header("authorization", "Bearer client-token-must-not-leak")
                 .header("x-e2ee-version", "2")
+                .header("x-e2ee-nonce", "client-nonce-must-not-leak")
+                .header("x-e2ee-timestamp", "1700000000")
+                .header("x-client-pub-key", "client-key-must-not-leak")
+                .header("x-model-pub-key", "model-key-must-not-leak")
+                .header("x-user-tier", "premium")
                 .body(Body::from(raw_body.clone()))
                 .unwrap(),
         )
@@ -1080,11 +1099,33 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
         .unwrap()
         .to_string();
     let _ = body_bytes(resp.into_body()).await;
+    let (forwarded_body, forwarded_headers) = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream should receive one request");
     assert_eq!(
-        captured.lock().unwrap().as_deref(),
-        Some(raw_body.as_slice()),
+        forwarded_body, raw_body,
         "HTTP handler plus middleware path must forward the exact request bytes"
     );
+    assert_eq!(
+        forwarded_headers.get("authorization").map(String::as_str),
+        Some("Bearer upstream-token"),
+        "upstream authorization must come from upstream config, not the client request"
+    );
+    for forbidden in [
+        "x-e2ee-version",
+        "x-e2ee-nonce",
+        "x-e2ee-timestamp",
+        "x-client-pub-key",
+        "x-model-pub-key",
+        "x-user-tier",
+    ] {
+        assert!(
+            !forwarded_headers.contains_key(forbidden),
+            "middleware path must not forward client-controlled {forbidden} header"
+        );
+    }
 
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
