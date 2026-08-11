@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{RawQuery, State},
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -970,7 +970,14 @@ fn setup_with_config_inner(
 
 /// Records the query string and `Authorization` header the stub received.
 type CapturedRequest = Arc<Mutex<Option<(String, Option<String>)>>>;
-type CapturedRawRequest = Arc<Mutex<Option<(Vec<u8>, std::collections::HashMap<String, String>)>>>;
+#[derive(Clone, Debug)]
+struct RawCapture {
+    path: String,
+    body: Vec<u8>,
+    headers: std::collections::HashMap<String, String>,
+}
+
+type CapturedRawRequest = Arc<Mutex<Option<RawCapture>>>;
 
 #[derive(Clone)]
 struct PhalaStubState {
@@ -1013,6 +1020,7 @@ async fn serve_phala_stub(nvidia_payload: Option<String>) -> (String, CapturedRe
 async fn raw_capture_chat_handler(
     State(captured): State<CapturedRawRequest>,
     headers: HeaderMap,
+    uri: Uri,
     body: Bytes,
 ) -> Response {
     let captured_headers = headers
@@ -1024,14 +1032,22 @@ async fn raw_capture_chat_handler(
                 .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
         })
         .collect();
-    *captured.lock().unwrap() = Some((body.to_vec(), captured_headers));
+    let path = uri.path().to_string();
+    *captured.lock().unwrap() = Some(RawCapture {
+        path: path.clone(),
+        body: body.to_vec(),
+        headers: captured_headers,
+    });
+    let response = if path == "/v1/completions" {
+        br#"{"id":"cmpl-http","object":"text_completion","model":"up-a","choices":[{"text":"ok","index":0,"finish_reason":"stop","logprobs":null}]}"#
+            .to_vec()
+    } else {
+        br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[]}"#.to_vec()
+    };
     (
         StatusCode::OK,
         [("content-type", "application/json")],
-        Body::from(
-            br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[]}"#
-                .to_vec(),
-        ),
+        Body::from(response),
     )
         .into_response()
 }
@@ -1040,6 +1056,7 @@ async fn serve_raw_capture_openai_upstream() -> (String, CapturedRawRequest) {
     let captured = Arc::new(Mutex::new(None));
     let app = Router::new()
         .route("/v1/chat/completions", post(raw_capture_chat_handler))
+        .route("/v1/completions", post(raw_capture_chat_handler))
         .with_state(captured.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1099,17 +1116,18 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
         .unwrap()
         .to_string();
     let _ = body_bytes(resp.into_body()).await;
-    let (forwarded_body, forwarded_headers) = captured
+    let captured = captured
         .lock()
         .unwrap()
         .clone()
         .expect("upstream should receive one request");
+    assert_eq!(captured.path, "/v1/chat/completions");
     assert_eq!(
-        forwarded_body, raw_body,
+        captured.body, raw_body,
         "HTTP handler plus middleware path must forward the exact request bytes"
     );
     assert_eq!(
-        forwarded_headers.get("authorization").map(String::as_str),
+        captured.headers.get("authorization").map(String::as_str),
         Some("Bearer upstream-token"),
         "upstream authorization must come from upstream config, not the client request"
     );
@@ -1122,7 +1140,7 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
         "x-user-tier",
     ] {
         assert!(
-            !forwarded_headers.contains_key(forbidden),
+            !captured.headers.contains_key(forbidden),
             "middleware path must not forward client-controlled {forbidden} header"
         );
     }
@@ -1130,6 +1148,84 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
         .expect("middleware HTTP receipt should be retained");
+    let expected = private_ai_gateway::aci::digest::sha256_hex(&raw_body);
+    assert_eq!(
+        payload_event(&receipt, "request.received")["body_hash"],
+        serde_json::json!(expected.clone())
+    );
+    assert_eq!(
+        payload_event(&receipt, "middleware.forwarded")["body_hash"],
+        serde_json::json!(expected.clone())
+    );
+    assert_eq!(
+        payload_event(&receipt, "request.forwarded")["body_hash"],
+        serde_json::json!(expected)
+    );
+    assert_eq!(
+        payload_event(&receipt, "route.selected")["target_route_id"],
+        serde_json::json!("raw-a:gpt-test")
+    );
+}
+
+#[tokio::test]
+async fn middleware_http_completions_path_preserves_raw_request_body_bytes() {
+    let (base, captured) = serve_raw_capture_openai_upstream().await;
+    let config = format!(
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}},"bearer_token":"upstream-token"}}]"#
+    );
+    let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "prompt": "legacy completions raw body",
+  "metadata": { "z": 1, "a": ["kept", "ordered"] },
+  "stream_options": { "continuous_usage_stats": true, "include_usage": true },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer client-token-must-not-leak")
+                .body(Body::from(raw_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let receipt_id = resp
+        .headers()
+        .get("x-receipt-id")
+        .expect("middleware HTTP completions path must issue a receipt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = body_bytes(resp.into_body()).await;
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream should receive one completions request");
+    assert_eq!(
+        captured.path, "/v1/completions",
+        "legacy completions surface must not be rerouted to chat completions"
+    );
+    assert_eq!(
+        captured.body, raw_body,
+        "legacy completions middleware path must forward the exact request bytes"
+    );
+    assert_eq!(
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer upstream-token"),
+        "upstream authorization must come from upstream config, not the client request"
+    );
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("middleware completions receipt should be retained");
     let expected = private_ai_gateway::aci::digest::sha256_hex(&raw_body);
     assert_eq!(
         payload_event(&receipt, "request.received")["body_hash"],
