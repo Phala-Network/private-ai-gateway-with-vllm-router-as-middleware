@@ -11,11 +11,12 @@ use async_trait::async_trait;
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{RawQuery, State},
-    http::{HeaderMap, Request, StatusCode, Uri},
+    http::{header::CONTENT_TYPE, HeaderMap, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures_util::stream;
 use private_ai_gateway::aci::keys::{verify_receipt_signature, KeyProvider};
 use private_ai_gateway::aci::receipt::{
     receipt_signing_input, ChannelBinding, SignedReceipt, UpstreamVerifiedEvent,
@@ -1072,13 +1073,8 @@ async fn serve_phala_stub(nvidia_payload: Option<String>) -> (String, CapturedRe
     (format!("http://{addr}"), captured)
 }
 
-async fn raw_capture_chat_handler(
-    State(captured): State<CapturedRawRequest>,
-    headers: HeaderMap,
-    uri: Uri,
-    body: Bytes,
-) -> Response {
-    let captured_headers = headers
+fn capture_raw_headers(headers: &HeaderMap) -> std::collections::HashMap<String, String> {
+    headers
         .iter()
         .filter_map(|(name, value)| {
             value
@@ -1086,12 +1082,20 @@ async fn raw_capture_chat_handler(
                 .ok()
                 .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
         })
-        .collect();
+        .collect()
+}
+
+async fn raw_capture_chat_handler(
+    State(captured): State<CapturedRawRequest>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     let path = uri.path().to_string();
     *captured.lock().unwrap() = Some(RawCapture {
         path: path.clone(),
         body: body.to_vec(),
-        headers: captured_headers,
+        headers: capture_raw_headers(&headers),
     });
     let response = match path.as_str() {
         "/v1/completions" => {
@@ -1117,6 +1121,37 @@ async fn raw_capture_chat_handler(
         .into_response()
 }
 
+async fn raw_capture_streaming_chat_handler(
+    State(captured): State<CapturedRawRequest>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    let path = uri.path().to_string();
+    *captured.lock().unwrap() = Some(RawCapture {
+        path,
+        body: body.to_vec(),
+        headers: capture_raw_headers(&headers),
+    });
+    let chunks = stream::iter([
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"id":"chat-stream-http","object":"chat.completion.chunk","model":"up-a","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+        )),
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n\n")),
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"id":"chat-stream-http","object":"chat.completion.chunk","model":"up-a","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )),
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n\n")),
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+    ]);
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(chunks),
+    )
+        .into_response()
+}
+
 async fn serve_raw_capture_openai_upstream() -> (String, CapturedRawRequest) {
     let captured = Arc::new(Mutex::new(None));
     let app = Router::new()
@@ -1124,6 +1159,22 @@ async fn serve_raw_capture_openai_upstream() -> (String, CapturedRawRequest) {
         .route("/v1/completions", post(raw_capture_chat_handler))
         .route("/v1/responses", post(raw_capture_chat_handler))
         .route("/v1/embeddings", post(raw_capture_chat_handler))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), captured)
+}
+
+async fn serve_raw_capture_streaming_openai_upstream() -> (String, CapturedRawRequest) {
+    let captured = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(raw_capture_streaming_chat_handler),
+        )
         .with_state(captured.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1187,6 +1238,70 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
         .expect("middleware HTTP receipt should be retained");
+    assert_middleware_passthrough_hashes(&receipt, &raw_body);
+    assert_eq!(
+        payload_event(&receipt, "route.selected")["target_route_id"],
+        serde_json::json!("raw-a:gpt-test")
+    );
+}
+
+#[tokio::test]
+async fn middleware_http_streaming_path_preserves_raw_request_body_bytes() {
+    let (base, captured) = serve_raw_capture_streaming_openai_upstream().await;
+    let config = format!(
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}},"bearer_token":"upstream-token"}}]"#
+    );
+    let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "stream": true,
+  "messages": [
+    { "role": "user", "content": "streaming raw body" }
+  ],
+  "stream_options": { "include_usage": true, "continuous_usage_stats": true },
+  "metadata": { "preserve": ["spacing", "order"] },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+
+    let resp = app
+        .oneshot(middleware_request_with_sensitive_headers(
+            "/v1/chat/completions",
+            raw_body.clone(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-e2ee-applied").is_none());
+    assert!(resp.headers().get("x-e2ee-version").is_none());
+    assert!(resp.headers().get("x-e2ee-algo").is_none());
+    let receipt_id = resp
+        .headers()
+        .get("x-receipt-id")
+        .expect("middleware streaming HTTP path must issue a receipt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = body_bytes(resp.into_body()).await;
+    assert!(
+        String::from_utf8_lossy(&body).contains("data: [DONE]"),
+        "streaming response body should be consumed before checking the receipt"
+    );
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream should receive one streaming request");
+    assert_eq!(captured.path, "/v1/chat/completions");
+    assert_eq!(
+        captured.body, raw_body,
+        "streaming HTTP middleware path must forward the exact request bytes"
+    );
+    assert_sensitive_downstream_headers_do_not_leak(&captured.headers);
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("middleware streaming HTTP receipt should be retained");
     assert_middleware_passthrough_hashes(&receipt, &raw_body);
     assert_eq!(
         payload_event(&receipt, "route.selected")["target_route_id"],
