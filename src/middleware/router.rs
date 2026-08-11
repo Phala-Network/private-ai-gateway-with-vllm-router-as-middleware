@@ -2001,8 +2001,8 @@ mod tests {
     }
 
     #[test]
-    fn middleware_metrics_poll_default_is_five_hundred_ms() {
-        assert_eq!(MiddlewareConfig::default().metrics_poll_ms, 500);
+    fn middleware_metrics_poll_default_is_one_second() {
+        assert_eq!(MiddlewareConfig::default().metrics_poll_ms, 1_000);
     }
 
     #[test]
