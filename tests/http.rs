@@ -171,6 +171,7 @@ fn middleware_request_with_sensitive_headers(uri: &str, raw_body: Vec<u8>) -> Re
         .uri(uri)
         .header("content-type", "application/json")
         .header("authorization", "Bearer client-token-must-not-leak")
+        .header("x-signing-algo", "ecdsa")
         .header("x-e2ee-version", "2")
         .header("x-e2ee-nonce", "client-nonce-must-not-leak")
         .header("x-e2ee-timestamp", "1700000000")
@@ -190,6 +191,7 @@ fn assert_sensitive_downstream_headers_do_not_leak(
         "upstream authorization must come from upstream config, not the client request"
     );
     for forbidden in [
+        "x-signing-algo",
         "x-e2ee-version",
         "x-e2ee-nonce",
         "x-e2ee-timestamp",
