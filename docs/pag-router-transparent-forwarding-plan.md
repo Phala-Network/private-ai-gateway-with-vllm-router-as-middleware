@@ -109,12 +109,16 @@ flowchart TD
 10. Cache affinity is only a routing optimization; it is not a proof claim and
     must remain behind the load and pressure guard.
 
-## PAG PR Scope
+## Downstream PAG Dependency
 
-The downstream PAG change should contain the JSON mutations that this Router
-must no longer perform, including streaming usage option injection for routed
-requests. That keeps body mutation at the public gateway layer where request
-normalization already belongs.
+Downstream PAG must perform any JSON mutations that this Router must not
+perform, including streaming usage option injection for routed requests. That
+keeps body mutation at the public gateway layer where request normalization
+already belongs.
+
+Implementation, review, and release of downstream PAG are outside this Router
+repository's scope. This repository only records the dependency because Router
+correctness depends on receiving already-normalized cleartext request bytes.
 
 Router source must stay transparent after that change: it can read the request
 for route selection, but the bytes passed to the verified backend must be the
