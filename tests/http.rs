@@ -164,6 +164,45 @@ fn assert_middleware_passthrough_hashes(receipt: &SignedReceipt, raw_body: &[u8]
     );
 }
 
+fn middleware_request_with_sensitive_headers(uri: &str, raw_body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer client-token-must-not-leak")
+        .header("x-e2ee-version", "2")
+        .header("x-e2ee-nonce", "client-nonce-must-not-leak")
+        .header("x-e2ee-timestamp", "1700000000")
+        .header("x-client-pub-key", "client-key-must-not-leak")
+        .header("x-model-pub-key", "model-key-must-not-leak")
+        .header("x-user-tier", "premium")
+        .body(Body::from(raw_body))
+        .unwrap()
+}
+
+fn assert_sensitive_downstream_headers_do_not_leak(
+    headers: &std::collections::HashMap<String, String>,
+) {
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some("Bearer upstream-token"),
+        "upstream authorization must come from upstream config, not the client request"
+    );
+    for forbidden in [
+        "x-e2ee-version",
+        "x-e2ee-nonce",
+        "x-e2ee-timestamp",
+        "x-client-pub-key",
+        "x-model-pub-key",
+        "x-user-tier",
+    ] {
+        assert!(
+            !headers.contains_key(forbidden),
+            "middleware path must not forward client-controlled {forbidden} header"
+        );
+    }
+}
+
 #[tokio::test]
 async fn health_endpoint_reports_ok() {
     let h = make_harness();
@@ -1114,21 +1153,10 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
     .to_vec();
 
     let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer client-token-must-not-leak")
-                .header("x-e2ee-version", "2")
-                .header("x-e2ee-nonce", "client-nonce-must-not-leak")
-                .header("x-e2ee-timestamp", "1700000000")
-                .header("x-client-pub-key", "client-key-must-not-leak")
-                .header("x-model-pub-key", "model-key-must-not-leak")
-                .header("x-user-tier", "premium")
-                .body(Body::from(raw_body.clone()))
-                .unwrap(),
-        )
+        .oneshot(middleware_request_with_sensitive_headers(
+            "/v1/chat/completions",
+            raw_body.clone(),
+        ))
         .await
         .unwrap();
 
@@ -1154,24 +1182,7 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
         captured.body, raw_body,
         "HTTP handler plus middleware path must forward the exact request bytes"
     );
-    assert_eq!(
-        captured.headers.get("authorization").map(String::as_str),
-        Some("Bearer upstream-token"),
-        "upstream authorization must come from upstream config, not the client request"
-    );
-    for forbidden in [
-        "x-e2ee-version",
-        "x-e2ee-nonce",
-        "x-e2ee-timestamp",
-        "x-client-pub-key",
-        "x-model-pub-key",
-        "x-user-tier",
-    ] {
-        assert!(
-            !captured.headers.contains_key(forbidden),
-            "middleware path must not forward client-controlled {forbidden} header"
-        );
-    }
+    assert_sensitive_downstream_headers_do_not_leak(&captured.headers);
 
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
@@ -1199,15 +1210,10 @@ async fn middleware_http_completions_path_preserves_raw_request_body_bytes() {
     .to_vec();
 
     let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer client-token-must-not-leak")
-                .body(Body::from(raw_body.clone()))
-                .unwrap(),
-        )
+        .oneshot(middleware_request_with_sensitive_headers(
+            "/v1/completions",
+            raw_body.clone(),
+        ))
         .await
         .unwrap();
 
@@ -1233,11 +1239,7 @@ async fn middleware_http_completions_path_preserves_raw_request_body_bytes() {
         captured.body, raw_body,
         "legacy completions middleware path must forward the exact request bytes"
     );
-    assert_eq!(
-        captured.headers.get("authorization").map(String::as_str),
-        Some("Bearer upstream-token"),
-        "upstream authorization must come from upstream config, not the client request"
-    );
+    assert_sensitive_downstream_headers_do_not_leak(&captured.headers);
 
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
@@ -1266,15 +1268,10 @@ async fn middleware_http_responses_path_preserves_raw_request_body_bytes() {
     .to_vec();
 
     let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer client-token-must-not-leak")
-                .body(Body::from(raw_body.clone()))
-                .unwrap(),
-        )
+        .oneshot(middleware_request_with_sensitive_headers(
+            "/v1/responses",
+            raw_body.clone(),
+        ))
         .await
         .unwrap();
 
@@ -1300,11 +1297,7 @@ async fn middleware_http_responses_path_preserves_raw_request_body_bytes() {
         captured.body, raw_body,
         "responses middleware path must forward the exact request bytes"
     );
-    assert_eq!(
-        captured.headers.get("authorization").map(String::as_str),
-        Some("Bearer upstream-token"),
-        "upstream authorization must come from upstream config, not the client request"
-    );
+    assert_sensitive_downstream_headers_do_not_leak(&captured.headers);
 
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
@@ -1333,15 +1326,10 @@ async fn middleware_http_embeddings_path_preserves_raw_request_body_bytes() {
     .to_vec();
 
     let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/embeddings")
-                .header("content-type", "application/json")
-                .header("authorization", "Bearer client-token-must-not-leak")
-                .body(Body::from(raw_body.clone()))
-                .unwrap(),
-        )
+        .oneshot(middleware_request_with_sensitive_headers(
+            "/v1/embeddings",
+            raw_body.clone(),
+        ))
         .await
         .unwrap();
 
@@ -1367,11 +1355,7 @@ async fn middleware_http_embeddings_path_preserves_raw_request_body_bytes() {
         captured.body, raw_body,
         "embeddings middleware path must forward the exact request bytes even when stream=true is forced buffered locally"
     );
-    assert_eq!(
-        captured.headers.get("authorization").map(String::as_str),
-        Some("Bearer upstream-token"),
-        "upstream authorization must come from upstream config, not the client request"
-    );
+    assert_sensitive_downstream_headers_do_not_leak(&captured.headers);
 
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
