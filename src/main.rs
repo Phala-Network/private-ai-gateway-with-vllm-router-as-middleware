@@ -81,9 +81,9 @@ struct GatewayConfigFile {
     /// no third party. Reported as `serving: "direct"`, and receipts then
     /// carry no `upstream.verified` event (§7.5).
     direct_serving: bool,
-    /// Advertise and terminate client-facing ACI E2EE (§6). Off until the
-    /// scheme's response-authentication revamp lands; a deployment with it
-    /// off is not spec-conformant for chat completions (§1.4(5)).
+    /// Inherited PAG client-facing ACI E2EE (§6) switch. Router middleware
+    /// deployments must keep this disabled because user-facing E2EE terminates
+    /// at downstream PAG before the Router is called.
     enable_e2ee: bool,
     dstack_endpoint: Option<String>,
     middleware: Option<MiddlewareConfig>,
@@ -108,7 +108,19 @@ fn load_gateway_config(path: &str) -> Result<GatewayConfigFile, String> {
         .map_err(|e| format!("failed to read gateway config {}: {e}", path.display()))?;
     let config: GatewayConfigFile = serde_json::from_str(&text)
         .map_err(|e| format!("failed to parse gateway config {}: {e}", path.display()))?;
+    validate_gateway_config(&config)?;
     Ok(config)
+}
+
+fn validate_gateway_config(config: &GatewayConfigFile) -> Result<(), String> {
+    if config.middleware.is_some() && config.enable_e2ee {
+        return Err(
+            "enable_e2ee must be false when router middleware is configured; \
+             user-facing E2EE terminates at downstream PAG"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn resolve_state_dir(config_state_dir: Option<&str>) -> Result<PathBuf, String> {
@@ -738,6 +750,26 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
             middleware.default_engine,
             Some(private_ai_gateway::middleware::types::Engine::Vllm)
         );
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn gateway_config_rejects_middleware_with_e2ee_enabled() {
+        let config_path = temp_path("gateway-config-middleware-e2ee");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "enable_e2ee": true,
+                "middleware": {
+                    "public_model": "gemma4-31b-it"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let err = load_gateway_config(config_path.to_str().unwrap()).unwrap_err();
+
+        assert!(err.contains("enable_e2ee must be false when router middleware is configured"));
         let _ = std::fs::remove_file(config_path);
     }
 

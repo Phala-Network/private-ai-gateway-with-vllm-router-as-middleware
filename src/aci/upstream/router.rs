@@ -87,9 +87,13 @@ impl ModelRoute {
 /// Model-id router for OpenAI-compatible request bodies.
 ///
 /// A route maps one public model id to one concrete upstream and one
-/// upstream-accepted model id. The rewrite happens in [`Self::prepare`],
-/// before upstream verification and receipt hashing, so the receipt
-/// covers the exact bytes sent to the selected upstream.
+/// upstream-accepted model id.
+///
+/// The no-middleware path preserves PAG's original model-alias behavior and
+/// rewrites the body model to the upstream id before verification/forwarding.
+/// The router-middleware path sets a concrete `target_route_id`; that path only
+/// selects and annotates the upstream route, and forwards the caller-provided
+/// bytes unchanged.
 pub struct ModelRouterBackend {
     name: String,
     routes: HashMap<String, ModelRoute>,
@@ -169,19 +173,20 @@ impl UpstreamBackend for ModelRouterBackend {
             Some(route_id) => self.route_for_id(route_id)?,
             None => self.route_for(&body_model_id)?,
         };
+        let middleware_selected_route = req.target_route_id.is_some();
         let mut request = req;
-        request.body = rewrite_request_model(&request.body, &route.upstream_model_id)?;
-        // The chat-shaped downstream surfaces (`/v1/chat/completions` and the
-        // Anthropic `/v1/messages`) are converted to the upstream's chat
-        // request format before they reach here, so both must target the
-        // upstream's chat path rather than the downstream surface path: a
-        // configured per-upstream path when set (e.g. native Anthropic
-        // upstreams use `/v1/messages`), otherwise the OpenAI-compatible
-        // `/v1/chat/completions`. The path is resolved explicitly (rather than
-        // deferred to the backend default) so the forwarded request is
-        // deterministic. Other surfaces (`/v1/completions`, `/v1/embeddings`,
-        // `/v1/responses`) keep the caller-supplied path so they route to the
-        // matching upstream path.
+        if !middleware_selected_route {
+            request.body = rewrite_request_model(&request.body, &route.upstream_model_id)?;
+        }
+        // Chat-shaped downstream surfaces (`/v1/chat/completions` and
+        // `/v1/messages`) use route metadata to choose the upstream POST path:
+        // a configured per-upstream path when set (for example a native
+        // Anthropic upstream), otherwise the OpenAI-compatible
+        // `/v1/chat/completions`. In middleware-selected routes this does not
+        // imply a request-body conversion; the body bytes are the bytes received
+        // from downstream PAG. Other surfaces (`/v1/completions`,
+        // `/v1/embeddings`, `/v1/responses`) keep the caller-supplied path so
+        // they route to the matching upstream path.
         let on_chat_surface = request
             .path
             .as_deref()
@@ -287,8 +292,9 @@ impl UpstreamBackend for ModelRouterBackend {
         model: &str,
     ) -> Result<serde_json::Value, UpstreamError> {
         let route = self.route_for(model)?;
-        // The backend resolves the chute by its own upstream model id, the same
-        // value the inference path forwards after rewriting the request model.
+        // Provider attestation resolves the chute by its own upstream model id.
+        // Middleware-selected inference requests may still forward the
+        // caller-provided request bytes unchanged.
         route
             .upstream
             .chutes_attestation_report(&route.upstream_model_id)
@@ -347,7 +353,12 @@ mod tests {
             )
             .unwrap();
 
-        let body = br#"{"model":"openai/gpt-oss-120b","messages":[]}"#.to_vec();
+        let body = br#"{
+  "messages": [],
+  "model": "openai/gpt-oss-120b",
+  "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+}"#
+        .to_vec();
         let default_prepared = router
             .prepare(UpstreamRequest {
                 body: body.clone(),
@@ -355,22 +366,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(default_prepared.upstream_name, "near-ai");
+        assert_eq!(default_prepared.model_id, "near-model");
+        assert_eq!(
+            default_prepared.route_id.as_deref(),
+            Some("near-ai:openai/gpt-oss-120b")
+        );
         assert_eq!(
             request_model_id(&default_prepared.request.body).as_deref(),
-            Some("near-model")
+            Some("near-model"),
+            "no-middleware default route preserves model alias rewrite"
         );
 
         let targeted_prepared = router
             .prepare(UpstreamRequest {
-                body,
+                body: body.clone(),
                 target_route_id: Some("secretai-107:openai/gpt-oss-120b".to_string()),
                 ..Default::default()
             })
             .unwrap();
         assert_eq!(targeted_prepared.upstream_name, "secretai-107");
+        assert_eq!(targeted_prepared.model_id, "secret-model");
+        assert_eq!(
+            targeted_prepared.route_id.as_deref(),
+            Some("secretai-107:openai/gpt-oss-120b")
+        );
+        assert_eq!(
+            targeted_prepared.request.body, body,
+            "middleware-selected route prepare must preserve body bytes"
+        );
         assert_eq!(
             request_model_id(&targeted_prepared.request.body).as_deref(),
-            Some("secret-model")
+            Some("openai/gpt-oss-120b")
         );
     }
 

@@ -2,7 +2,7 @@
 //!
 //! The router chooses ordered candidates. `AciService` still validates the
 //! route, verifies the upstream, enforces channel binding, forwards the request,
-//! and finalizes receipts/E2EE.
+//! and finalizes receipts.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,33 +20,31 @@ use serde_json::Value;
 
 use crate::aci::upstream::UpstreamError;
 use crate::aggregator::service::{
-    AciService, ChatCompletionRequest, E2eeRequestContext, E2eeResponseInfo, ForwardCandidate,
-    GatewayRequestContext, MiddlewareAttemptObserver, MiddlewareForwardResult,
-    MiddlewareReceiptJournal, ReceiptOwner, ServiceError, ServiceResponseStream,
+    AciService, ChatCompletionRequest, ForwardCandidate, GatewayRequestContext,
+    MiddlewareAttemptObserver, MiddlewareForwardResult, MiddlewareReceiptJournal, ReceiptOwner,
+    ServiceError, ServiceResponseStream,
 };
 
 use super::control::ControlClient;
 use super::errors::{self, Surface};
-use super::reasoning;
-use super::request_transform::{build_candidates, Endpoint};
 use super::router::RouteInFlight;
 use super::sse::{KeepAliveStream, MeterStream, StreamReport};
-use super::stream_transform::{SseTransformStream, StreamTransform};
-use super::types::{ProviderFormat, RouteCandidate};
+use super::stream_transform::SseTransformStream;
+use super::types::{Endpoint, ProviderFormat, RouteCandidate};
 use super::{response_transform, stream_transform};
 
-/// Everything the completion path needs, computed by the HTTP handler after E2EE
-/// termination and JSON normalization.
+/// Everything the completion path needs, computed by the HTTP handler after
+/// request validation. `params` is a read-only routing view; `received_body` is
+/// what the middleware-selected forwarding path sends upstream.
 pub struct CompletionInput {
     pub endpoint: Endpoint,
     pub endpoint_path: &'static str,
     pub surface: Surface,
-    /// Normalized request body used for routing + transforms.
+    /// Parsed request body used only for routing decisions.
     pub params: Value,
     /// Exact cleartext bytes the service observed (recorded into the receipt).
     pub received_body: Vec<u8>,
     pub requester: Option<ReceiptOwner>,
-    pub e2ee: Option<E2eeRequestContext>,
     pub aci_required: bool,
     pub aci_session_ids: Vec<String>,
     pub request_id: String,
@@ -74,7 +72,6 @@ pub(super) fn rate_limited_by_router(
         429,
         body,
         &headers,
-        input.e2ee.clone(),
     )
 }
 
@@ -201,6 +198,19 @@ fn log_failed_attempts(ctx: OutcomeCtx<'_>, attempts: &[(String, u16)], is_strea
     }
 }
 
+fn passthrough_forward_candidates(
+    received_body: &[u8],
+    candidates: &[RouteCandidate],
+) -> Vec<ForwardCandidate> {
+    candidates
+        .iter()
+        .map(|candidate| ForwardCandidate {
+            route_id: candidate.route_id.clone(),
+            body: received_body.to_vec(),
+        })
+        .collect()
+}
+
 pub(super) async fn run(
     service: &AciService,
     sse_keepalive_ms: Option<u64>,
@@ -218,7 +228,6 @@ pub(super) async fn run(
         params,
         received_body,
         requester,
-        e2ee,
         aci_required,
         aci_session_ids,
         request_id,
@@ -227,73 +236,26 @@ pub(super) async fn run(
         stream,
     } = input;
 
-    let (params, reasoning_requirements, exclude_reasoning) = if endpoint == Endpoint::ChatComplete
-    {
-        match reasoning::normalize_chat_request(&params) {
-            Ok(normalized) => normalized,
-            Err(err) => {
-                let model = params.get("model").and_then(Value::as_str).unwrap_or("");
-                let outcome_ctx = OutcomeCtx {
-                    request_id: &request_id,
-                    model,
-                    started,
-                };
-                let message = err.to_string();
-                log_generated_outcome(outcome_ctx, "request_validation", 400, 0, "", 0, &message);
-                let body = errors::envelope_bytes(
-                    surface,
-                    errors::error_type(surface, 400),
-                    &message,
-                    Some(&request_id),
-                );
-                return finalize_generated(surface, service, endpoint_path, 400, body, &[], e2ee);
-            }
-        }
-    } else {
-        (params, None, false)
-    };
-
     let model = params.get("model").and_then(Value::as_str);
     let outcome_ctx = OutcomeCtx {
         request_id: &request_id,
         model: model.unwrap_or(""),
         started,
     };
+    let identity = Arc::new(response_transform::ResponseIdentity {
+        request_id: request_id.clone(),
+        user_model: user_model.clone(),
+    });
     if candidates.is_empty() {
         // Not found, not malformed: model_not_found is an OpenAI-compatible
         // 404. Capacity exhaustion is handled earlier by the router wrapper.
         let message = format!("no route available for model {}", model.unwrap_or("(none)"));
         log_generated_outcome(outcome_ctx, "routing", 404, 0, "", 0, &message);
         let body = errors::envelope_bytes(surface, "model_not_found", &message, Some(&request_id));
-        return finalize_generated(surface, service, endpoint_path, 404, body, &[], e2ee);
+        return finalize_generated(surface, service, endpoint_path, 404, body, &[]);
     }
 
-    let shaped = match build_candidates(
-        &params,
-        endpoint,
-        &candidates,
-        reasoning_requirements.as_ref(),
-    ) {
-        Ok(shaped) => shaped,
-        Err(err) => {
-            let message = format!("failed to shape provider request: {err}");
-            log_generated_outcome(outcome_ctx, "shaping", 500, 0, "", 0, &message);
-            let body = errors::envelope_bytes(
-                surface,
-                errors::error_type(surface, 500),
-                &message,
-                Some(&request_id),
-            );
-            return finalize_generated(surface, service, endpoint_path, 500, body, &[], e2ee);
-        }
-    };
-    let forward_candidates: Vec<ForwardCandidate> = shaped
-        .into_iter()
-        .map(|(route_id, body)| ForwardCandidate {
-            route_id,
-            body: serde_json::to_vec(&body).unwrap_or_default(),
-        })
-        .collect();
+    let forward_candidates = passthrough_forward_candidates(&received_body, &candidates);
 
     let context = GatewayRequestContext {
         request_id: request_id.clone(),
@@ -314,7 +276,7 @@ pub(super) async fn run(
                 aci_session_ids,
                 upstream_verification_event: None,
                 requester: requester.clone(),
-                e2ee: e2ee.clone(),
+                e2ee: None,
             },
             forward_candidates,
             stream,
@@ -358,15 +320,7 @@ pub(super) async fn run(
                             message,
                             Some(&request_id),
                         );
-                        return finalize_generated(
-                            surface,
-                            service,
-                            endpoint_path,
-                            502,
-                            body,
-                            &[],
-                            e2ee,
-                        );
+                        return finalize_generated(surface, service, endpoint_path, 502, body, &[]);
                     }
                 };
                 let mut transformed = response_transform::transform_response(
@@ -374,9 +328,8 @@ pub(super) async fn run(
                     endpoint,
                     upstream_json,
                 );
-                if exclude_reasoning {
-                    response_transform::exclude_reasoning(&mut transformed);
-                }
+                response_transform::rewrite_identity(&mut transformed, &identity);
+                response_transform::canonicalize(&mut transformed, endpoint);
                 (
                     upstream_status,
                     serde_json::to_vec(&transformed).unwrap_or_default(),
@@ -409,15 +362,13 @@ pub(super) async fn run(
                 &final_body,
                 Some("application/json"),
                 requester,
-                e2ee,
+                None,
             ) {
                 Ok(finalized) => {
                     let status =
                         StatusCode::from_u16(client_status).unwrap_or(StatusCode::BAD_GATEWAY);
-                    let mut headers =
-                        response_headers(&forward.upstream_headers, "application/json");
+                    let mut headers = gateway_owned_headers("application/json");
                     insert_header(&mut headers, "x-receipt-id", &finalized.receipt.receipt_id);
-                    apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), true);
                     (status, headers, finalized.wire_body).into_response()
                 }
                 Err(err) => {
@@ -432,7 +383,7 @@ pub(super) async fn run(
                         forward.failed_attempts.len() as u32,
                         &detail,
                     );
-                    service_error_response(surface, endpoint_path, service, &request_id, err, None)
+                    service_error_response(surface, endpoint_path, service, &request_id, err)
                 }
             }
         }
@@ -443,8 +394,10 @@ pub(super) async fn run(
             let content_type = forward
                 .upstream_headers
                 .get("content-type")
-                .cloned()
-                .unwrap_or_else(|| "text/event-stream".to_string());
+                .map(|value| value.split(';').next().unwrap_or("").trim())
+                .filter(|base| !base.is_empty())
+                .unwrap_or("text/event-stream")
+                .to_string();
             let upstream_status = forward.upstream_status;
             let attempt_index = forward.failed_attempts.len() as u32;
             let selected_format = candidates
@@ -458,14 +411,11 @@ pub(super) async fn run(
                     Some(transform) => Box::pin(SseTransformStream::new(forward.body, transform)),
                     None => forward.body,
                 };
-            let visible: ServiceResponseStream = if exclude_reasoning {
-                Box::pin(SseTransformStream::new(
-                    transformed,
-                    StreamTransform::ExcludeReasoning,
-                ))
-            } else {
-                transformed
-            };
+            let visible: ServiceResponseStream = transformed;
+            let sanitized: ServiceResponseStream = Box::pin(SseTransformStream::new(
+                visible,
+                stream_transform::StreamTransform::SanitizeResponse(identity.clone(), endpoint),
+            ));
             let downstream_abort = Arc::new(AtomicBool::new(false));
             let meter_settled = Arc::new(AtomicBool::new(false));
             let stream_report = StreamReport {
@@ -485,7 +435,7 @@ pub(super) async fn run(
                 settled: meter_settled.clone(),
             };
             let metered: ServiceResponseStream = Box::pin(MeterStream::new(
-                visible,
+                sanitized,
                 stream_report,
                 crate::sse_protocol::sse_protocol(endpoint_path),
             ));
@@ -502,19 +452,15 @@ pub(super) async fn run(
                 endpoint_path,
                 Some(&content_type),
                 requester,
-                e2ee,
+                None,
                 Some(request_id.clone()),
             ) {
                 Ok(finalized) => {
                     let status =
                         StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
-                    let mut headers = response_headers(&forward.upstream_headers, &content_type);
-                    match &receipt_id {
-                        Some(receipt_id) => {
-                            insert_header(&mut headers, "x-receipt-id", receipt_id);
-                            apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), true);
-                        }
-                        None => apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), false),
+                    let mut headers = gateway_owned_headers(&content_type);
+                    if let Some(receipt_id) = &receipt_id {
+                        insert_header(&mut headers, "x-receipt-id", receipt_id);
                     }
                     headers.insert(
                         HeaderName::from_static("x-accel-buffering"),
@@ -577,7 +523,7 @@ pub(super) async fn run(
                         forward.failed_attempts.len() as u32,
                         &detail,
                     );
-                    service_error_response(surface, endpoint_path, service, &request_id, err, None)
+                    service_error_response(surface, endpoint_path, service, &request_id, err)
                 }
             }
         }
@@ -603,7 +549,7 @@ pub(super) async fn run(
                 forward.failed_attempts.len() as u32,
                 &detail,
             );
-            finalize_generated(surface, service, endpoint_path, status, body, &[], e2ee)
+            finalize_generated(surface, service, endpoint_path, status, body, &[])
         }
         Ok(MiddlewareForwardResult::AllFailed(forward)) => {
             log_failed_attempts(outcome_ctx, &forward.failed_attempts, stream);
@@ -618,20 +564,13 @@ pub(super) async fn run(
                 forward.failed_attempts.len() as u32,
                 &detail,
             );
-            service_error_response(
-                surface,
-                endpoint_path,
-                service,
-                &request_id,
-                forward.error,
-                e2ee,
-            )
+            service_error_response(surface, endpoint_path, service, &request_id, forward.error)
         }
         Err(err) => {
             let status = forward_error_status(&err);
             let detail = detail_snippet_text(&err.to_string());
             log_generated_outcome(outcome_ctx, "forward_error", status, 0, "", 0, &detail);
-            service_error_response(surface, endpoint_path, service, &request_id, err, e2ee)
+            service_error_response(surface, endpoint_path, service, &request_id, err)
         }
     }
 }
@@ -666,30 +605,24 @@ fn service_error_response(
     service: &AciService,
     request_id: &str,
     err: ServiceError,
-    e2ee: Option<E2eeRequestContext>,
 ) -> Response {
     let status = forward_error_status(&err);
-    let e2ee = match &err {
-        ServiceError::E2ee(_) => None,
-        _ => e2ee,
-    };
     let body = errors::envelope_bytes(
         surface,
         errors::error_type(surface, status),
         &err.to_string(),
         Some(request_id),
     );
-    finalize_generated(surface, service, endpoint_path, status, body, &[], e2ee)
+    finalize_generated(surface, service, endpoint_path, status, body, &[])
 }
 
 fn finalize_generated(
-    surface: Surface,
-    service: &AciService,
-    endpoint_path: &str,
+    _surface: Surface,
+    _service: &AciService,
+    _endpoint_path: &str,
     status: u16,
     body: Vec<u8>,
     extra_headers: &[(&'static str, String)],
-    e2ee: Option<E2eeRequestContext>,
 ) -> Response {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
@@ -697,103 +630,15 @@ fn finalize_generated(
     for (name, value) in extra_headers {
         insert_header(&mut headers, name, value);
     }
-    if e2ee.is_none() {
-        return (status_code, headers, body).into_response();
-    }
-    match service.finalize_middleware_generated_response(
-        endpoint_path,
-        &body,
-        Some("application/json"),
-        e2ee,
-    ) {
-        Ok(finalized) => {
-            apply_e2ee_headers(&mut headers, finalized.e2ee.as_ref(), false);
-            (status_code, headers, finalized.wire_body).into_response()
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "E2EE generated-response finalization failed");
-            errors::error_response(
-                surface,
-                500,
-                errors::error_type(surface, 500),
-                "response finalization failed",
-                None,
-            )
-        }
-    }
+    (status_code, headers, body).into_response()
 }
 
-fn response_headers(
-    upstream_headers: &std::collections::HashMap<String, String>,
-    content_type: &str,
-) -> HeaderMap {
+fn gateway_owned_headers(content_type: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    for (name, value) in upstream_headers {
-        if is_gateway_owned(name)
-            || is_hop_by_hop(name)
-            || name.eq_ignore_ascii_case("content-type")
-            || name.eq_ignore_ascii_case("content-encoding")
-        {
-            continue;
-        }
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
     if let Ok(value) = HeaderValue::from_str(content_type) {
         headers.insert(CONTENT_TYPE, value);
     }
     headers
-}
-
-fn is_gateway_owned(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower == "x-receipt-id"
-        || lower.starts_with("x-e2ee-")
-        || lower.starts_with("x-aci-")
-        || lower.starts_with("x-private-ai-gateway-")
-}
-
-fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "content-length"
-    )
-}
-
-fn apply_e2ee_headers(
-    headers: &mut HeaderMap,
-    e2ee: Option<&E2eeResponseInfo>,
-    include_plain_false: bool,
-) {
-    match e2ee {
-        Some(info) => {
-            headers.insert(
-                HeaderName::from_static("x-e2ee-applied"),
-                HeaderValue::from_static("true"),
-            );
-            insert_header(headers, "x-e2ee-version", &info.version);
-            insert_header(headers, "x-e2ee-algo", &info.algo);
-        }
-        None if include_plain_false => {
-            headers.insert(
-                HeaderName::from_static("x-e2ee-applied"),
-                HeaderValue::from_static("false"),
-            );
-        }
-        None => {}
-    }
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
@@ -802,5 +647,39 @@ fn insert_header(headers: &mut HeaderMap, name: &str, value: &str) {
         HeaderValue::from_str(value),
     ) {
         headers.insert(name, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::middleware::types::Engine;
+
+    #[test]
+    fn passthrough_candidates_preserve_received_body_bytes() {
+        let received = br#"{
+  "model": "gemma4-31b-it",
+  "messages": [{"role": "user", "content": "hi"}],
+  "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+}"#;
+        let candidates = vec![
+            RouteCandidate {
+                route_id: "use2-a:gemma4-31b-it".to_string(),
+                format: ProviderFormat::Openai,
+                engine: Some(Engine::Vllm),
+            },
+            RouteCandidate {
+                route_id: "use2-b:gemma4-31b-it".to_string(),
+                format: ProviderFormat::Openai,
+                engine: Some(Engine::Sglang),
+            },
+        ];
+
+        let forward = passthrough_forward_candidates(received, &candidates);
+
+        assert_eq!(forward.len(), candidates.len());
+        assert_eq!(forward[0].route_id, "use2-a:gemma4-31b-it");
+        assert_eq!(forward[1].route_id, "use2-b:gemma4-31b-it");
+        assert!(forward.iter().all(|candidate| candidate.body == received));
     }
 }

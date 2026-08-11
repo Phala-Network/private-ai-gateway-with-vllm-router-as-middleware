@@ -46,17 +46,22 @@ This is the smallest practical container config.
 | `api_token` | unset | Optional bearer token for public inference, model catalog, metrics, and `/v1/upstream-status`. When unset, those routes are publicly reachable. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `direct_serving` | `false` | Set only when inference is served inside this same attested workload with no upstream hop. It is mutually exclusive with middleware mode. |
-| `enable_e2ee` | `false` | Advertise and terminate ACI E2EE. The legacy dstack-vllm-proxy E2EE compatibility path remains available separately. |
+| `enable_e2ee` | `false` | Inherited PAG field. Router middleware deployments do not use it because user-facing E2EE, if enabled, terminates at downstream PAG before this Router is called. |
 | `middleware` | unset | Optional single-model router middleware. When present, the gateway orders configured upstream candidates locally, then forwards through the verified backend. See [Middleware](#middleware). |
+
+When `middleware` is configured, Router does not evaluate user-facing E2EE
+headers or enter inherited E2EE request handling. The Router deployment expects
+downstream PAG to send already-normalized cleartext bytes.
 
 ## Middleware
 
 The optional `middleware` section runs middleware in the request path. The
 middleware is inside the gateway process, after frontend normalization and
-before the verified backend forward. It may choose routes or transform request
-and response payloads, but upstream verification, channel binding, forwarding,
-and receipt finalization remain backend responsibilities. When the section is
-omitted the gateway serves directly.
+before the verified backend forward. Router middleware may choose routes and
+read parsed request JSON for cache-aware ordering, but it forwards the exact
+cleartext request bytes it received. Upstream verification, channel binding,
+forwarding, and receipt finalization remain backend responsibilities. When the
+section is omitted the gateway serves directly.
 
 This fork supports one middleware shape: a single public model routed across
 multiple configured upstreams with cache-aware and PIG-aware load ordering. The
@@ -83,7 +88,7 @@ security boundary.
 | `middleware.metrics_stale_ms` | `3000` | Age after which a metrics sample is ignored and the route falls back to local in-flight state. |
 | `middleware.metrics_path` | `/v1/metrics` | Metrics path appended to each upstream base URL. The upstream's configured bearer token is used for metrics auth. |
 | `middleware.trusted_user_tier_header` | `false` | Whether inbound `x-user-tier` is trusted for routing and forwarding to PIG. Keep `false` for public endpoints unless a trusted front door strips or sets this header. With the default, all requests are routed as `basic` and no caller-supplied tier header is forwarded. |
-| `middleware.default_engine` | unset | Optional engine hint put into synthetic route candidates, for example `vllm` or `sglang`. |
+| `middleware.default_engine` | unset | Deprecated compatibility field. Transparent router middleware accepts it in existing configs but does not use it to shape request bodies. |
 | `middleware.control_url` | unset | Optional control-plane URL for best-effort post-request usage reports only. Routing and catalog handling stay local. |
 | `middleware.control_token` | unset | Bearer token sent to the optional control-plane usage-report endpoint. |
 | `middleware.control_post_timeout_ms` | `10000` | Timeout for the fire-and-forget post-request usage report. |
@@ -101,7 +106,6 @@ Silence or re-route the target via `RUST_LOG` (the subscriber uses `EnvFilter`).
 {
   "middleware": {
     "public_model": "gemma4-31b-it",
-    "default_engine": "vllm",
     "metrics_path": "/v1/metrics",
     "trusted_user_tier_header": true,
     "control_url": "https://control.example"
@@ -110,7 +114,7 @@ Silence or re-route the target via `RUST_LOG` (the subscriber uses `EnvFilter`).
 ```
 
 No middleware field is strictly required, but production deployments normally
-set `public_model`, `default_engine`, and `trusted_user_tier_header` explicitly.
+set `public_model` and `trusted_user_tier_header` explicitly.
 
 ## Source Provenance
 
@@ -232,7 +236,10 @@ origin must meet the componentwise AMD TCB minimum embedded in the verifier.
 For `aci-service`, `base_url` is the HTTPS origin used for both model traffic and
 `/v1/aci/attestation`. The router fetches the report through normal TLS,
 derives the attested TLS SPKI binding from that report, then pins that SPKI for
-the actual upstream model request.
+the actual upstream request. In router-middleware deployments, request body
+model rewriting must happen before the request reaches this router; the router's
+upstream config supplies route and verification metadata, not a data-plane body
+transform.
 
 ## Environment Variables
 

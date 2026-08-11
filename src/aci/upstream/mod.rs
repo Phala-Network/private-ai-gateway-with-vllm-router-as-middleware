@@ -109,10 +109,11 @@ pub trait UpstreamBackend: Send + Sync {
     /// Origin (scheme + host + port) recorded in receipts.
     fn url_origin(&self) -> Option<&str>;
 
-    /// Prepare an upstream request before verification and receipt
-    /// hashing. Routers use this phase to select the concrete upstream
-    /// and rewrite request bytes such as model aliases. Plain backends
-    /// leave the request untouched.
+    /// Prepare an upstream request before verification and receipt hashing.
+    /// Routers use this phase to select the concrete upstream, attach route
+    /// metadata, and in no-middleware mode preserve the existing model-alias
+    /// rewrite behavior. Middleware-selected requests carry an explicit target
+    /// route and keep their caller-provided body bytes unchanged.
     fn prepare(&self, req: UpstreamRequest) -> Result<PreparedUpstreamRequest, UpstreamError> {
         let model_id = request_model_id(&req.body).unwrap_or_default();
         Ok(PreparedUpstreamRequest {
@@ -128,8 +129,8 @@ pub trait UpstreamBackend: Send + Sync {
     /// Forward `req` to the upstream and return the response.
     async fn forward(&self, req: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError>;
 
-    /// Forward a request after [`Self::prepare`] has selected and
-    /// normalized the upstream request bytes.
+    /// Forward a request after [`Self::prepare`] has selected the upstream and
+    /// attached route metadata.
     async fn forward_prepared(
         &self,
         req: PreparedUpstreamRequest,
@@ -179,8 +180,8 @@ pub trait UpstreamBackend: Send + Sync {
         })
     }
 
-    /// Stream a request after [`Self::prepare`] has selected and
-    /// normalized the upstream request bytes.
+    /// Stream a request after [`Self::prepare`] has selected the upstream and
+    /// attached route metadata.
     async fn forward_stream_prepared(
         &self,
         req: PreparedUpstreamRequest,

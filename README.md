@@ -1,64 +1,81 @@
-# Private AI Gateway
+# Private AI Gateway With vLLM Router Middleware
 
-Private AI Gateway is an OpenAI-compatible gateway for **Attested Confidential
-Inference (ACI)**. It publishes dstack workload attestation for the gateway,
-verifies configured private-inference upstreams before forwarding prompts, and
-signs per-request receipts.
+This repository is Phala's Router-focused fork of Private AI Gateway. It keeps
+the ACI proof-chain machinery from PAG and adds an in-process cache-aware,
+load-aware, and tier-aware router for one public model backed by many
+PIG-fronted vLLM or SGLang nodes.
 
-A relying party evaluates three artifacts before accepting a response: the
-gateway attestation report, the provider verification event for the selected
-route, and the signed receipt that binds the response to the gateway identity.
+The intended production chain is:
 
-This repository is the reference implementation of the
-[ACI Spec](spec/aci.md) (earlier draft discussion in
-[`Dstack-TEE/dstack#694`](https://github.com/Dstack-TEE/dstack/pull/694)). It is
-also the workload that
-[`git-launcher`](https://github.com/Dstack-TEE/dstack-examples/tree/main/git-launcher)
-can fetch, build, and run inside a dstack v2 application VM.
+```text
+Redpill / Client
+  -> downstream Private AI Gateway
+  -> this Router
+  -> selected PIG
+  -> vLLM or SGLang
+```
+
+The downstream PAG owns the public client boundary, request normalization,
+billing-oriented JSON mutations, and user-facing E2EE termination if E2EE is
+enabled. This Router receives the already-normalized cleartext request bytes
+from that downstream PAG, reads them only for routing, and forwards those same
+bytes to the selected upstream.
 
 Start here:
 
-- [ACI quickstart](docs/quickstart.md) — verify a live deployment with the
-  `aci` CLI, then use it as a local OpenAI-compatible endpoint.
-- [ACI spec](spec/aci.md) — the protocol: trust model, artifacts, checks.
+- [Router middleware design](docs/router-middleware.md) — the core design and
+  routing algorithm.
+- [Configuration reference](docs/configuration-reference.md) — static config,
+  dynamic upstreams, admin APIs, metrics, and route status.
+- [ACI spec](spec/aci.md) — the inherited proof-chain protocol.
 
 ## Audience
 
-- Security auditors should start with the claim, limits, request flow, and
-  auditor checklist.
-- New users and agent developers should start with the short mental model and
-  local smoke path before reading provider-specific details.
+- Security reviewers should start with the claim, request flow, and auditor
+  checklist below, then inspect `docs/router-middleware.md`.
+- Operators should start with dynamic upstream management and the router admin
+  snapshot in `docs/configuration-reference.md`.
+- PAG users who need public client ingress should use upstream PAG as the
+  downstream gateway and configure this Router as an `aci-service` upstream.
 
 ## Security Claim
 
-When the gateway is correctly deployed in dstack with reviewed code, reviewed
-runtime config, and supported provider adapters, a relying party can verify
-these facts:
+When this Router is correctly deployed in dstack with reviewed code and runtime
+config, a downstream PAG can verify these facts:
 
-1. **Gateway identity**: the gateway is a specific workload running in a genuine
-   TEE, with reported source provenance and a stable workload keyset.
-2. **Client channel binding**: the user-facing TLS SPKI, when configured, or
-   E2EE public keys are published in the attested keyset, so a client can bind
-   an API session to the verified workload identity.
-3. **Upstream verification**: before a prompt is forwarded, the backend verifies
-   the selected upstream provider and gets an enforceable channel binding, such
-   as a TLS SPKI or provider E2EE key.
-4. **Fail-closed forwarding**: if verification is required and the gateway
-   cannot verify the upstream or enforce the verified binding, it does not send
-   the prompt.
-5. **Per-request evidence**: every provider-backed inference response carries
-   `x-receipt-id`. The signed receipt records the user-visible request hash, the
-   selected provider route, upstream verification, provider-facing request hash,
-   and response hash.
+1. **Router identity**: the Router is a specific workload running in a genuine
+   TEE, exposed to the downstream PAG as an ACI service.
+2. **Transparent forwarding**: the request body forwarded by the middleware
+   selected path is byte-for-byte equal to the body received from downstream
+   PAG.
+3. **Upstream verification**: before a prompt is forwarded, the selected
+   PIG-fronted model node is verified through the native `phala-direct`
+   provider verifier.
+4. **Fail-closed forwarding**: if upstream verification is required and no
+   verified channel binding can be enforced, the Router does not send the
+   prompt.
+5. **Per-request evidence**: every successful routed response carries
+   `x-receipt-id`. The signed receipt records the received request hash,
+   route selection, upstream verification, forwarded request hash, and response
+   hash.
 
 ### Limits
 
-- It does not make an arbitrary upstream provider private. A provider is only
-  acceptable when its adapter can verify a provider-specific identity and
-  enforce the request channel binding.
-- It does not hide plaintext from gateway middleware. Middleware is optional,
-  but if enabled it sees plaintext after downstream E2EE termination and must be
-  part of the same attested deployment and audit boundary.
+- It is not the public client gateway in the Phala Router deployment. The
+  public client boundary belongs to the downstream PAG.
+- It does not terminate, implement, require, or interpret user-facing E2EE. If
+  E2EE is used, it terminates at the downstream PAG before this Router is
+  called. Router middleware treats the downstream PAG's request body as the
+  already-cleartext routing input and never enters inherited E2EE compatibility
+  paths.
+- It does not normalize, rewrite, rebuild, or reserialize request bodies in the
+  middleware-selected path. Any JSON mutation must happen in downstream PAG.
+- It does not make an arbitrary upstream private. An upstream is acceptable only
+  when its configured provider verifier can prove and enforce the requested
+  channel binding.
+- It does see the cleartext request bytes supplied by downstream PAG for
+  routing. Therefore the Router source and runtime config remain part of the
+  attested deployment and audit boundary.
 - It does not provide durable public transparency yet. Receipts are currently
   kept in memory with a configurable TTL; public transparency log integration is
   not implemented.
@@ -71,34 +88,40 @@ these facts:
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 40, "rankSpacing": 70}}}%%
 flowchart LR
-  user["User<br/>OpenAI SDK"]
-  upstream["Upstream<br/>providers"]
+  client["Redpill / Client"]
+  downstream["Downstream PAG<br/>public ingress, auth, JSON normalization<br/>E2EE terminates here if enabled"]
 
-  subgraph gateway["Private AI Gateway"]
-    frontend["Frontend"]
-    middleware["Optional<br/>middleware"]
-    backend["Backend"]
+  subgraph router["This Router<br/>ACI service to downstream PAG"]
+    middleware["Router middleware<br/>read-only body view"]
+    backend["PAG verified backend<br/>phala-direct upstream verifier"]
 
-    frontend -->|"in-process"| middleware
-    middleware -->|"target"| backend
-    frontend -->|"direct"| backend
+    middleware -->|"ordered candidates"| backend
   end
 
-  user <-->|"attested session"| frontend
-  backend <-->|"attested session"| upstream
+  pig["Selected PIG"]
+  engine["vLLM / SGLang"]
+
+  client --> downstream
+  downstream -->|"ACI-service verified request"| middleware
+  backend -->|"phala-direct verified request"| pig
+  pig --> engine
 ```
 
-1. The user verifies `GET /v1/aci/attestation?nonce=<fresh nonce>` and accepts
-   the gateway workload keyset.
-2. The user sends an OpenAI-compatible request over ordinary TLS or ACI E2EE.
-3. The frontend records the user-facing request and downstream E2EE state.
-4. Optional middleware may handle auth, billing, routing, cache-aware logic, or
-   rewrites. Middleware does not create verification facts.
-5. The backend validates the target route, verifies or refreshes the upstream
-   lease, enforces the verified channel binding, and forwards the provider
-   request.
-6. The response returns through the same path. The frontend signs the receipt
-   after it has observed the final user-visible response.
+1. The downstream PAG verifies this Router with
+   `GET /v1/aci/attestation?nonce=<fresh nonce>` and treats it as an
+   `aci-service` upstream.
+2. The downstream PAG sends an already-normalized OpenAI-compatible request to
+   this Router.
+3. Router middleware parses a read-only JSON view to extract the model, routing
+   prefix, user tier, and cache/load signals.
+4. Router middleware orders candidate upstreams without modifying the received
+   body bytes.
+5. The PAG verified backend validates the selected route, verifies or refreshes
+   the upstream `phala-direct` lease, enforces the verified channel binding, and
+   forwards the original request bytes.
+6. The response returns through the same path. The Router signs its own receipt;
+   the downstream PAG remains responsible for its outer receipt and any
+   user-facing policy.
 
 ## Auditor Checklist
 
@@ -106,15 +129,15 @@ Use this checklist before treating a deployment as private inference.
 
 | Check | Evidence |
 | --- | --- |
-| Gateway identity is real | `GET /v1/aci/attestation?nonce=<fresh nonce>` proves the TEE quote and the attested keyset digest bound into it. For dstack, verify `evidence.app_compose` against the RTMR3-bound `compose-hash`; pin the hashes you accept with `aci verify --accept-compose`. Image and source-code acceptance remain verifier-policy TODOs. |
-| Keys are bound to the workload | The keyset in the report lists receipt-signing, E2EE, and optional TLS SPKI keys. The quote binds the digest of the keyset itself; there is no separate identity key or endorsement. |
-| Client session is bound | For direct TLS, verify the server certificate SPKI matches the attested keyset. For ACI E2EE, verify the E2EE public key from the keyset. |
-| Upstream is verified | Receipt event `upstream.verified` must be `verified` for the provider and canonical model id. |
+| Router identity is real | Downstream PAG verifies `GET /v1/aci/attestation?nonce=<fresh nonce>` and treats this service as an `aci-service`. For dstack, verify `evidence.app_compose` against the RTMR3-bound `compose-hash`; pin the hashes you accept with `aci verify --accept-compose`. |
+| User-facing E2EE is not duplicated | Downstream PAG owns client E2EE if enabled. This Router should receive cleartext request bytes from downstream PAG and must not add a second user-facing E2EE data-plane step. |
+| Request body is transparent | Router receipt events for successful middleware-selected forwards should show `request.received.body_hash == middleware.forwarded.body_hash == request.forwarded.body_hash`. |
+| Upstream is verified | Router receipt event `upstream.verified` must be `verified` for `provider=phala-direct` and the selected route. |
 | Channel binding is enforceable | The upstream verification event must include a binding the backend can enforce on the actual request path. |
 | Upstream session is auditable | `upstream.verified.session_id`, when present, points to `GET /v1/aci/sessions/{session_id}`. The id is the SHA-256 of the exact served session document bytes, so the fetched record is provably the one the receipt cited. |
-| Middleware is in boundary | If middleware is enabled, audit its source/config and confirm it runs inside the same attested deployment. |
+| Middleware is in boundary | Audit middleware source/config and confirm it runs inside the same attested Router deployment. |
 | Response is bound | Verify the receipt signature under the attested receipt key and compare the response hash in `response.returned`. |
-| Provider is admissible | Review the provider's `docs/providers/<provider>/review.md` against `docs/providers/audit-criteria.md`. |
+| Provider is admissible | Phala model nodes should use `provider=phala-direct`. Other inherited PAG providers are not part of this Router deployment goal unless separately reviewed. |
 
 Provider verification and transport binding are backend responsibilities.
 Middleware and user-controlled headers can select routes, but they do not create
@@ -122,8 +145,8 @@ verification facts.
 
 ## What New Users Should Know
 
-You can talk to the gateway with normal OpenAI-compatible clients. The
-additional ACI artifacts are:
+The downstream PAG talks to this Router with normal OpenAI-compatible requests.
+Operationally useful Router artifacts are:
 
 - `GET /v1/aci/attestation?nonce=<n>`: proves which gateway workload you are
   talking to.
@@ -131,20 +154,18 @@ additional ACI artifacts are:
 - `GET /v1/aci/receipts/{id}`: fetches the signed receipt by chat id or receipt id.
 - `GET /v1/aci/sessions/{session_id}`: fetches an attested-session audit
   record referenced by a receipt.
-- Optional ACI E2EE headers: seal the whole request and response bodies to an
-  attested key when the client wants application-level encryption in addition
-  to TLS.
+- `GET /v1/admin/router`: authenticated router snapshot with per-route state.
+- `GET /v1/admin/upstreams`: authenticated dynamic upstream config snapshot.
+- `GET /v1/upstream-status`: coarse route capacity signal for downstream
+  gateways.
 
 Useful terms:
 
 - **TEE**: trusted execution environment. In this project, the gateway relies on
   dstack/TDX evidence to prove where the workload is running.
-- **E2EE**: end-to-end encryption of whole request and response bodies between
-  a client and the verified gateway workload, used when TLS alone is not
-  enough for the client.
-- **Workload keyset**: the attested document listing the gateway's
-  receipt-signing, E2EE, and TLS keys. The TEE quote binds its digest, making
-  the keyset the unit of workload identity.
+- **Workload keyset**: the attested document listing the gateway's workload
+  keys. The TEE quote binds its digest, making the keyset the unit of workload
+  identity.
 - **dstack KMS**: the dstack key-release service used by this implementation to
   obtain stable workload keys inside an approved TEE workload.
 - **TDX quote / DCAP**: Intel TDX attestation evidence and the verification
@@ -176,17 +197,17 @@ gateway enforces only the generic verifier result and channel binding.
 
 ## Project Status
 
-`0.1.0` is a developer preview. The request path is implemented, but production
-release still depends on provider strict-release review, durable operational
-storage decisions, and production compose wiring for a concrete middleware
-container.
+`0.1.0` is a developer preview. The Router middleware path is implemented, but
+production release still depends on source tests, image publication from pushed
+source, remote proof-chain simulation, and the target deployment's reviewed
+runtime config.
 
 | Area | Status |
 | --- | --- |
 | Workload keyset, quote-bound keyset digest, attestation report | Implemented |
 | Signed receipts | Implemented |
-| Chat/completions, streaming, embeddings, `/v1/models` | Implemented; embeddings are buffered |
-| Downstream ACI E2EE and legacy vLLM E2EE | Implemented for chat/completions/embeddings; streaming E2EE for chat/completions |
+| Chat/completions, streaming, embeddings, `/v1/models` | Implemented; Router middleware focuses on chat/completions and completions routing. |
+| User-facing E2EE | Out of scope for this Router deployment; downstream PAG owns it if enabled. |
 | Runtime upstream config file and admin API | Implemented |
 | Gateway-owned Prometheus metrics | Implemented |
 | Provider adapters | Implemented for Tinfoil, NEAR AI, Chutes, SecretAI, PhalaDirect, ACI service, and generic OpenAI-compatible upstreams |
@@ -195,9 +216,10 @@ container.
 | Receipt store | In-memory; receipt TTL is configurable. The gateway never stores request bodies (receipts hold hashes, not content). |
 | Public transparency log | Not implemented |
 
-The binary has no ephemeral-key or stub-quote startup mode. It loads
-receipt-signing and E2EE keys from dstack KMS through the Rust `dstack-sdk`,
-and it uses the same SDK for TDX quotes.
+The binary has no ephemeral-key or stub-quote startup mode. It loads workload
+keys from dstack KMS through the Rust `dstack-sdk`, and it uses the same SDK for
+TDX quotes. User-facing E2EE belongs to downstream PAG, outside the Router
+middleware data path.
 
 ## Quick Start For New Users
 
@@ -317,10 +339,12 @@ upstream:
 ]
 ```
 
-`models` maps public model ids to provider-facing upstream model ids. In
-no-middleware mode, the public model id is also the target route id. Private
-Chutes deployments that use Basic authentication and the attested E2EE transport
-are documented in [Private Chutes configuration](docs/providers/chutes/configuration.md).
+`models` maps the model ids this router accepts to the model ids used for
+upstream verification and provider metadata. Router middleware does not rewrite
+the request body to the mapped value; the body received from downstream PAG must
+already contain a model name accepted by the selected PIG/vLLM/SGLang backend.
+Private Chutes deployments that use Basic authentication and the attested E2EE
+transport are documented in [Private Chutes configuration](docs/providers/chutes/configuration.md).
 
 For other scoped private OpenAI-compatible endpoints that require Basic
 authentication, keep the credential in `bearer_token` and set
@@ -416,16 +440,19 @@ middleware mode the middleware runs in-process, between the frontend and
 backend:
 
 - Public `/v1/models` is served from the configured single router model.
-- Public inference requests are decrypted and normalized by the frontend, then
-  handed to the middleware, which orders configured upstream candidates with
-  cache affinity plus PIG load/pressure signals and shapes the provider request.
-- The middleware forwards through the backend, transforms the response, can
-  inject usage cost, and can send a best-effort post-request usage report when
-  `middleware.control_url` is configured. Verification facts still come from the
-  backend.
+- Public inference requests are validated by the Router frontend, then handed
+  to the middleware, which reads the parsed JSON only to order configured
+  upstream candidates with cache affinity plus PIG load/pressure signals.
+  Client-facing decryption and request-body normalization belong in downstream
+  PAG before it calls this Router.
+- The middleware forwards the exact cleartext request bytes it received through
+  the backend. It can transform cross-format responses, inject usage cost, and
+  send a best-effort post-request usage report when `middleware.control_url` is
+  configured. Verification facts still come from the backend.
 - Streaming responses stay streaming across backend, middleware, and frontend.
-- Middleware-generated OpenAI-compatible responses are passed through downstream
-  E2EE when the original user request used E2EE.
+- In the Phala router deployment, user-facing E2EE terminates at the downstream
+  PAG before this router is called. The router middleware does not participate
+  in that data-plane step.
 
 The middleware is configured by the `middleware` section of the static gateway
 config; see the [configuration reference](docs/configuration-reference.md#middleware)
@@ -558,7 +585,7 @@ scripts/phala_multi_upstream_smoke.sh
 ```
 
 The Phala smoke deploys two mocked upstream ACI services and one gateway CVM,
-then asserts model routing, provider-facing request hashes, verified upstream
+then asserts model routing, forwarded request hashes, verified upstream
 events, and metrics model ids.
 
 ## Repository Map
@@ -567,7 +594,7 @@ events, and metrics model ids.
 src/main.rs                    binary entrypoint and runtime config
 src/dstack.rs                  dstack SDK KMS key provider and quote provider
 src/aci/                       ACI wire types, keys, receipts, upstreams
-src/aggregator/service.rs      report, forwarding, E2EE, receipt finalization
+src/aggregator/service.rs      inherited PAG service: report, forwarding, receipt finalization
 src/aggregator/upstream_config.rs runtime upstream config and provider adapters
 src/http/app.rs                Axum HTTP routers and middleware/backend wiring
 src/bin/aci/                   `aci` verifier CLI: verify, audit, sessions, send, serve

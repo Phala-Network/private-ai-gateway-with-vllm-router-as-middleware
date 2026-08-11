@@ -9,11 +9,11 @@ mod common;
 
 use async_trait::async_trait;
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes},
     extract::{RawQuery, State},
     http::{HeaderMap, Request, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use private_ai_gateway::aci::keys::{verify_receipt_signature, KeyProvider};
@@ -30,7 +30,10 @@ use private_ai_gateway::aggregator::service::{
 use private_ai_gateway::aggregator::upstream_config::{
     UpstreamConfigManager, UpstreamRuntimeOptions, UpstreamVerifierMode,
 };
-use private_ai_gateway::http::{build_router, build_router_with_admin};
+use private_ai_gateway::http::{
+    build_router, build_router_with_admin, build_router_with_admin_and_middleware,
+};
+use private_ai_gateway::middleware::{Middleware, MiddlewareConfig};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -409,6 +412,39 @@ async fn attestation_report_nonce_null_when_absent() {
             .unwrap(),
         expected_hex
     );
+}
+
+#[tokio::test]
+async fn middleware_mode_preserves_aci_service_attestation_surface() {
+    let (service, app) = setup_with_config_and_middleware(
+        "[]",
+        MiddlewareConfig {
+            public_model: Some("router-model".to_string()),
+            ..Default::default()
+        },
+    );
+    let nonce = "cd20088d763605cf78564e5b35524ad52715419624b76e029582a3652758708d";
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/aci/attestation?nonce={nonce}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&body_bytes(resp.into_body()).await).unwrap();
+    assert_eq!(body["api_version"], "aci/1");
+    assert_eq!(
+        body["workload_keyset_digest"].as_str().unwrap(),
+        service.workload_keyset_digest()
+    );
+    assert!(body["attestation"]["workload_keyset"].is_object());
+    assert!(body["attestation"]["report_data"].is_string());
+    assert!(body["service_capabilities"].is_object());
 }
 
 #[tokio::test]
@@ -885,6 +921,20 @@ fn upstream_runtime_options() -> UpstreamRuntimeOptions {
 }
 
 fn setup_with_config(config_json: &str) -> (Arc<AciService>, Router) {
+    setup_with_config_inner(config_json, None)
+}
+
+fn setup_with_config_and_middleware(
+    config_json: &str,
+    middleware_config: MiddlewareConfig,
+) -> (Arc<AciService>, Router) {
+    setup_with_config_inner(config_json, Some(middleware_config))
+}
+
+fn setup_with_config_inner(
+    config_json: &str,
+    middleware_config: Option<MiddlewareConfig>,
+) -> (Arc<AciService>, Router) {
     // Unique per call: a coarse system clock can hand concurrent tests the same
     // nanos, so an atomic counter guarantees distinct temp paths.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -908,12 +958,19 @@ fn setup_with_config(config_json: &str) -> (Arc<AciService>, Router) {
         )
         .unwrap(),
     );
-    let app = build_router_with_admin(service.clone(), manager, None);
+    let app = match middleware_config {
+        Some(config) => {
+            let middleware = Arc::new(Middleware::new(&config, manager.clone()).unwrap());
+            build_router_with_admin_and_middleware(service.clone(), manager, None, middleware)
+        }
+        None => build_router_with_admin(service.clone(), manager, None),
+    };
     (service, app)
 }
 
 /// Records the query string and `Authorization` header the stub received.
 type CapturedRequest = Arc<Mutex<Option<(String, Option<String>)>>>;
+type CapturedBody = Arc<Mutex<Option<Vec<u8>>>>;
 
 #[derive(Clone)]
 struct PhalaStubState {
@@ -951,6 +1008,104 @@ async fn serve_phala_stub(nvidia_payload: Option<String>) -> (String, CapturedRe
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), captured)
+}
+
+async fn raw_capture_chat_handler(State(captured): State<CapturedBody>, body: Bytes) -> Response {
+    *captured.lock().unwrap() = Some(body.to_vec());
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        Body::from(
+            br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[]}"#
+                .to_vec(),
+        ),
+    )
+        .into_response()
+}
+
+async fn serve_raw_capture_openai_upstream() -> (String, CapturedBody) {
+    let captured = Arc::new(Mutex::new(None));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(raw_capture_chat_handler))
+        .with_state(captured.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), captured)
+}
+
+#[tokio::test]
+async fn middleware_http_path_preserves_raw_request_body_bytes() {
+    let (base, captured) = serve_raw_capture_openai_upstream().await;
+    let config = format!(
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}}}}]"#
+    );
+    let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "messages": [
+    { "content": "", "role": "assistant", "tool_calls": [] },
+    { "content": "raw http body", "role": "user" }
+  ],
+  "provider": { "custom": "keep", "aci_verified": false },
+  "metadata": { "z": 1, "a": ["kept", "ordered"] },
+  "stream_options": { "continuous_usage_stats": true, "include_usage": true },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("x-e2ee-version", "2")
+                .body(Body::from(raw_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-e2ee-applied").is_none());
+    assert!(resp.headers().get("x-e2ee-version").is_none());
+    assert!(resp.headers().get("x-e2ee-algo").is_none());
+    let receipt_id = resp
+        .headers()
+        .get("x-receipt-id")
+        .expect("middleware HTTP path must issue a receipt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = body_bytes(resp.into_body()).await;
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(raw_body.as_slice()),
+        "HTTP handler plus middleware path must forward the exact request bytes"
+    );
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("middleware HTTP receipt should be retained");
+    let expected = private_ai_gateway::aci::digest::sha256_hex(&raw_body);
+    assert_eq!(
+        payload_event(&receipt, "request.received")["body_hash"],
+        serde_json::json!(expected.clone())
+    );
+    assert_eq!(
+        payload_event(&receipt, "middleware.forwarded")["body_hash"],
+        serde_json::json!(expected.clone())
+    );
+    assert_eq!(
+        payload_event(&receipt, "request.forwarded")["body_hash"],
+        serde_json::json!(expected)
+    );
+    assert_eq!(
+        payload_event(&receipt, "route.selected")["target_route_id"],
+        serde_json::json!("raw-a:gpt-test")
+    );
 }
 
 const TEST_NONCE: &str = "cd20088d763605cf78564e5b35524ad52715419624b76e029582a3652758708d";

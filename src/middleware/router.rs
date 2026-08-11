@@ -23,8 +23,7 @@ use super::completion::{self, CompletionInput};
 use super::config::MiddlewareConfig;
 use super::control::ControlClient;
 use super::errors::{self, Surface};
-use super::request_transform::Endpoint;
-use super::types::{ProviderFormat, RouteCandidate};
+use super::types::{Endpoint, ProviderFormat, RouteCandidate};
 
 const MAX_ROUTING_HISTORY_CHARS: usize = 16_384;
 const UPSTREAM_STATUS_GREEN: u8 = 0;
@@ -425,15 +424,22 @@ impl RouterBackend {
             }
         };
         let mut input = input;
+        let requested_public_model = !public_model.is_empty()
+            && input
+                .params
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|model| model == public_model);
         let (routes, selected, configured_count) = self.ordered_routes(&public_model, &input);
         let user_tier = self.request_tier(&input);
         if !self.config.trusted_user_tier_header {
             input.user_tier = None;
         }
-        if configured_count > 0 && selected.is_none() {
+        if requested_public_model && selected.is_none() {
             tracing::info!(
                 public_model,
                 user_tier = user_tier.as_str(),
+                configured_count,
                 "router middleware rejected request because no observable upstream has capacity"
             );
             return completion::rate_limited_by_router(
@@ -1390,7 +1396,6 @@ fn route_from_upstream(
             route_id,
             format: provider_format(upstream.provider),
             engine: config.default_engine,
-            effective_reasoning: None,
         },
     }
 }
@@ -2399,7 +2404,6 @@ mod tests {
                 route_id: route_id.to_string(),
                 format: ProviderFormat::Openai,
                 engine: None,
-                effective_reasoning: None,
             },
         }
     }

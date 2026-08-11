@@ -252,6 +252,48 @@ fn global_aci_service_does_not_require_policy_for_plain_openai_compatible_upstre
 }
 
 #[tokio::test]
+async fn phala_direct_config_builds_provider_verifier() {
+    let mut cfg = test_upstream_config(
+        "phala-a",
+        UpstreamProvider::PhalaDirect,
+        "public-a",
+        "upstream-a",
+    );
+    cfg.verifier_request_timeout_seconds = Some(1);
+    let config = vec![cfg];
+    let options = UpstreamRuntimeOptions {
+        verifier_mode: UpstreamVerifierMode::None,
+        accepted_subjects: Vec::new(),
+        accepted_image_digests: Vec::new(),
+        accepted_dstack_kms_root_public_keys: Vec::new(),
+        pccs_url: None,
+        verifier_cache_seconds: 0,
+        connect_timeout_seconds: 1,
+        read_timeout_seconds: 1,
+        verifier_request_timeout_seconds: 1,
+    };
+    let verifier = build_verifier(&config, &options, &ProviderSessionRegistry::default())
+        .expect("phala-direct config should build a provider verifier")
+        .expect("phala-direct config must not fall back to no verifier");
+
+    let event = verifier
+        .verify(UpstreamVerificationRequest {
+            upstream_name: "phala-a".to_string(),
+            url_origin: Some("https://phala-a.example".to_string()),
+            model_id: "upstream-a".to_string(),
+            forwarded_body_hash: "sha256:".to_string() + &"00".repeat(32),
+            required: true,
+        })
+        .await;
+
+    assert_eq!(event.provider_type.as_deref(), Some("phala-direct"));
+    assert_eq!(event.verifier_id, "phala-direct/external-verifier/v1");
+    assert_ne!(event.verifier_id, "none");
+    assert_eq!(event.result, VerificationResult::Failed);
+    assert!(event.required);
+}
+
+#[tokio::test]
 async fn dynamic_verifier_forwards_invalidation_to_current_verifier() {
     let verifications = Arc::new(AtomicUsize::new(0));
     let invalidations = Arc::new(AtomicUsize::new(0));

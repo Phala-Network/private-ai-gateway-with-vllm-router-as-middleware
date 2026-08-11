@@ -1,12 +1,22 @@
-//! Router middleware request-shaping types.
+//! Router middleware data types.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Request endpoint, used for route text extraction and response handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Endpoint {
+    ChatComplete,
+    Complete,
+    Embed,
+    Messages,
+    CreateModelResponse,
+}
+
 /// Opaque pricing block. Carried verbatim until cost computation.
 pub type PricingConfig = Value;
 
-/// Which API format shapes a candidate's request and parses its response.
+/// Which API format parses a candidate's response.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderFormat {
@@ -14,52 +24,12 @@ pub enum ProviderFormat {
     Anthropic,
 }
 
-/// Serving engine of a self-hosted OpenAI-compatible upstream. Selects
-/// engine-specific request shaping; absent for managed third-party APIs.
+/// Serving engine hint retained for config compatibility.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     Sglang,
     Vllm,
-}
-
-/// Canonical public/control reasoning effort.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Max,
-    Xhigh,
-    High,
-    Medium,
-    Low,
-    Minimal,
-    None,
-}
-
-impl ReasoningEffort {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Max => "max",
-            Self::Xhigh => "xhigh",
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
-            Self::Minimal => "minimal",
-            Self::None => "none",
-        }
-    }
-}
-
-/// Route-relevant reasoning; response visibility remains gateway-local.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReasoningConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<ReasoningEffort>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
 }
 
 /// Billing mode, carried into the optional post-request usage report.
@@ -71,21 +41,18 @@ pub enum SpendMode {
     SubscriptionOverflow,
 }
 
-/// One ordered failover candidate: a backend route id plus the upstream format.
+/// One ordered failover candidate: a backend route id plus response format.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteCandidate {
     /// `<upstream name>:<public model id>`, aligned with the backend's upstreams.
     pub route_id: String,
-    /// API format that shapes the request and parses the response.
+    /// API format used only when response adaptation is required.
     pub format: ProviderFormat,
-    /// Serving engine when this upstream is a self-hosted OpenAI-compatible
-    /// server. Absent for managed APIs.
+    /// Retained for config compatibility; transparent routing does not shape
+    /// request bodies from this hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<Engine>,
-    /// Request-specific setting selected after capability filtering.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_reasoning: Option<ReasoningConfig>,
 }
 
 /// Which component a gateway-synthesized failure is attributed to in reports.

@@ -16,8 +16,9 @@ throughput findings.
   provider fixture tests.
 - Prove the no-middleware path remains behavior-compatible with the current
   gateway.
-- Prove the middleware path can rewrite requests and select a target route
-  while backend-owned provider verification facts remain unforgeable.
+- Prove the middleware path can select a target route while forwarding the
+  request body byte-for-byte and keeping backend-owned provider verification
+  facts unforgeable.
 - Check API fidelity for the surfaces users rely on: streaming, tool calls,
   structured outputs, multimodal inputs, context limits, and cache metadata.
 - Give users a concrete verification story for "I received this API response;
@@ -270,10 +271,10 @@ For each provider and enabled request mode:
 - Verify receipt signature using the receipt key from the attested keyset.
 - Verify the payload's keyset digest matches the attestation report.
 - Verify `request.received.body_hash` equals the exact client body.
-- Verify `request.forwarded.body_hash` equals the model-rewritten upstream
-  body.
-- Verify a rewrite shows as `request.forwarded.body_hash` differing from
-  `request.received.body_hash`.
+- Verify `request.forwarded.body_hash` equals `request.received.body_hash` for
+  transparent router middleware requests.
+- Verify `middleware.forwarded.body_hash` also equals `request.received.body_hash`
+  when middleware selected the route without rewriting the body.
 - Verify `upstream.verified` is `verified`, `required == true`, and cites a
   `session_id` whose fetched bytes hash to it.
 - Verify `response.returned.body_hash` equals the response body for
@@ -314,24 +315,25 @@ will expand once those land.
 Run the same lifecycle cases in two gateway modes:
 
 - **No middleware:** frontend calls backend directly. Assert behavior matches
-  the current request path: `body.model` is the target route id, backend rewrites
-  to the upstream model, and receipts contain the same verification and hash
+  the current request path and receipts contain the same verification and hash
   facts as today.
 - **Fixture middleware:** frontend forwards plaintext to a local middleware
-  fixture. The fixture rewrites the request and selects a different configured
-  target route id. Backend must validate that route, verify the provider, and
-  record backend-authored route/provider facts that the middleware cannot forge.
+  fixture. The fixture selects a configured target route id without changing the
+  request body. Backend must validate that route, verify the provider, and record
+  backend-authored route/provider facts that the middleware cannot forge.
 
 Middleware fixture checks:
 
 - Public requests with forged `X-Private-AI-Gateway-*` headers are sanitized by
   the frontend.
 - Middleware cannot claim `upstream.verified`; backend must author that event.
-- E2EE AAD uses the original user model even when middleware selects a
-  provider-qualified target route.
+- User-facing E2EE remains a downstream PAG concern in the Phala Router
+  deployment; Router middleware tests should focus on byte-for-byte request body
+  passthrough after downstream PAG normalization.
 - The final receipt distinguishes `request.received`, `middleware.forwarded`,
   `route.selected`, `upstream.forwarded`, `upstream.verified`, and
-  `response.returned`.
+  `response.returned`; transparent middleware cases must have matching request
+  body hashes.
 
 The `bfcl_v4.py` wrapper runs the Berkeley Function Calling Leaderboard v4
 through the local gateway over OpenAI-compatible Chat Completions. It is
@@ -503,7 +505,8 @@ providers. Our suite should explicitly cover the same classes of behavior:
 3. `run.py --profile quick` for Tinfoil, NEAR AI, Chutes, including
    attested-session audit lookup.
 4. Framework no-middleware compatibility case.
-5. Framework fixture-middleware case with route selection and rewrite receipts.
+5. Framework fixture-middleware case with route selection and transparent body
+   receipts.
 6. Streaming and receipt hash verification.
 7. Tool and structured-output cases.
 8. Multimodal and context cases.

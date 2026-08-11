@@ -77,7 +77,7 @@ pub struct StreamReport {
     pub upstream_status: u16,
     pub started: Instant,
     /// Set by the response-body wrapper when the downstream finalizer
-    /// (receipt drafting / E2EE) errors mid-consumption. The meter's drop then
+    /// (receipt drafting or response wrapping) errors mid-consumption. The meter's drop then
     /// settles the stream as an internal failure instead of misattributing the
     /// teardown to the client.
     pub downstream_abort: Arc<AtomicBool>,

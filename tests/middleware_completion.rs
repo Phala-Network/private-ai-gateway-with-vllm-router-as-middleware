@@ -17,7 +17,11 @@ use axum::http::{header::CONTENT_TYPE, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{routing::post, Json, Router};
 use futures_util::{stream, StreamExt};
-use private_ai_gateway::aci::receipt::{UpstreamVerifiedEvent, VerificationResult};
+use private_ai_gateway::aci::digest::sha256_hex;
+use private_ai_gateway::aci::receipt::{
+    UpstreamVerifiedEvent, VerificationResult, EVENT_MIDDLEWARE_FORWARDED, EVENT_REQUEST_FORWARDED,
+    EVENT_REQUEST_RECEIVED, EVENT_ROUTE_SELECTED,
+};
 use private_ai_gateway::aci::upstream::{
     PreparedUpstreamRequest, UpstreamBackend, UpstreamError, UpstreamRequest, UpstreamResponse,
 };
@@ -30,7 +34,7 @@ use private_ai_gateway::aggregator::upstream_config::{
     UpstreamVerifierMode,
 };
 use private_ai_gateway::middleware::errors::Surface;
-use private_ai_gateway::middleware::request_transform::Endpoint;
+use private_ai_gateway::middleware::types::Endpoint;
 use private_ai_gateway::middleware::{CompletionInput, Middleware, MiddlewareConfig};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -96,6 +100,20 @@ struct FailVerifier;
 #[async_trait]
 impl UpstreamVerifier for FailVerifier {
     async fn verify(&self, request: UpstreamVerificationRequest) -> UpstreamVerifiedEvent {
+        let mut event = event_from_request(&request, VerificationResult::Failed);
+        event.reason = Some("fixture verification failed".to_string());
+        event
+    }
+}
+
+struct RecordingFailVerifier {
+    request: Arc<Mutex<Option<UpstreamVerificationRequest>>>,
+}
+
+#[async_trait]
+impl UpstreamVerifier for RecordingFailVerifier {
+    async fn verify(&self, request: UpstreamVerificationRequest) -> UpstreamVerifiedEvent {
+        *self.request.lock().unwrap() = Some(request.clone());
         let mut event = event_from_request(&request, VerificationResult::Failed);
         event.reason = Some("fixture verification failed".to_string());
         event
@@ -173,6 +191,24 @@ fn service_from_manager(manager: &Arc<UpstreamConfigManager>) -> Arc<AciService>
             Arc::new(StubQuoter::default()),
             manager.backend(),
             manager.verifier(),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test(),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    )
+}
+
+fn service_from_manager_with_verifier(
+    manager: &Arc<UpstreamConfigManager>,
+    verifier: Arc<dyn UpstreamVerifier>,
+) -> Arc<AciService> {
+    Arc::new(
+        AciService::new_with_upstream_verifier(
+            Arc::new(StaticKeyProvider::default()),
+            Arc::new(StubQuoter::default()),
+            manager.backend(),
+            verifier,
             Arc::new(InMemoryReceiptStore::default()),
             AciServiceConfig::for_test(),
             Arc::new(FixedClock(1_700_000_000)),
@@ -305,7 +341,6 @@ fn chat_input(model: &str, content: &str) -> CompletionInput {
         received_body: serde_json::to_vec(&params).unwrap(),
         params,
         requester: None,
-        e2ee: None,
         aci_required: false,
         aci_session_ids: Vec::new(),
         request_id: "req-1".to_string(),
@@ -341,6 +376,15 @@ fn route_snapshot<'a>(snapshot: &'a Value, route_id: &str) -> &'a Value {
         .iter()
         .find(|route| route["route_id"] == json!(route_id))
         .unwrap_or_else(|| panic!("route {route_id} not found in snapshot: {snapshot}"))
+}
+
+fn receipt_event<'a>(payload: &'a Value, event_type: &str) -> &'a Value {
+    payload["event_log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"].as_str() == Some(event_type))
+        .unwrap_or_else(|| panic!("event {event_type} not found in receipt: {payload}"))
 }
 
 #[tokio::test]
@@ -444,6 +488,30 @@ async fn wrong_model_returns_model_not_found_without_forwarding() {
 }
 
 #[tokio::test]
+async fn configured_model_with_no_enabled_upstreams_returns_rate_limit() {
+    let manager = upstream_manager(Vec::new());
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            public_model: Some("gpt-test".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let (status, headers, body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
+    assert!(headers.get("retry-after").is_some());
+}
+
+#[tokio::test]
 async fn forwarding_uses_selected_route_and_finalizes_receipt() {
     let calls_a = Arc::new(CapturedCalls::default());
     let calls_b = Arc::new(CapturedCalls::default());
@@ -467,22 +535,71 @@ async fn forwarding_uses_selected_route_and_finalizes_receipt() {
     ]);
     let service = service_from_manager(&manager);
     let mw = middleware(manager, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "messages": [
+    { "content": "stable prefix one", "role": "user" }
+  ],
+  "metadata": { "z": 1, "a": ["kept", "ordered"] },
+  "stream_options": { "continuous_usage_stats": true, "include_usage": true },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+    let input = CompletionInput {
+        endpoint: Endpoint::ChatComplete,
+        endpoint_path: "/v1/chat/completions",
+        surface: Surface::Openai,
+        params: serde_json::from_slice(&raw_body).unwrap(),
+        received_body: raw_body.clone(),
+        requester: None,
+        aci_required: false,
+        aci_session_ids: Vec::new(),
+        request_id: "req-raw-body".to_string(),
+        user_model: Some("gpt-test".to_string()),
+        user_tier: None,
+        stream: false,
+    };
 
-    let (status, headers, body) = response_parts(
-        mw.handle_completion(&service, chat_input("gpt-test", "stable prefix one"))
-            .await,
-    )
-    .await;
+    let (status, headers, body) = response_parts(mw.handle_completion(&service, input).await).await;
 
     assert_eq!(status, 200);
-    assert_eq!(body["id"], json!("chat-a"));
+    assert_eq!(body["id"], json!("req-raw-body"));
+    assert_eq!(body["model"], json!("gpt-test"));
     assert!(headers.get("x-receipt-id").is_some());
+    assert!(headers.get("x-e2ee-applied").is_none());
+    assert!(headers.get("x-e2ee-version").is_none());
+    assert!(headers.get("x-e2ee-algo").is_none());
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 0);
     assert_eq!(
         calls_a.bodies.lock().unwrap()[0]["model"],
-        json!("up-a"),
-        "selected route must rewrite the public model to its upstream model"
+        json!("gpt-test"),
+        "selected route must forward the request model unchanged"
+    );
+
+    let receipt_id = headers
+        .get("x-receipt-id")
+        .expect("receipt id header")
+        .to_str()
+        .expect("receipt id is ascii");
+    let receipt = service
+        .get_receipt_by_receipt_id(receipt_id)
+        .expect("receipt is stored");
+    let payload = receipt.document_json().expect("receipt json parses");
+    assert_eq!(
+        receipt_event(&payload, EVENT_ROUTE_SELECTED)["target_route_id"],
+        json!("gpu-a:gpt-test")
+    );
+    let received_hash = receipt_event(&payload, EVENT_REQUEST_RECEIVED)["body_hash"].clone();
+    assert_eq!(received_hash, json!(sha256_hex(&raw_body)));
+    assert_eq!(
+        receipt_event(&payload, EVENT_MIDDLEWARE_FORWARDED)["body_hash"],
+        received_hash,
+        "middleware-selected route must not rewrite body before candidate forwarding"
+    );
+    assert_eq!(
+        receipt_event(&payload, EVENT_REQUEST_FORWARDED)["body_hash"],
+        received_hash,
+        "middleware-selected route must not rewrite body in backend prepare"
     );
 }
 
@@ -520,7 +637,8 @@ async fn disabled_upstream_is_visible_but_not_routed() {
     .await;
 
     assert_eq!(status, 200);
-    assert_eq!(body["id"], json!("chat-active"));
+    assert_eq!(body["id"], json!("req-1"));
+    assert_eq!(body["model"], json!("gpt-test"));
     assert_eq!(calls_disabled.bodies.lock().unwrap().len(), 0);
     assert_eq!(calls_active.bodies.lock().unwrap().len(), 1);
 
@@ -642,8 +760,8 @@ async fn cache_aware_selection_keeps_similar_prefix_on_same_route() {
 
     assert_eq!(first_status, 200);
     assert_eq!(second_status, 200);
-    assert_eq!(first_body["id"], json!("chat-a"));
-    assert_eq!(second_body["id"], json!("chat-a"));
+    assert_eq!(first_body["id"], json!("req-1"));
+    assert_eq!(second_body["id"], json!("req-1"));
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 2);
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 0);
 
@@ -698,7 +816,7 @@ async fn disabled_upstream_cache_is_removed_before_selection() {
     )
     .await;
     assert_eq!(first_status, 200);
-    assert_eq!(first_body["id"], json!("chat-a"));
+    assert_eq!(first_body["id"], json!("req-1"));
 
     manager.set_enabled("gpu-a", false).unwrap();
 
@@ -709,7 +827,7 @@ async fn disabled_upstream_cache_is_removed_before_selection() {
     .await;
 
     assert_eq!(second_status, 200);
-    assert_eq!(second_body["id"], json!("chat-b"));
+    assert_eq!(second_body["id"], json!("req-1"));
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
 
@@ -728,20 +846,46 @@ async fn disabled_upstream_cache_is_removed_before_selection() {
 #[tokio::test]
 async fn streaming_running_count_stays_until_body_is_consumed() {
     let calls = Arc::new(CapturedCalls::default());
-    let upstream = spawn_openai_streaming_upstream("chat-stream", calls).await;
+    let upstream = spawn_openai_streaming_upstream("chat-stream", calls.clone()).await;
     let manager = upstream_manager(vec![upstream_config(
         "gpu-a", &upstream, "gpt-test", "up-a",
     )]);
     let service = service_from_manager(&manager);
     let mw = middleware(manager, MiddlewareConfig::default());
-    let mut input = chat_input("gpt-test", "streaming request");
-    input.stream = true;
-    input.params["stream"] = json!(true);
-    input.received_body = serde_json::to_vec(&input.params).unwrap();
+    let raw_body = br#"{
+  "stream": true,
+  "messages": [
+    { "role": "user", "content": "streaming request" }
+  ],
+  "stream_options": { "include_usage": true, "continuous_usage_stats": true },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+    let input = CompletionInput {
+        endpoint: Endpoint::ChatComplete,
+        endpoint_path: "/v1/chat/completions",
+        surface: Surface::Openai,
+        params: serde_json::from_slice(&raw_body).unwrap(),
+        received_body: raw_body.clone(),
+        requester: None,
+        aci_required: false,
+        aci_session_ids: Vec::new(),
+        request_id: "req-stream-raw-body".to_string(),
+        user_model: Some("gpt-test".to_string()),
+        user_tier: None,
+        stream: true,
+    };
 
     let response = mw.handle_completion(&service, input).await;
 
     assert_eq!(response.status(), StatusCode::OK);
+    let receipt_id = response
+        .headers()
+        .get("x-receipt-id")
+        .expect("streaming receipt id header")
+        .to_str()
+        .expect("streaming receipt id is ascii")
+        .to_string();
     assert_eq!(
         route_running(&mw.admin_snapshot().unwrap(), "gpu-a:gpt-test"),
         1
@@ -752,6 +896,28 @@ async fn streaming_running_count_stays_until_body_is_consumed() {
     assert_eq!(
         route_running(&mw.admin_snapshot().unwrap(), "gpu-a:gpt-test"),
         0
+    );
+    assert_eq!(calls.bodies.lock().unwrap()[0]["model"], json!("gpt-test"));
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("streaming receipt is stored after body is consumed");
+    let payload = receipt.document_json().expect("streaming receipt parses");
+    assert_eq!(
+        receipt_event(&payload, EVENT_ROUTE_SELECTED)["target_route_id"],
+        json!("gpu-a:gpt-test")
+    );
+    let received_hash = receipt_event(&payload, EVENT_REQUEST_RECEIVED)["body_hash"].clone();
+    assert_eq!(received_hash, json!(sha256_hex(&raw_body)));
+    assert_eq!(
+        receipt_event(&payload, EVENT_MIDDLEWARE_FORWARDED)["body_hash"],
+        received_hash,
+        "streaming middleware candidate must preserve request body bytes"
+    );
+    assert_eq!(
+        receipt_event(&payload, EVENT_REQUEST_FORWARDED)["body_hash"],
+        received_hash,
+        "streaming backend prepare must preserve request body bytes"
     );
 }
 
@@ -776,6 +942,60 @@ async fn upstream_verification_failure_fails_closed_before_forwarding() {
         .unwrap()
         .contains("fixture verification failed"));
     assert!(calls.bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn upstream_verification_uses_passthrough_body_hash() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls.clone()).await;
+    let mut cfg = upstream_config("gpu-a", &upstream, "gpt-test", "up-a");
+    cfg.provider = UpstreamProvider::PhalaDirect;
+    let manager = upstream_manager(vec![cfg]);
+    let captured = Arc::new(Mutex::new(None));
+    let service = service_from_manager_with_verifier(
+        &manager,
+        Arc::new(RecordingFailVerifier {
+            request: captured.clone(),
+        }),
+    );
+    let mw = middleware(manager, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "messages": [
+    { "content": "verification hash", "role": "user" }
+  ],
+  "provider": { "aci_verified": true },
+  "stream_options": { "include_usage": true, "continuous_usage_stats": true },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+    let input = CompletionInput {
+        endpoint: Endpoint::ChatComplete,
+        endpoint_path: "/v1/chat/completions",
+        surface: Surface::Openai,
+        params: serde_json::from_slice(&raw_body).unwrap(),
+        received_body: raw_body.clone(),
+        requester: None,
+        aci_required: true,
+        aci_session_ids: Vec::new(),
+        request_id: "req-verify-hash".to_string(),
+        user_model: Some("gpt-test".to_string()),
+        user_tier: None,
+        stream: false,
+    };
+
+    let (status, _, _) = response_parts(mw.handle_completion(&service, input).await).await;
+
+    assert_eq!(status, 503);
+    assert!(calls.bodies.lock().unwrap().is_empty());
+    let request = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("verification request should be recorded before fail-closed response");
+    assert_eq!(request.upstream_name, "gpu-a");
+    assert_eq!(request.model_id, "up-a");
+    assert_eq!(request.forwarded_body_hash, sha256_hex(&raw_body));
+    assert!(request.required);
 }
 
 #[tokio::test]

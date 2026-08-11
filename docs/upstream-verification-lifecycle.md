@@ -127,7 +127,8 @@ Startup:
 Request path:
 
 1. Treat the public model id as the target route id.
-2. Rewrite the target route id to the upstream model id.
+2. Rewrite the public body model to the configured upstream model id before
+   verification and forwarding.
 3. Verify the selected upstream, usually from a cached verification lease.
 4. Refuse forwarding if verification is required and no verified binding exists.
 5. Forward only through a backend that can enforce the verified binding.
@@ -139,10 +140,15 @@ Request path:
 The frontend/middleware/backend framework keeps the same lease semantics but
 moves responsibility boundaries:
 
-1. Frontend terminates downstream E2EE and records the user-facing request.
-2. Optional middleware sees plaintext and may choose a target route id.
+1. Downstream PAG owns any user-facing E2EE and request normalization before it
+   calls this Router deployment.
+2. Router middleware sees the cleartext bytes received from downstream PAG and
+   may choose a target route id.
 3. Backend validates the target route id, then runs the same verification lease
-   and provider session lease path described here.
+   and provider session lease path described here. Router-middleware-selected
+   requests keep the body bytes that middleware received; the configured
+   upstream model id is used for route metadata and verification, not request
+   body rewriting.
 4. Backend records provider verification and provider-facing forwarding facts in
    shared request context.
 5. Frontend finalizes the user-facing response and signs the receipt.

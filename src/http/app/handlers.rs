@@ -43,7 +43,7 @@ use super::util::{
 };
 use super::AppState;
 use crate::middleware::errors::Surface;
-use crate::middleware::request_transform::Endpoint;
+use crate::middleware::types::Endpoint;
 use crate::middleware::CompletionInput;
 
 #[derive(Deserialize)]
@@ -563,9 +563,9 @@ pub(super) async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // Native Anthropic-format downstream surface. The frontend treats the body
-    // as opaque plaintext: it only extracts `model`/`stream` and forwards to the
-    // middleware, which handles Anthropic<->provider conversion.
+    // Native Anthropic-format downstream surface. In middleware mode the
+    // request body is still forwarded byte-for-byte; any request-shape
+    // conversion must already have happened in the downstream PAG.
     openai_completion_endpoint(state, headers, body, MESSAGES_PATH, false).await
 }
 
@@ -576,10 +576,8 @@ pub(super) async fn responses(
 ) -> Response {
     // Native OpenAI Responses API passthrough (create only). The frontend treats
     // the body as opaque plaintext (extracts `model`/`stream`); the path flows
-    // through to the upstream as `base_url + /v1/responses`. ACI E2EE is not
-    // supported on this endpoint yet — its body uses `input`, not `messages` —
-    // so reject E2EE requests cleanly instead of failing later in field decryption.
-    if has_e2ee_headers(&headers) {
+    // through to the upstream as `base_url + /v1/responses`.
+    if state.middleware.is_none() && has_e2ee_headers(&headers) {
         return error_response(
             StatusCode::BAD_REQUEST,
             "e2ee_unsupported_endpoint",
@@ -672,8 +670,8 @@ fn aci_constraint(parsed: &Value) -> Result<AciConstraint, String> {
 }
 
 /// Remove gateway-only ACI controls before direct upstream forwarding. The
-/// middleware path already shapes a fresh provider request, so it keeps the
-/// original block for the control-plane consult.
+/// middleware path keeps the original cleartext bytes and only reads the parsed
+/// block for routing and control-plane consults.
 fn strip_aci_constraint(mut parsed: Value) -> (Value, bool) {
     let Some(provider) = parsed.get_mut("provider").and_then(Value::as_object_mut) else {
         return (parsed, false);
@@ -699,7 +697,9 @@ pub(super) async fn openai_completion_endpoint(
         return resp;
     }
 
-    let has_e2ee = has_e2ee_headers(&headers);
+    let middleware_mode = state.middleware.is_some();
+    let has_e2ee = !middleware_mode && has_e2ee_headers(&headers);
+
     // `supported_e2ee_versions` advertises ACI E2EE (§6). The inherited
     // dstack-vllm-proxy path predates it and is identified by
     // `x-signing-algo`, so a deployment that has not turned the ACI scheme on
@@ -743,8 +743,6 @@ pub(super) async fn openai_completion_endpoint(
             );
         }
     };
-    let (parsed, normalized) = strip_empty_tool_calls(parsed);
-
     if headers.contains_key("x-upstream-verification") {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -814,7 +812,6 @@ pub(super) async fn openai_completion_endpoint(
             params: parsed,
             received_body: service_body,
             requester,
-            e2ee,
             aci_required,
             aci_session_ids: aci.session_ids,
             request_id: context.request_id,
@@ -825,6 +822,7 @@ pub(super) async fn openai_completion_endpoint(
         return middleware.handle_completion(&state.service, input).await;
     }
 
+    let (parsed, normalized) = strip_empty_tool_calls(parsed);
     let (direct_params, aci_stripped) = strip_aci_constraint(parsed);
     let forwarded_body = if normalized || aci_stripped {
         match serde_json::to_vec(&direct_params) {

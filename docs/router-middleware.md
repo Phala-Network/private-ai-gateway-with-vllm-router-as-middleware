@@ -9,6 +9,8 @@ It is not a standalone vLLM Router, an external adapter, or a new verification
 authority. Private AI Gateway still owns attestation, upstream verification,
 channel binding, forwarding, receipt finalization, and all public ACI evidence.
 The middleware only orders candidate routes before the verified backend forward.
+It reads request JSON for `model`, routing text, and tier selection, but it does
+not rewrite, rebuild, or reserialize the request body.
 
 ## Request Path
 
@@ -22,9 +24,18 @@ client
 ```
 
 The middleware runs inside the same process and attested workload as the rest of
-the gateway. Plain requests are visible to it after TLS termination, and ACI
-E2EE requests are visible after gateway-side decryption. That is why the
-middleware source and config are part of the same audit boundary as the gateway.
+the gateway. In the Phala router deployment, user-facing E2EE terminates at the
+downstream PAG before it calls this router. Router middleware does not
+participate in that E2EE data path; its security boundary is the ACI service
+surface exposed to the downstream PAG plus phala-direct verification for
+selected upstream nodes. It treats the downstream PAG's request body as the
+already-cleartext routing input and never enters inherited PAG E2EE
+compatibility paths.
+
+When another downstream PAG calls this router, the downstream side should verify
+the router as an `aci-service`. This router then verifies selected model nodes
+with the same `phala-direct` upstream verifier used by PAG. The request bytes
+received from the downstream PAG are the bytes forwarded to the selected node.
 
 ## Upstream Source
 
@@ -73,6 +84,12 @@ For each request, the router:
 8. Falls back to the least-loaded route when no prefix match exists or the
    matched route fails the load guard.
 9. Returns the rest as fallback candidates ordered by lower effective load.
+
+The request body sent to every ordered candidate is the exact cleartext byte
+sequence received by middleware from the downstream PAG. Any JSON normalization
+such as streaming usage injection, provider field stripping, reasoning parameter
+mapping, or tool-call cleanup must happen in the downstream PAG before it calls
+this router.
 
 PIG pressure always wins over cache affinity. The router checks cache affinity
 before load fallback, but the matched route must still pass the load guard
@@ -225,3 +242,8 @@ response.returned
 Middleware cannot forge `upstream.verified`; the backend verifies or refreshes
 the selected upstream lease and enforces the verified channel binding before
 sending request bytes.
+
+For transparent routing, `middleware.forwarded.body_hash` and
+`request.forwarded.body_hash` are expected to match `request.received.body_hash`
+for successful upstream attempts. A difference means some configured backend
+adapter or non-router path rewrote the request and should be audited separately.

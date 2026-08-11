@@ -1,4 +1,4 @@
-# Private AI Gateway Roadmap
+# Private AI Gateway With Router Middleware Roadmap
 
 Date: 2026-06-09 UTC.
 Current phase: refactoring the feature-complete prototype into a gateway
@@ -13,9 +13,9 @@ adapters that fail closed when binding material cannot be enforced.
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| OpenAI-compatible chat/completions surface | Done | `/v1/chat/completions`, `/v1/completions`, streaming, E2EE addon, legacy aliases, and vLLM-compatible error behavior are covered by tests. |
-| OpenAI-compatible embeddings surface | Done | `/v1/embeddings` forwards through the same receipt/attestation pipeline as chat. Buffered-only (client-sent `stream:true` is forced back to buffered). ACI E2EE v2 encrypts the `input` request field and each `data[].embedding` response field (field-level, same as the dstack-vllm-proxy legacy modes; the §6 whole-body scheme lands with the revamp). Provider adapters in this slice: openai-compatible only — Chutes embeddings (TEI native paths, not `/v1/embeddings`) and Tinfoil/NEAR-AI embedding routes still need adapter work. |
-| Model routing and runtime config | Done | One upstream config file, admin `GET`/`PUT`, model alias rewrite before verification/forwarding/receipt hashing in no-middleware mode. Production upstream policy should live in this config file, not in broad process-level allowlist env vars. |
+| OpenAI-compatible chat/completions surface | Done | `/v1/chat/completions`, `/v1/completions`, streaming, legacy aliases, and vLLM-compatible error behavior are covered by tests. User-facing E2EE remains a downstream PAG concern, not a Router middleware release target. |
+| OpenAI-compatible embeddings surface | Done | `/v1/embeddings` forwards through the same receipt/attestation pipeline as chat. Buffered-only (client-sent `stream:true` is forced back to buffered). Router middleware does not route embeddings today. |
+| Model routing and runtime config | Done | One upstream config file, admin `GET`/`PUT`, route selection before verification/forwarding/receipt hashing, and transparent request-body forwarding in router-middleware mode. Production upstream policy should live in this config file, not in broad process-level allowlist env vars. |
 | ACI identity and self-attestation | In progress | dstack KMS-backed keys, the quote-bound keyset digest, TLS SPKI publication, and local dstack simulator support are implemented. Launcher provenance is tracked separately but still part of the release story. |
 | Receipts | In progress | Request/response body hashes, streaming hashing, upstream verification events, middleware route events, and the legacy `/v1/signature` alias are implemented. Persistent storage decision is still open. |
 | Attested sessions | In progress | Upstream verified TLS/SPKI or provider E2EE bindings now create session ids, audit records, and receipt references. Downstream session ids are pending TLS/domain binding work. |
@@ -24,7 +24,7 @@ adapters that fail closed when binding material cannot be enforced.
 | Frontend/middleware/backend framework | Shipped | Frontend/backend split with an optional middleware that consults the control plane to route, transform, cost-inject, and report usage; the middleware-disabled path stays behavior-compatible. |
 | Multi-domain downstream TLS binding | In progress | Domain-tagged TLS SPKIs can be configured, published in the keyset, and selected in report evidence from the HTTP `Host`. Downstream session ids are still pending. |
 | Client serving constraints | Implemented | Spec §5.3: `provider.aci_verified` and `provider.aci_session_ids` in any prompt-endpoint body; membership enforced by the measured code, refusal via `session_not_accepted`, member stripped before forwarding (recorded as the §7.4 rewrite). Enforced in the gateway: the member is consumed and stripped on the single body parse, membership is checked before forwarding, and the refusal is receipt-recorded. |
-| Authenticated E2EE responses | Specced | Spec §6.1: response keys mix `request_secret`, the request's client-ephemeral × service-static secret, so a valid AEAD tag proves the workload sealed the unit for that request. Implementation, TS client, and test vectors still derive from the unit secret alone. Lands with the E2EE revamp. |
+| Authenticated E2EE responses | Out of Router scope | User-facing E2EE is owned by downstream PAG. Router middleware receives cleartext bytes from downstream PAG and does not decrypt, encrypt, or compatibility-handle that traffic. |
 | JCS workload keyset | Implemented | Spec §3.1/§4.1: the keyset digest is over the JCS form and the report embeds the keyset as a plain `workload_keyset` object (base64 armor dropped). Implemented across the gateway, CLI, TS client, vectors, and docs. |
 | CLI verifier policy | Partial | User-configurable §1.3 policy for the `aci` CLI and `aci serve`. Landed: required claims (`--require-claim`, §9.2(3)) and attested-session pinning (`aci sessions`, `serve --session` / `--require-claim` with refresh-on-412). Remaining: custody checking (§9.1(5)) and provenance policy beyond `--accept-compose`. |
 | Local backend proxy mode | Planned | Let an end user run the verified-provider backend as a laptop-local OpenAI-compatible proxy without local TEE requirements. |
@@ -103,15 +103,15 @@ may need multiple custom domains bound to the same gateway workload.
 
 ### P0: Frontend / Middleware / Backend Refactor
 
-Shipped. The gateway is split into a frontend (public ACI endpoints, downstream
-E2EE, request-context creation, receipt signing), a backend (target-route
-validation, provider verification, upstream binding, backend-authored receipt
-facts), and an optional middleware between them. The middleware runs
-**in-process**: it consults the control plane to authorize and route each
-request, shapes the provider request, transforms and cost-injects the response,
-and reports usage — with no out-of-process hop. The middleware-disabled path
-stays behavior-compatible with the direct request path and is covered by the
-full test suite. Verification facts always come from backend observations, never
+Shipped. The gateway is split into a frontend (public ACI endpoints,
+request-context creation, receipt signing), a backend (target-route validation,
+provider verification, upstream binding, backend-authored receipt facts), and an
+optional middleware between them. In this Router-focused fork, the middleware
+runs **in-process** and only orders candidate routes; it does not shape,
+rebuild, or reserialize the request body. Downstream PAG owns client-facing
+normalization before calling this Router. The middleware-disabled path stays
+behavior-compatible with the direct request path and is covered by the full test
+suite. Verification facts always come from backend observations, never
 middleware claims (`middleware.forwarded`, `route.selected`, `request.forwarded`,
 backend-owned `response.received`, frontend-owned `response.returned`).
 
@@ -194,11 +194,9 @@ backend-owned `response.received`, frontend-owned `response.returned`).
   compatible with existing vLLM-proxy clients. If a high-volume auditor ever needs
   to avoid the follow-up GET, `?expand=` on the receipt is a clean additive
   optimization — not modeled now.
-- Document E2EE receipt semantics clearly. E2EE already provides AEAD integrity
-  for encrypted fields. Receipts are still attached like normal TLS requests and
-  hash the gateway-observed decrypted request body plus the returned response
-  hashes. Verifiers should not compare `request.received.body_hash` with the
-  original encrypted HTTP body.
+- Keep user-facing E2EE receipt semantics in downstream PAG documentation. This
+  Router fork should document only the cleartext bytes received from downstream
+  PAG and the byte-for-byte equality of its forwarded upstream body.
 - Write neutral docs with `{API_KEY_ENV_VAR}` and product wrappers that render
   `REDPILL_API_KEY` for Redpill and `PHALA_MODEL_API_KEY` for Phala.
 
