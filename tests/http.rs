@@ -148,6 +148,22 @@ fn payload_event(receipt: &SignedReceipt, event_type: &str) -> Value {
         .clone()
 }
 
+fn assert_middleware_passthrough_hashes(receipt: &SignedReceipt, raw_body: &[u8]) {
+    let expected = private_ai_gateway::aci::digest::sha256_hex(raw_body);
+    assert_eq!(
+        payload_event(receipt, "request.received")["body_hash"],
+        serde_json::json!(expected.clone())
+    );
+    assert_eq!(
+        payload_event(receipt, "middleware.forwarded")["body_hash"],
+        serde_json::json!(expected.clone())
+    );
+    assert_eq!(
+        payload_event(receipt, "request.forwarded")["body_hash"],
+        serde_json::json!(expected)
+    );
+}
+
 #[tokio::test]
 async fn health_endpoint_reports_ok() {
     let h = make_harness();
@@ -1038,11 +1054,21 @@ async fn raw_capture_chat_handler(
         body: body.to_vec(),
         headers: captured_headers,
     });
-    let response = if path == "/v1/completions" {
-        br#"{"id":"cmpl-http","object":"text_completion","model":"up-a","choices":[{"text":"ok","index":0,"finish_reason":"stop","logprobs":null}]}"#
-            .to_vec()
-    } else {
-        br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[]}"#.to_vec()
+    let response = match path.as_str() {
+        "/v1/completions" => {
+            br#"{"id":"cmpl-http","object":"text_completion","model":"up-a","choices":[{"text":"ok","index":0,"finish_reason":"stop","logprobs":null}]}"#
+                .to_vec()
+        }
+        "/v1/responses" => {
+            br#"{"id":"resp-http","object":"response","created_at":1,"model":"up-a","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#
+                .to_vec()
+        }
+        "/v1/embeddings" => {
+            br#"{"object":"list","data":[],"model":"up-a","usage":{"prompt_tokens":1,"total_tokens":1}}"#
+                .to_vec()
+        }
+        _ => br#"{"id":"chat-http","object":"chat.completion","model":"up-a","choices":[]}"#
+            .to_vec(),
     };
     (
         StatusCode::OK,
@@ -1057,6 +1083,8 @@ async fn serve_raw_capture_openai_upstream() -> (String, CapturedRawRequest) {
     let app = Router::new()
         .route("/v1/chat/completions", post(raw_capture_chat_handler))
         .route("/v1/completions", post(raw_capture_chat_handler))
+        .route("/v1/responses", post(raw_capture_chat_handler))
+        .route("/v1/embeddings", post(raw_capture_chat_handler))
         .with_state(captured.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1148,19 +1176,7 @@ async fn middleware_http_path_preserves_raw_request_body_bytes() {
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
         .expect("middleware HTTP receipt should be retained");
-    let expected = private_ai_gateway::aci::digest::sha256_hex(&raw_body);
-    assert_eq!(
-        payload_event(&receipt, "request.received")["body_hash"],
-        serde_json::json!(expected.clone())
-    );
-    assert_eq!(
-        payload_event(&receipt, "middleware.forwarded")["body_hash"],
-        serde_json::json!(expected.clone())
-    );
-    assert_eq!(
-        payload_event(&receipt, "request.forwarded")["body_hash"],
-        serde_json::json!(expected)
-    );
+    assert_middleware_passthrough_hashes(&receipt, &raw_body);
     assert_eq!(
         payload_event(&receipt, "route.selected")["target_route_id"],
         serde_json::json!("raw-a:gpt-test")
@@ -1226,19 +1242,141 @@ async fn middleware_http_completions_path_preserves_raw_request_body_bytes() {
     let receipt = service
         .get_receipt_by_receipt_id(&receipt_id)
         .expect("middleware completions receipt should be retained");
-    let expected = private_ai_gateway::aci::digest::sha256_hex(&raw_body);
+    assert_middleware_passthrough_hashes(&receipt, &raw_body);
     assert_eq!(
-        payload_event(&receipt, "request.received")["body_hash"],
-        serde_json::json!(expected.clone())
+        payload_event(&receipt, "route.selected")["target_route_id"],
+        serde_json::json!("raw-a:gpt-test")
+    );
+}
+
+#[tokio::test]
+async fn middleware_http_responses_path_preserves_raw_request_body_bytes() {
+    let (base, captured) = serve_raw_capture_openai_upstream().await;
+    let config = format!(
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}},"bearer_token":"upstream-token"}}]"#
+    );
+    let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "input": [
+    { "role": "user", "content": "responses raw body" }
+  ],
+  "metadata": { "z": 1, "a": ["kept", "ordered"] },
+  "model": "gpt-test"
+}"#
+    .to_vec();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer client-token-must-not-leak")
+                .body(Body::from(raw_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let receipt_id = resp
+        .headers()
+        .get("x-receipt-id")
+        .expect("middleware HTTP responses path must issue a receipt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = body_bytes(resp.into_body()).await;
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream should receive one responses request");
+    assert_eq!(
+        captured.path, "/v1/responses",
+        "responses surface must keep the caller path"
     );
     assert_eq!(
-        payload_event(&receipt, "middleware.forwarded")["body_hash"],
-        serde_json::json!(expected.clone())
+        captured.body, raw_body,
+        "responses middleware path must forward the exact request bytes"
     );
     assert_eq!(
-        payload_event(&receipt, "request.forwarded")["body_hash"],
-        serde_json::json!(expected)
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer upstream-token"),
+        "upstream authorization must come from upstream config, not the client request"
     );
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("middleware responses receipt should be retained");
+    assert_middleware_passthrough_hashes(&receipt, &raw_body);
+    assert_eq!(
+        payload_event(&receipt, "route.selected")["target_route_id"],
+        serde_json::json!("raw-a:gpt-test")
+    );
+}
+
+#[tokio::test]
+async fn middleware_http_embeddings_path_preserves_raw_request_body_bytes() {
+    let (base, captured) = serve_raw_capture_openai_upstream().await;
+    let config = format!(
+        r#"[{{"name":"raw-a","provider":"openai-compatible","base_url":"{base}","models":{{"gpt-test":"up-a"}},"bearer_token":"upstream-token"}}]"#
+    );
+    let (service, app) = setup_with_config_and_middleware(&config, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "input": ["embeddings raw body"],
+  "encoding_format": "float",
+  "metadata": { "z": 1, "a": ["kept", "ordered"] },
+  "stream": true,
+  "model": "gpt-test"
+}"#
+    .to_vec();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer client-token-must-not-leak")
+                .body(Body::from(raw_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let receipt_id = resp
+        .headers()
+        .get("x-receipt-id")
+        .expect("middleware HTTP embeddings path must issue a receipt")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let _ = body_bytes(resp.into_body()).await;
+    let captured = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream should receive one embeddings request");
+    assert_eq!(
+        captured.path, "/v1/embeddings",
+        "embeddings surface must keep the caller path"
+    );
+    assert_eq!(
+        captured.body, raw_body,
+        "embeddings middleware path must forward the exact request bytes even when stream=true is forced buffered locally"
+    );
+    assert_eq!(
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer upstream-token"),
+        "upstream authorization must come from upstream config, not the client request"
+    );
+
+    let receipt = service
+        .get_receipt_by_receipt_id(&receipt_id)
+        .expect("middleware embeddings receipt should be retained");
+    assert_middleware_passthrough_hashes(&receipt, &raw_body);
     assert_eq!(
         payload_event(&receipt, "route.selected")["target_route_id"],
         serde_json::json!("raw-a:gpt-test")
