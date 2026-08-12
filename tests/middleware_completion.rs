@@ -512,6 +512,47 @@ async fn configured_model_with_no_enabled_upstreams_returns_rate_limit() {
 }
 
 #[tokio::test]
+async fn unconfigured_model_with_no_upstreams_returns_rate_limit() {
+    let manager = upstream_manager(Vec::new());
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default());
+
+    let (status, headers, body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
+    assert!(headers.get("retry-after").is_some());
+}
+
+#[tokio::test]
+async fn disabled_only_upstreams_return_rate_limit_without_forwarding() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls.clone()).await;
+    let mut disabled = upstream_config("gpu-a", &upstream, "gpt-test", "up-a");
+    disabled.enabled = false;
+    let manager = upstream_manager(vec![disabled]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default());
+
+    let (status, headers, body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
+    assert!(headers.get("retry-after").is_some());
+    assert!(calls.bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn forwarding_uses_selected_route_and_finalizes_receipt() {
     let calls_a = Arc::new(CapturedCalls::default());
     let calls_b = Arc::new(CapturedCalls::default());

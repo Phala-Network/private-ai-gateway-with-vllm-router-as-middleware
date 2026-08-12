@@ -410,9 +410,18 @@ impl RouterBackend {
         input: CompletionInput,
     ) -> Response {
         let snapshot = self.upstream_config.snapshot();
+        let requested_model = input
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let public_model = match self.public_model(&snapshot) {
             Ok(Some(model)) => model,
-            Ok(None) => String::new(),
+            // With no enabled upstream, a single-model Router cannot derive the
+            // model catalog. Treat the requested model as temporarily
+            // unavailable so clients see the same capacity 429 they would get
+            // from PIG, instead of a malformed/unroutable request error.
+            Ok(None) => requested_model.clone().unwrap_or_default(),
             Err(err) => {
                 return errors::error_response(
                     input.surface,
@@ -425,10 +434,8 @@ impl RouterBackend {
         };
         let mut input = input;
         let requested_public_model = !public_model.is_empty()
-            && input
-                .params
-                .get("model")
-                .and_then(Value::as_str)
+            && requested_model
+                .as_deref()
                 .is_some_and(|model| model == public_model);
         let (routes, selected, configured_count) = self.ordered_routes(&public_model, &input);
         let user_tier = self.request_tier(&input);
