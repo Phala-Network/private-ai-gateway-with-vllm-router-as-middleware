@@ -30,6 +30,7 @@ const UPSTREAM_STATUS_GREEN: u8 = 0;
 const UPSTREAM_STATUS_YELLOW: u8 = 1;
 const UPSTREAM_STATUS_RED: u8 = 2;
 const PIG_PRESSURE_PASSTHROUGH_REASON: &str = "pig_pressure_passthrough";
+const PIG_PRESSURE_PASSTHROUGH_CANDIDATE_LIMIT: usize = 3;
 
 #[derive(Clone)]
 struct RouterRoute {
@@ -255,7 +256,7 @@ impl RouterBackend {
                     .selectable_route_ids(&routes, &self.config, tier)
                     .collect::<HashSet<_>>();
                 let selected_is_normally_selectable = selectable.contains(&selected.route_id);
-                let candidate_route_ids = if selected_is_normally_selectable {
+                let mut candidate_route_ids = if selected_is_normally_selectable {
                     selectable
                 } else {
                     routes
@@ -265,7 +266,7 @@ impl RouterBackend {
                 };
                 let pressure_order_keys = if selected.reason == PIG_PRESSURE_PASSTHROUGH_REASON {
                     let load_order = state.load_order(&routes, &self.config, tier);
-                    routes
+                    let ordered_pressure_keys = routes
                         .iter()
                         .filter(|route| candidate_route_ids.contains(&route.route_id))
                         .map(|route| {
@@ -274,7 +275,29 @@ impl RouterBackend {
                                 state.route_order_key(route, &self.config, tier, load_order),
                             )
                         })
-                        .collect::<HashMap<_, _>>()
+                        .collect::<HashMap<_, _>>();
+                    let mut ordered_route_ids = routes
+                        .iter()
+                        .filter(|route| candidate_route_ids.contains(&route.route_id))
+                        .map(|route| route.route_id.clone())
+                        .collect::<Vec<_>>();
+                    ordered_route_ids.sort_by(|a, b| {
+                        if a == &selected.route_id {
+                            return std::cmp::Ordering::Less;
+                        }
+                        if b == &selected.route_id {
+                            return std::cmp::Ordering::Greater;
+                        }
+                        ordered_pressure_keys
+                            .get(a)
+                            .cmp(&ordered_pressure_keys.get(b))
+                            .then_with(|| a.cmp(b))
+                    });
+                    candidate_route_ids = ordered_route_ids
+                        .into_iter()
+                        .take(PIG_PRESSURE_PASSTHROUGH_CANDIDATE_LIMIT)
+                        .collect::<HashSet<_>>();
+                    ordered_pressure_keys
                 } else {
                     HashMap::new()
                 };

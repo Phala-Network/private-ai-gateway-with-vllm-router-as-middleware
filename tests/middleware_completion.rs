@@ -879,6 +879,78 @@ async fn pressured_pig_passthrough_failovers_after_first_429() {
 }
 
 #[tokio::test]
+async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
+    let calls_a = Arc::new(CapturedCalls::default());
+    let calls_b = Arc::new(CapturedCalls::default());
+    let calls_c = Arc::new(CapturedCalls::default());
+    let calls_d = Arc::new(CapturedCalls::default());
+    let full_metrics = concat!(
+        "pig_dynamic_observed_running 10\n",
+        "pig_dynamic_observed_waiting 0\n",
+        "pig_dynamic_global_limit 10\n",
+        "pig_tier_basic_limit 9\n",
+        "pig_tier_inflight{tier=\"basic\"} 9\n",
+    );
+    let upstream_a = spawn_pig_upstream(
+        full_metrics,
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_a_full"}}),
+        calls_a.clone(),
+    )
+    .await;
+    let upstream_b = spawn_pig_upstream(
+        full_metrics,
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_b_full"}}),
+        calls_b.clone(),
+    )
+    .await;
+    let upstream_c = spawn_pig_upstream(
+        full_metrics,
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_c_full"}}),
+        calls_c.clone(),
+    )
+    .await;
+    let upstream_d = spawn_pig_upstream(
+        full_metrics,
+        StatusCode::OK,
+        json!({"object":"chat.completion","model":"up-d","choices":[]}),
+        calls_d.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![
+        upstream_config("gpu-a", &upstream_a, "gpt-test", "up-a"),
+        upstream_config("gpu-b", &upstream_b, "gpt-test", "up-b"),
+        upstream_config("gpu-c", &upstream_c, "gpt-test", "up-c"),
+        upstream_config("gpu-d", &upstream_d, "gpt-test", "up-d"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            metrics_poll_ms: 10,
+            metrics_stale_ms: 10_000,
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (status, _headers, body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_c.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_d.bodies.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
 async fn untrusted_user_tier_header_is_not_forwarded_by_default() {
     let calls = Arc::new(CapturedCalls::default());
     let upstream = spawn_openai_upstream(

@@ -56,7 +56,15 @@ real admission decision. This keeps the learning loop observable.
      next least-pressured hard-eligible route instead of stopping at the first
      rejected node.
 
-4. Update aggregate status semantics:
+4. Bound the pressure fallback walk:
+   - `pig_pressure_passthrough` passes at most the first three pressure-ordered
+     candidates into verified forwarding;
+   - the cap is count-based, not time-based, so it cannot abort an accepted
+     generation request;
+   - if all three candidates return capacity signals, the existing forwarding
+     path returns the final real upstream 429.
+
+5. Update aggregate status semantics:
    - green: at least one route has clear capacity;
    - yellow: no clear capacity, but at least one hard-eligible route can still
      receive passthrough/probe traffic;
@@ -70,6 +78,7 @@ Add or update tests for:
   `pig_pressure_passthrough`;
 - passthrough mode supplies multiple ordered candidates, so a 429 from the first
   pressured PIG can fail over to a later PIG that still accepts the request;
+- passthrough mode supplies at most the first three pressure-ordered candidates;
 - PIG/upstream 429 is preserved to the client;
 - no configured/enabled route still returns the PIG-shaped Router 429;
 - `/v1/upstream-status` returns yellow for soft-pressure-only exhaustion and red
