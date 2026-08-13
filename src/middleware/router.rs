@@ -29,6 +29,7 @@ const MAX_ROUTING_HISTORY_CHARS: usize = 16_384;
 const UPSTREAM_STATUS_GREEN: u8 = 0;
 const UPSTREAM_STATUS_YELLOW: u8 = 1;
 const UPSTREAM_STATUS_RED: u8 = 2;
+const PIG_PRESSURE_PASSTHROUGH_REASON: &str = "pig_pressure_passthrough";
 
 #[derive(Clone)]
 struct RouterRoute {
@@ -47,6 +48,7 @@ struct RouteStats {
     selected_by_load: u64,
     selected_by_order: u64,
     cache_rejected_by_pressure: u64,
+    pressure_passthrough: u64,
 }
 
 #[derive(Default)]
@@ -252,9 +254,33 @@ impl RouterBackend {
                 let selectable = state
                     .selectable_route_ids(&routes, &self.config, tier)
                     .collect::<HashSet<_>>();
+                let selected_is_normally_selectable = selectable.contains(&selected.route_id);
+                let candidate_route_ids = if selected_is_normally_selectable {
+                    selectable
+                } else {
+                    routes
+                        .iter()
+                        .map(|route| route.route_id.clone())
+                        .collect::<HashSet<_>>()
+                };
+                let pressure_order_keys = if selected.reason == PIG_PRESSURE_PASSTHROUGH_REASON {
+                    let load_order = state.load_order(&routes, &self.config, tier);
+                    routes
+                        .iter()
+                        .filter(|route| candidate_route_ids.contains(&route.route_id))
+                        .map(|route| {
+                            (
+                                route.route_id.clone(),
+                                state.route_order_key(route, &self.config, tier, load_order),
+                            )
+                        })
+                        .collect::<HashMap<_, _>>()
+                } else {
+                    HashMap::new()
+                };
                 let loads = routes
                     .iter()
-                    .filter(|route| selectable.contains(&route.route_id))
+                    .filter(|route| candidate_route_ids.contains(&route.route_id))
                     .map(|route| {
                         (
                             route.route_id.clone(),
@@ -265,19 +291,25 @@ impl RouterBackend {
                     })
                     .collect::<HashMap<_, _>>();
                 state.mark_started(&selected);
-                (selected, selectable, loads)
+                (selected, candidate_route_ids, loads, pressure_order_keys)
             })
         };
-        let Some((selected, selectable, loads)) = selection else {
+        let Some((selected, candidate_route_ids, loads, pressure_order_keys)) = selection else {
             return (Vec::new(), None, configured_count);
         };
-        routes.retain(|route| selectable.contains(&route.route_id));
+        routes.retain(|route| candidate_route_ids.contains(&route.route_id));
         routes.sort_by(|a, b| {
             if a.route_id == selected.route_id {
                 return std::cmp::Ordering::Less;
             }
             if b.route_id == selected.route_id {
                 return std::cmp::Ordering::Greater;
+            }
+            if let (Some(a_key), Some(b_key)) = (
+                pressure_order_keys.get(&a.route_id),
+                pressure_order_keys.get(&b.route_id),
+            ) {
+                return a_key.cmp(b_key);
             }
             let a_load = loads.get(&a.route_id).copied().unwrap_or(0);
             let b_load = loads.get(&b.route_id).copied().unwrap_or(0);
@@ -314,9 +346,11 @@ impl RouterBackend {
                     "selected_by_load": stats.selected_by_load,
                     "selected_by_order": stats.selected_by_order,
                     "cache_rejected_by_pressure": stats.cache_rejected_by_pressure,
+                    "pressure_passthrough": stats.pressure_passthrough,
                     "cache_records": cache_stats.records,
                     "cache_chars": cache_stats.chars,
                     "selectable": !pressure.blocked,
+                    "pressure_passthrough_eligible": pressure.blocked,
                     "effective_running": pressure.effective_running,
                     "pending_reservations": pressure.pending_reservations,
                     "unreconciled_dispatches": pressure.unreconciled_dispatches,
@@ -586,6 +620,9 @@ impl RouterState {
             "single" => {
                 stats.selected_by_order = stats.selected_by_order.saturating_add(1);
             }
+            PIG_PRESSURE_PASSTHROUGH_REASON => {
+                stats.pressure_passthrough = stats.pressure_passthrough.saturating_add(1);
+            }
             _ => {
                 stats.selected_by_load = stats.selected_by_load.saturating_add(1);
             }
@@ -835,12 +872,6 @@ impl RouterState {
         if routes.is_empty() {
             return UPSTREAM_STATUS_RED;
         }
-        if !routes
-            .iter()
-            .any(|route| self.route_selectable(route, config, tier))
-        {
-            return UPSTREAM_STATUS_RED;
-        }
         let mut saw_yellow = false;
         for route in routes {
             match self.route_status_code(route, config, tier) {
@@ -864,7 +895,7 @@ impl RouterState {
     ) -> u8 {
         let pressure = self.route_pressure(route, config, tier);
         if pressure.blocked || pressure.waiting > 0 || pressure.fullness_milli >= 1_000 {
-            return UPSTREAM_STATUS_RED;
+            return UPSTREAM_STATUS_YELLOW;
         }
         if pressure.metrics_missing || pressure.fullness_milli >= 850 {
             return UPSTREAM_STATUS_YELLOW;
@@ -906,16 +937,16 @@ impl RouterState {
             .map(|route| route.route_id.clone())
             .collect::<HashSet<_>>();
         self.cache_index.retain_model_routes(model, &active_routes);
-        let routes = routes
+        let selectable_routes = routes
             .iter()
             .filter(|route| self.route_selectable(route, config, tier))
             .cloned()
             .collect::<Vec<_>>();
-        if routes.is_empty() {
-            return None;
+        if selectable_routes.is_empty() {
+            return self.select_pressure_passthrough(model, text, routes, config, tier);
         }
-        if routes.len() == 1 {
-            let route_id = routes[0].route_id.clone();
+        if selectable_routes.len() == 1 {
+            let route_id = selectable_routes[0].route_id.clone();
             let running_at_select = self.stats.get(&route_id).map_or(0, |s| s.running);
             if active_routes.len() > 1 && !text.is_empty() {
                 if let Some(matched) = self.cache_index.match_prefix(model, text) {
@@ -946,17 +977,18 @@ impl RouterState {
         }
 
         let selected = if text.is_empty() {
-            self.least_loaded(&routes, config, tier).map(|route| {
-                let pressure = self.route_pressure(route, config, tier);
-                RouteSelection {
-                    route_id: route.route_id.clone(),
-                    reason: "no_text",
-                    cache_match_rate: 0.0,
-                    running_at_select: pressure.effective_running,
-                }
-            })
+            self.least_loaded(&selectable_routes, config, tier)
+                .map(|route| {
+                    let pressure = self.route_pressure(route, config, tier);
+                    RouteSelection {
+                        route_id: route.route_id.clone(),
+                        reason: "no_text",
+                        cache_match_rate: 0.0,
+                        running_at_select: pressure.effective_running,
+                    }
+                })
         } else {
-            self.select_cache_aware(model, text, &routes, config, tier)
+            self.select_cache_aware(model, text, &selectable_routes, config, tier)
         }?;
 
         self.record_cache(
@@ -966,6 +998,32 @@ impl RouterState {
             config.max_history_per_route,
         );
         Some(selected)
+    }
+
+    fn select_pressure_passthrough(
+        &mut self,
+        model: &str,
+        text: &str,
+        routes: &[RouterRoute],
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> Option<RouteSelection> {
+        let selected = self.least_loaded(routes, config, tier)?;
+        let pressure = self.route_pressure(selected, config, tier);
+        if !text.is_empty() {
+            self.record_cache(
+                model,
+                &selected.route_id,
+                text,
+                config.max_history_per_route,
+            );
+        }
+        Some(RouteSelection {
+            route_id: selected.route_id.clone(),
+            reason: PIG_PRESSURE_PASSTHROUGH_REASON,
+            cache_match_rate: 0.0,
+            running_at_select: pressure.effective_running,
+        })
     }
 
     fn select_cache_aware(
@@ -1770,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn local_reservation_consumes_single_request_aware_inspect_slot() {
+    fn local_reservation_exhaustion_passthroughs_to_pig() {
         let mut state = RouterState::default();
         let config = MiddlewareConfig::default();
         let routes = vec![test_route("new:m")];
@@ -1788,16 +1846,15 @@ mod tests {
         assert!(pressure.blocked);
         assert_eq!(pressure.effective_running, 3);
         assert_eq!(pressure.fullness_milli, 1_000);
-        assert!(
-            state
-                .select("m", "second", &routes, &config, UserTier::Basic)
-                .is_none(),
-            "a second dispatcher reused the same inspect slot"
-        );
+        let second = state
+            .select("m", "second", &routes, &config, UserTier::Basic)
+            .expect("soft PIG pressure should passthrough to PIG");
+        assert_eq!(second.route_id, "new:m");
+        assert_eq!(second.reason, PIG_PRESSURE_PASSTHROUGH_REASON);
     }
 
     #[test]
-    fn concurrent_burst_cannot_reuse_one_request_aware_inspect_slot() {
+    fn concurrent_burst_passthroughs_after_request_aware_slot_is_spent() {
         const DISPATCHERS: usize = 16;
         let state = Arc::new(Mutex::new(RouterState::default()));
         let config = Arc::new(MiddlewareConfig::default());
@@ -1824,21 +1881,20 @@ mod tests {
                         &config,
                         UserTier::Basic,
                     );
-                    if let Some(selected) = selected {
-                        state.mark_started(&selected);
-                        1usize
-                    } else {
-                        0usize
-                    }
+                    let selected = selected.expect("soft PIG pressure should not pre-reject");
+                    let passthrough =
+                        usize::from(selected.reason == PIG_PRESSURE_PASSTHROUGH_REASON);
+                    state.mark_started(&selected);
+                    passthrough
                 })
             })
             .collect::<Vec<_>>();
-        let admitted = handles
+        let passthroughs = handles
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .sum::<usize>();
 
-        assert_eq!(admitted, 1);
+        assert_eq!(passthroughs, DISPATCHERS - 1);
     }
 
     #[test]
@@ -1850,9 +1906,10 @@ mod tests {
             "new".to_string(),
             request_aware_metrics(3.0, 0.0, true, 3.0),
         );
-        assert!(state
+        let pressured = state
             .select("m", "blocked", &routes, &config, UserTier::Basic)
-            .is_none());
+            .unwrap();
+        assert_eq!(pressured.reason, PIG_PRESSURE_PASSTHROUGH_REASON);
 
         state.update_upstream_metrics(
             "new".to_string(),
@@ -2285,7 +2342,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_status_returns_red_when_all_routes_are_blocked() {
+    fn upstream_status_returns_yellow_when_all_routes_are_soft_blocked() {
         let mut state = RouterState::default();
         let config = MiddlewareConfig::default();
         let routes = vec![test_route("a:m"), test_route("b:m")];
@@ -2294,12 +2351,12 @@ mod tests {
 
         assert_eq!(
             state.upstream_status_code(&routes, &config, UserTier::Basic),
-            UPSTREAM_STATUS_RED
+            UPSTREAM_STATUS_YELLOW
         );
     }
 
     #[test]
-    fn upstream_status_treats_basic_full_as_red() {
+    fn upstream_status_treats_basic_full_as_yellow() {
         let mut state = RouterState::default();
         let config = MiddlewareConfig::default();
         let routes = vec![test_route("a:m")];
@@ -2307,7 +2364,7 @@ mod tests {
 
         assert_eq!(
             state.upstream_status_code(&routes, &config, UserTier::Basic),
-            UPSTREAM_STATUS_RED
+            UPSTREAM_STATUS_YELLOW
         );
         assert_eq!(
             state.upstream_status_code(&routes, &config, UserTier::Premium),

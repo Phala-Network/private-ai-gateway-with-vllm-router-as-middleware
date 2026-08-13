@@ -313,6 +313,65 @@ async fn spawn_openai_streaming_upstream(id: &'static str, calls: Arc<CapturedCa
     format!("http://{addr}")
 }
 
+async fn spawn_pig_upstream(
+    metrics: &'static str,
+    status: StatusCode,
+    body: Value,
+    calls: Arc<CapturedCalls>,
+) -> String {
+    let response_body = Arc::new(body);
+    let app = Router::new()
+        .route(
+            "/v1/metrics",
+            axum::routing::get(move || async move { (StatusCode::OK, metrics) }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, raw: Bytes| {
+                let calls = calls.clone();
+                let response_body = response_body.clone();
+                async move {
+                    let parsed = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
+                    calls.bodies.lock().unwrap().push(parsed);
+                    calls
+                        .headers
+                        .lock()
+                        .unwrap()
+                        .push(capture_headers(&headers));
+                    (status, Json((*response_body).clone()))
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_pressured_pig_upstream(calls: Arc<CapturedCalls>) -> String {
+    spawn_pig_upstream(
+        concat!(
+            "pig_dynamic_observed_running 10\n",
+            "pig_dynamic_observed_waiting 0\n",
+            "pig_dynamic_global_limit 10\n",
+            "pig_tier_basic_limit 9\n",
+            "pig_tier_inflight{tier=\"basic\"} 9\n",
+        ),
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": {
+                "message": "PIG says capacity is full",
+                "type": "rate_limit_error",
+                "code": "pig_capacity_full"
+            }
+        }),
+        calls,
+    )
+    .await
+}
+
 fn capture_headers(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
@@ -691,6 +750,132 @@ async fn disabled_upstream_is_visible_but_not_routed() {
         .find(|route| route["route_id"] == json!("gpu-a:gpt-test"))
         .unwrap();
     assert_eq!(disabled_route["enabled"], json!(false));
+}
+
+#[tokio::test]
+async fn pressured_pig_route_is_forwarded_instead_of_router_prerejected() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_pressured_pig_upstream(calls.clone()).await;
+    let manager = upstream_manager(vec![upstream_config(
+        "gpu-a", &upstream, "gpt-test", "up-a",
+    )]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            metrics_poll_ms: 10,
+            metrics_stale_ms: 10_000,
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (status, _, _body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 429);
+    assert_eq!(calls.bodies.lock().unwrap().len(), 1);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    let route = route_snapshot(&snapshot, "gpu-a:gpt-test");
+    assert_eq!(route["selectable"], json!(false));
+    assert_eq!(route["pressure_passthrough"], json!(1));
+}
+
+#[tokio::test]
+async fn pressured_pig_passthrough_failovers_after_first_429() {
+    let calls_a = Arc::new(CapturedCalls::default());
+    let calls_b = Arc::new(CapturedCalls::default());
+    let calls_c = Arc::new(CapturedCalls::default());
+    let upstream_a = spawn_pig_upstream(
+        concat!(
+            "pig_dynamic_observed_running 1\n",
+            "pig_dynamic_observed_waiting 1\n",
+            "pig_dynamic_global_limit 10\n",
+            "pig_tier_basic_limit 9\n",
+            "pig_tier_inflight{tier=\"basic\"} 1\n",
+        ),
+        StatusCode::OK,
+        json!({"object":"chat.completion","model":"up-a","choices":[]}),
+        calls_a.clone(),
+    )
+    .await;
+    let upstream_b = spawn_pig_upstream(
+        concat!(
+            "pig_dynamic_observed_running 11\n",
+            "pig_dynamic_observed_waiting 0\n",
+            "pig_dynamic_global_limit 10\n",
+            "pig_tier_basic_limit 9\n",
+            "pig_tier_inflight{tier=\"basic\"} 9\n",
+        ),
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_b_full"}}),
+        calls_b.clone(),
+    )
+    .await;
+    let upstream_c = spawn_pig_upstream(
+        concat!(
+            "pig_dynamic_observed_running 10\n",
+            "pig_dynamic_observed_waiting 0\n",
+            "pig_dynamic_global_limit 10\n",
+            "pig_tier_basic_limit 9\n",
+            "pig_tier_inflight{tier=\"basic\"} 9\n",
+        ),
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_c_full"}}),
+        calls_c.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![
+        upstream_config("gpu-a", &upstream_a, "gpt-test", "up-a"),
+        upstream_config("gpu-b", &upstream_b, "gpt-test", "up-b"),
+        upstream_config("gpu-c", &upstream_c, "gpt-test", "up-c"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            metrics_poll_ms: 10,
+            metrics_stale_ms: 10_000,
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let (status, headers, body) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "hello"))
+            .await,
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_eq!(body["model"], json!("gpt-test"));
+    assert_eq!(calls_c.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-c:gpt-test")["pressure_passthrough"],
+        json!(1)
+    );
+
+    let receipt_id = headers
+        .get("x-receipt-id")
+        .expect("receipt id header")
+        .to_str()
+        .expect("receipt id is ascii");
+    let receipt = service
+        .get_receipt_by_receipt_id(receipt_id)
+        .expect("receipt is stored");
+    let payload = receipt.document_json().expect("receipt json parses");
+    assert_eq!(
+        receipt_event(&payload, EVENT_ROUTE_SELECTED)["target_route_id"],
+        json!("gpu-a:gpt-test")
+    );
 }
 
 #[tokio::test]
