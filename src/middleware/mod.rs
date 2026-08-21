@@ -60,6 +60,10 @@ impl Middleware {
         self.router.upstream_status_code()
     }
 
+    pub fn metrics_body(&self) -> Result<Vec<u8>, prometheus::Error> {
+        self.router.metrics_body()
+    }
+
     /// Whether this request host should require a verified TEE upstream.
     ///
     /// The caller must pass the normalized request `Host` domain. We match

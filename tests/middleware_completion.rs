@@ -568,6 +568,8 @@ async fn configured_model_with_no_enabled_upstreams_returns_rate_limit() {
     assert_eq!(body["error"]["type"], json!("rate_limit_error"));
     assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
     assert!(headers.get("retry-after").is_some());
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_cache_record_skipped_total{reason=\"router_reject\"} 1"));
 }
 
 #[tokio::test]
@@ -783,6 +785,9 @@ async fn pressured_pig_route_is_forwarded_instead_of_router_prerejected() {
     let route = route_snapshot(&snapshot, "gpu-a:gpt-test");
     assert_eq!(route["selectable"], json!(false));
     assert_eq!(route["pressure_passthrough"], json!(1));
+    assert_eq!(route["cache_records"], json!(0));
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_cache_record_skipped_total{reason=\"upstream_429\"} 1"));
 }
 
 #[tokio::test]
@@ -861,6 +866,18 @@ async fn pressured_pig_passthrough_failovers_after_first_429() {
     assert_eq!(
         route_snapshot(&snapshot, "gpu-c:gpt-test")["pressure_passthrough"],
         json!(1)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(1)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-b:gpt-test")["cache_records"],
+        json!(0)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-c:gpt-test")["cache_records"],
+        json!(0)
     );
 
     let receipt_id = headers
@@ -948,6 +965,17 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_c.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_d.bodies.lock().unwrap().len(), 0);
+    let snapshot = mw.admin_snapshot().unwrap();
+    for route in [
+        "gpu-a:gpt-test",
+        "gpu-b:gpt-test",
+        "gpu-c:gpt-test",
+        "gpu-d:gpt-test",
+    ] {
+        assert_eq!(route_snapshot(&snapshot, route)["cache_records"], json!(0));
+    }
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_cache_record_skipped_total{reason=\"upstream_429\"} 1"));
 }
 
 #[tokio::test]
@@ -1078,6 +1106,77 @@ async fn cache_aware_selection_keeps_similar_prefix_on_same_route() {
 }
 
 #[tokio::test]
+async fn failover_records_only_the_upstream_that_actually_succeeded() {
+    let calls_a = Arc::new(CapturedCalls::default());
+    let calls_b = Arc::new(CapturedCalls::default());
+    let upstream_a = spawn_openai_upstream(
+        "chat-a",
+        429,
+        json!({"error":{"type":"rate_limit_error","message":"full"}}),
+        calls_a.clone(),
+    )
+    .await;
+    let upstream_b = spawn_openai_upstream(
+        "chat-b",
+        200,
+        json!({
+            "object":"chat.completion",
+            "model":"up-b",
+            "choices":[],
+            "usage":{
+                "prompt_tokens":32,
+                "completion_tokens":4,
+                "prompt_tokens_details":{"cached_tokens":16}
+            }
+        }),
+        calls_b.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![
+        upstream_config("gpu-a", &upstream_a, "gpt-test", "up-a"),
+        upstream_config("gpu-b", &upstream_b, "gpt-test", "up-b"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            cache_threshold: 0.25,
+            ..Default::default()
+        },
+    );
+
+    for prompt in ["shared failover prefix one", "shared failover prefix two"] {
+        let (status, _, _) = response_parts(
+            mw.handle_completion(&service, chat_input("gpt-test", prompt))
+                .await,
+        )
+        .await;
+        assert_eq!(status, 200);
+    }
+
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 2);
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(0)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-b:gpt-test")["cache_records"],
+        json!(2)
+    );
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-b:gpt-test")["selected_by_cache"],
+        json!(1)
+    );
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_cache_record_committed_total{route=\"gpu-b:gpt-test\"} 2"));
+    assert!(metrics.contains(
+        "router_cache_cached_tokens_total{route=\"gpu-b:gpt-test\",selection_reason=\"cache\"} 16"
+    ));
+}
+
+#[tokio::test]
 async fn disabled_upstream_cache_is_removed_before_selection() {
     let calls_a = Arc::new(CapturedCalls::default());
     let calls_b = Arc::new(CapturedCalls::default());
@@ -1195,6 +1294,10 @@ async fn streaming_running_count_stays_until_body_is_consumed() {
         route_running(&mw.admin_snapshot().unwrap(), "gpu-a:gpt-test"),
         0
     );
+    assert_eq!(
+        route_snapshot(&mw.admin_snapshot().unwrap(), "gpu-a:gpt-test")["cache_records"],
+        json!(1)
+    );
     assert_eq!(calls.bodies.lock().unwrap()[0]["model"], json!("gpt-test"));
 
     let receipt = service
@@ -1220,6 +1323,83 @@ async fn streaming_running_count_stays_until_body_is_consumed() {
 }
 
 #[tokio::test]
+async fn streaming_cancel_before_first_data_does_not_record_cache() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_streaming_upstream("chat-stream", calls).await;
+    let manager = upstream_manager(vec![upstream_config(
+        "gpu-a", &upstream, "gpt-test", "up-a",
+    )]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default());
+    let raw_body = br#"{
+  "stream": true,
+  "messages": [{"role":"user","content":"cancel before first data"}],
+  "model": "gpt-test"
+}"#
+    .to_vec();
+    let input = CompletionInput {
+        endpoint: Endpoint::ChatComplete,
+        endpoint_path: "/v1/chat/completions",
+        surface: Surface::Openai,
+        params: serde_json::from_slice(&raw_body).unwrap(),
+        received_body: raw_body,
+        requester: None,
+        aci_required: false,
+        aci_session_ids: Vec::new(),
+        request_id: "req-stream-cancel-before-data".to_string(),
+        user_model: Some("gpt-test".to_string()),
+        user_tier: None,
+        stream: true,
+    };
+
+    let response = mw.handle_completion(&service, input).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(route_running(&snapshot, "gpu-a:gpt-test"), 0);
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(0)
+    );
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains(
+        "router_cache_record_skipped_total{reason=\"client_cancel_before_first_token\"} 1"
+    ));
+}
+
+#[tokio::test]
+async fn streaming_cancel_after_first_data_records_cache_once() {
+    let calls = Arc::new(CapturedCalls::default());
+    let upstream = spawn_openai_streaming_upstream("chat-stream", calls).await;
+    let manager = upstream_manager(vec![upstream_config(
+        "gpu-a", &upstream, "gpt-test", "up-a",
+    )]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(manager, MiddlewareConfig::default());
+    let mut input = chat_input("gpt-test", "cancel after first data");
+    input.params["stream"] = json!(true);
+    input.received_body = serde_json::to_vec(&input.params).unwrap();
+    input.stream = true;
+
+    let response = mw.handle_completion(&service, input).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = body.next().await.expect("first stream item").unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("\"content\":\"hi\""));
+    drop(body);
+
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(route_running(&snapshot, "gpu-a:gpt-test"), 0);
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(1)
+    );
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_cache_record_committed_total{route=\"gpu-a:gpt-test\"} 1"));
+}
+
+#[tokio::test]
 async fn upstream_verification_failure_fails_closed_before_forwarding() {
     let calls = Arc::new(CapturedCalls::default());
     let upstream = spawn_openai_upstream("up-a", 200, json!({}), calls.clone()).await;
@@ -1240,6 +1420,13 @@ async fn upstream_verification_failure_fails_closed_before_forwarding() {
         .unwrap()
         .contains("fixture verification failed"));
     assert!(calls.bodies.lock().unwrap().is_empty());
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["cache_records"],
+        json!(0)
+    );
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_cache_record_skipped_total{reason=\"verification_error\"} 1"));
 }
 
 #[tokio::test]

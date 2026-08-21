@@ -10,6 +10,9 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+};
 use serde_json::{json, Value};
 
 use crate::aggregator::service::{AciService, MiddlewareAttemptObserver};
@@ -159,6 +162,7 @@ pub(super) struct RouterBackend {
     upstream_config: Arc<UpstreamConfigManager>,
     config: MiddlewareConfig,
     state: Arc<Mutex<RouterState>>,
+    metrics: RouterMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +177,347 @@ pub(super) struct RouteInFlight {
     route_id: Option<String>,
     pending_dispatch: bool,
     state: Arc<Mutex<RouterState>>,
+    cache_observation: Option<CacheObservation>,
+}
+
+#[derive(Clone)]
+struct RouterMetrics {
+    registry: Registry,
+    affinity_considered_total: IntCounterVec,
+    affinity_selected_total: IntCounterVec,
+    affinity_success_total: IntCounterVec,
+    affinity_retarget_total: IntCounterVec,
+    affinity_rejected_total: IntCounterVec,
+    cache_record_committed_total: IntCounterVec,
+    cache_record_skipped_total: IntCounterVec,
+    cache_usage_skipped_total: IntCounterVec,
+    cache_match_rate: HistogramVec,
+    cache_match_chars: HistogramVec,
+    cache_prompt_tokens_total: IntCounterVec,
+    cache_cached_tokens_total: IntCounterVec,
+}
+
+pub(super) struct CacheObservation {
+    state: Arc<Mutex<RouterState>>,
+    metrics: RouterMetrics,
+    model: String,
+    routing_text: String,
+    max_records: usize,
+    initial_route: String,
+    actual_route: String,
+    selection_reason: &'static str,
+    record_resolved: bool,
+    record_committed: bool,
+    usage_resolved: bool,
+}
+
+impl RouterMetrics {
+    fn new() -> Result<Self, String> {
+        let registry = Registry::new();
+        let affinity_considered_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_affinity_considered_total",
+                "Prefix-cache affinity candidates considered by route.",
+            ),
+            &["route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let affinity_selected_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_affinity_selected_total",
+                "Requests whose initial route was selected by prefix-cache affinity.",
+            ),
+            &["route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let affinity_success_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_affinity_success_total",
+                "Cache-selected requests committed after a successful upstream response.",
+            ),
+            &["route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let affinity_retarget_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_affinity_retarget_total",
+                "Cache-selected requests ultimately served by a different route.",
+            ),
+            &["from_route", "to_route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let affinity_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_affinity_rejected_total",
+                "Prefix-cache affinity candidates rejected by a bounded reason.",
+            ),
+            &["reason"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_record_committed_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_record_committed_total",
+                "Cache-index records committed after confirmed upstream success.",
+            ),
+            &["route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_record_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_record_skipped_total",
+                "Cache-index records skipped before confirmed upstream success.",
+            ),
+            &["reason"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_usage_skipped_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_usage_skipped_total",
+                "Successful cache observations without usable token-level cache telemetry.",
+            ),
+            &["reason"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_match_rate = HistogramVec::new(
+            HistogramOpts::new(
+                "router_cache_match_rate",
+                "Character prefix match ratio for considered affinity candidates.",
+            )
+            .buckets(vec![0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.0]),
+            &["route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_match_chars = HistogramVec::new(
+            HistogramOpts::new(
+                "router_cache_match_chars",
+                "Matched routing characters for considered affinity candidates.",
+            )
+            .buckets(vec![
+                64.0, 256.0, 1_024.0, 2_048.0, 4_096.0, 8_192.0, 16_384.0,
+            ]),
+            &["route"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_prompt_tokens_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_prompt_tokens_total",
+                "Prompt tokens reported for successful routed requests.",
+            ),
+            &["route", "selection_reason"],
+        )
+        .map_err(|err| err.to_string())?;
+        let cache_cached_tokens_total = IntCounterVec::new(
+            Opts::new(
+                "router_cache_cached_tokens_total",
+                "Cached prompt tokens reported for successful routed requests.",
+            ),
+            &["route", "selection_reason"],
+        )
+        .map_err(|err| err.to_string())?;
+
+        for collector in [
+            &affinity_considered_total,
+            &affinity_selected_total,
+            &affinity_success_total,
+            &affinity_retarget_total,
+            &affinity_rejected_total,
+            &cache_record_committed_total,
+            &cache_record_skipped_total,
+            &cache_usage_skipped_total,
+            &cache_prompt_tokens_total,
+            &cache_cached_tokens_total,
+        ] {
+            registry
+                .register(Box::new(collector.clone()))
+                .map_err(|err| err.to_string())?;
+        }
+        registry
+            .register(Box::new(cache_match_rate.clone()))
+            .map_err(|err| err.to_string())?;
+        registry
+            .register(Box::new(cache_match_chars.clone()))
+            .map_err(|err| err.to_string())?;
+
+        Ok(Self {
+            registry,
+            affinity_considered_total,
+            affinity_selected_total,
+            affinity_success_total,
+            affinity_retarget_total,
+            affinity_rejected_total,
+            cache_record_committed_total,
+            cache_record_skipped_total,
+            cache_usage_skipped_total,
+            cache_match_rate,
+            cache_match_chars,
+            cache_prompt_tokens_total,
+            cache_cached_tokens_total,
+        })
+    }
+
+    fn render(&self) -> Result<Vec<u8>, prometheus::Error> {
+        let encoder = TextEncoder::new();
+        let mut body = Vec::new();
+        encoder.encode(&self.registry.gather(), &mut body)?;
+        Ok(body)
+    }
+
+    fn record_affinity_considered(&self, route: &str, rate: f32, matched_chars: usize) {
+        self.affinity_considered_total
+            .with_label_values(&[route])
+            .inc();
+        self.cache_match_rate
+            .with_label_values(&[route])
+            .observe(f64::from(rate));
+        self.cache_match_chars
+            .with_label_values(&[route])
+            .observe(matched_chars as f64);
+    }
+
+    fn record_affinity_selected(&self, route: &str) {
+        self.affinity_selected_total
+            .with_label_values(&[route])
+            .inc();
+    }
+
+    fn record_affinity_rejected(&self, reason: &'static str) {
+        self.affinity_rejected_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    fn record_cache_committed(&self, route: &str) {
+        self.cache_record_committed_total
+            .with_label_values(&[route])
+            .inc();
+    }
+
+    fn record_cache_skipped(&self, reason: &'static str) {
+        self.cache_record_skipped_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    fn record_usage_skipped(&self, reason: &'static str) {
+        self.cache_usage_skipped_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+}
+
+impl CacheObservation {
+    fn new(
+        state: Arc<Mutex<RouterState>>,
+        metrics: RouterMetrics,
+        model: String,
+        routing_text: String,
+        max_records: usize,
+        selection: &RouteSelection,
+    ) -> Option<Self> {
+        if routing_text.is_empty() || max_records == 0 {
+            return None;
+        }
+        Some(Self {
+            state,
+            metrics,
+            model,
+            routing_text,
+            max_records,
+            initial_route: selection.route_id.clone(),
+            actual_route: selection.route_id.clone(),
+            selection_reason: selection.reason,
+            record_resolved: false,
+            record_committed: false,
+            usage_resolved: false,
+        })
+    }
+
+    fn retarget(&mut self, route_id: &str) {
+        self.actual_route.clear();
+        self.actual_route.push_str(route_id);
+    }
+
+    pub(super) fn commit(&mut self) {
+        if self.record_resolved {
+            return;
+        }
+        {
+            let mut state = self.state.lock().expect("router state poisoned");
+            state.record_cache(
+                &self.model,
+                &self.actual_route,
+                &self.routing_text,
+                self.max_records,
+            );
+        }
+        self.metrics.record_cache_committed(&self.actual_route);
+        if self.selection_reason == "cache" {
+            self.metrics
+                .affinity_success_total
+                .with_label_values(&[&self.actual_route])
+                .inc();
+            if self.initial_route != self.actual_route {
+                self.metrics
+                    .affinity_retarget_total
+                    .with_label_values(&[&self.initial_route, &self.actual_route])
+                    .inc();
+            }
+        }
+        self.record_resolved = true;
+        self.record_committed = true;
+    }
+
+    pub(super) fn skip(&mut self, reason: &'static str) {
+        if self.record_resolved {
+            return;
+        }
+        self.metrics.record_cache_skipped(reason);
+        self.record_resolved = true;
+    }
+
+    pub(super) fn is_committed(&self) -> bool {
+        self.record_committed
+    }
+
+    pub(super) fn record_usage(&mut self, usage: Option<&Value>) {
+        if self.usage_resolved {
+            return;
+        }
+        self.usage_resolved = true;
+        let Some(usage) = usage else {
+            self.metrics.record_usage_skipped("no_usage");
+            return;
+        };
+        let Some(prompt_tokens) = usage_prompt_tokens(usage) else {
+            self.metrics.record_usage_skipped("prompt_tokens_missing");
+            return;
+        };
+        self.metrics
+            .cache_prompt_tokens_total
+            .with_label_values(&[&self.actual_route, self.selection_reason])
+            .inc_by(prompt_tokens);
+        let Some(cached_tokens) = usage_cached_tokens(usage) else {
+            self.metrics.record_usage_skipped("cached_tokens_missing");
+            return;
+        };
+        self.metrics
+            .cache_cached_tokens_total
+            .with_label_values(&[&self.actual_route, self.selection_reason])
+            .inc_by(cached_tokens);
+    }
+}
+
+impl Drop for CacheObservation {
+    fn drop(&mut self) {
+        if !self.record_resolved {
+            self.metrics.record_cache_skipped("request_dropped");
+            self.record_resolved = true;
+        }
+        if !self.usage_resolved && self.record_committed {
+            self.metrics.record_usage_skipped("no_usage");
+            self.usage_resolved = true;
+        }
+    }
 }
 
 impl RouterBackend {
@@ -188,11 +533,13 @@ impl RouterBackend {
             return Err("middleware.public_model must not be empty".to_string());
         }
         let state = Arc::new(Mutex::new(RouterState::default()));
+        let metrics = RouterMetrics::new()?;
         spawn_metrics_poller(config.clone(), upstream_config.clone(), state.clone());
         Ok(Self {
             upstream_config,
             config: config.clone(),
             state,
+            metrics,
         })
     }
 
@@ -235,11 +582,11 @@ impl RouterBackend {
         &self,
         public_model: &str,
         input: &CompletionInput,
-    ) -> (Vec<RouterRoute>, Option<RouteSelection>, usize) {
+    ) -> (Vec<RouterRoute>, Option<RouteSelection>, usize, String) {
         let tier = self.request_tier(input);
         let requested_model = input.params.get("model").and_then(Value::as_str);
         if requested_model != Some(public_model) {
-            return (Vec::new(), None, 0);
+            return (Vec::new(), None, 0, String::new());
         }
 
         let mut routes = self.model_routes(public_model);
@@ -247,7 +594,14 @@ impl RouterBackend {
         let routing_text = bounded_routing_text(&input.params, input.endpoint);
         let selection = {
             let mut state = self.state.lock().expect("router state poisoned");
-            let selected = state.select(public_model, &routing_text, &routes, &self.config, tier);
+            let selected = state.select_observed(
+                public_model,
+                &routing_text,
+                &routes,
+                &self.config,
+                tier,
+                &self.metrics,
+            );
             selected.map(|selected| {
                 // Selection and the local reservation are one transaction. A
                 // second dispatcher must observe this request before it can
@@ -318,7 +672,7 @@ impl RouterBackend {
             })
         };
         let Some((selected, candidate_route_ids, loads, pressure_order_keys)) = selection else {
-            return (Vec::new(), None, configured_count);
+            return (Vec::new(), None, configured_count, routing_text);
         };
         routes.retain(|route| candidate_route_ids.contains(&route.route_id));
         routes.sort_by(|a, b| {
@@ -340,7 +694,11 @@ impl RouterBackend {
                 .cmp(&b_load)
                 .then_with(|| a.route_id.cmp(&b.route_id))
         });
-        (routes, Some(selected), configured_count)
+        (routes, Some(selected), configured_count, routing_text)
+    }
+
+    pub(super) fn metrics_body(&self) -> Result<Vec<u8>, prometheus::Error> {
+        self.metrics.render()
     }
 
     pub(super) fn admin_snapshot_value(&self) -> Value {
@@ -494,12 +852,16 @@ impl RouterBackend {
             && requested_model
                 .as_deref()
                 .is_some_and(|model| model == public_model);
-        let (routes, selected, configured_count) = self.ordered_routes(&public_model, &input);
+        let (routes, selected, configured_count, routing_text) =
+            self.ordered_routes(&public_model, &input);
         let user_tier = self.request_tier(&input);
         if !self.config.trusted_user_tier_header {
             input.user_tier = None;
         }
         if requested_public_model && selected.is_none() {
+            if !routing_text.is_empty() && self.config.max_history_per_route > 0 {
+                self.metrics.record_cache_skipped("router_reject");
+            }
             tracing::info!(
                 public_model,
                 user_tier = user_tier.as_str(),
@@ -512,9 +874,16 @@ impl RouterBackend {
                 "Rate limit exceeded. Please retry after some time.",
             );
         }
-        let route_in_flight = selected
-            .as_ref()
-            .map(|selection| RouteInFlight::from_reserved(self.state.clone(), selection));
+        let route_in_flight = selected.as_ref().map(|selection| {
+            RouteInFlight::from_reserved(
+                self.state.clone(),
+                self.metrics.clone(),
+                selection,
+                public_model.clone(),
+                routing_text,
+                self.config.max_history_per_route,
+            )
+        });
         if let Some(selection) = selected.as_ref() {
             tracing::debug!(
                 public_model,
@@ -552,16 +921,52 @@ impl RouterBackend {
 }
 
 impl RouteInFlight {
-    fn from_reserved(state: Arc<Mutex<RouterState>>, selection: &RouteSelection) -> Self {
+    fn from_reserved(
+        state: Arc<Mutex<RouterState>>,
+        metrics: RouterMetrics,
+        selection: &RouteSelection,
+        model: String,
+        routing_text: String,
+        max_records: usize,
+    ) -> Self {
+        let cache_observation = CacheObservation::new(
+            state.clone(),
+            metrics,
+            model,
+            routing_text,
+            max_records,
+            selection,
+        );
         Self {
             route_id: Some(selection.route_id.clone()),
             pending_dispatch: true,
             state,
+            cache_observation,
         }
     }
 
     pub(super) fn retarget(&mut self, route_id: &str) {
         self.move_reservation(route_id, false);
+        if let Some(observation) = self.cache_observation.as_mut() {
+            observation.retarget(route_id);
+        }
+    }
+
+    pub(super) fn commit_cache(&mut self, usage: Option<&Value>) {
+        if let Some(observation) = self.cache_observation.as_mut() {
+            observation.commit();
+            observation.record_usage(usage);
+        }
+    }
+
+    pub(super) fn skip_cache(&mut self, reason: &'static str) {
+        if let Some(observation) = self.cache_observation.as_mut() {
+            observation.skip(reason);
+        }
+    }
+
+    pub(super) fn take_cache_observation(&mut self) -> Option<CacheObservation> {
+        self.cache_observation.take()
     }
 
     fn move_reservation(&mut self, route_id: &str, record_dispatch: bool) {
@@ -941,13 +1346,14 @@ impl RouterState {
         UPSTREAM_STATUS_GREEN
     }
 
-    fn select(
+    fn select_observed(
         &mut self,
         model: &str,
         text: &str,
         routes: &[RouterRoute],
         config: &MiddlewareConfig,
         tier: UserTier,
+        metrics: &RouterMetrics,
     ) -> Option<RouteSelection> {
         if routes.is_empty() {
             return None;
@@ -966,7 +1372,7 @@ impl RouterState {
             .cloned()
             .collect::<Vec<_>>();
         if selectable_routes.is_empty() {
-            return self.select_pressure_passthrough(model, text, routes, config, tier);
+            return self.select_pressure_passthrough(routes, config, tier);
         }
         if selectable_routes.len() == 1 {
             let route_id = selectable_routes[0].route_id.clone();
@@ -975,6 +1381,11 @@ impl RouterState {
                 if let Some(matched) = self.cache_index.match_prefix(model, text) {
                     let input_chars = matched.input_chars.max(1);
                     let rate = matched.matched_chars as f32 / input_chars as f32;
+                    metrics.record_affinity_considered(
+                        &matched.route_id,
+                        rate,
+                        matched.matched_chars,
+                    );
                     if rate > config.cache_threshold
                         && matched.route_id != route_id
                         && active_routes.contains(&matched.route_id)
@@ -983,10 +1394,12 @@ impl RouterState {
                             .entry(matched.route_id)
                             .or_default()
                             .cache_rejected_by_pressure += 1;
+                        metrics.record_affinity_rejected("pressure");
+                    } else if rate <= config.cache_threshold {
+                        metrics.record_affinity_rejected("below_threshold");
                     }
                 }
             }
-            self.record_cache(model, &route_id, text, config.max_history_per_route);
             return Some(RouteSelection {
                 route_id,
                 reason: if active_routes.len() == 1 {
@@ -1011,19 +1424,13 @@ impl RouterState {
                     }
                 })
         } else {
-            self.select_cache_aware(model, text, &selectable_routes, config, tier)
+            self.select_cache_aware(model, text, &selectable_routes, config, tier, metrics)
         }?;
-
-        self.record_cache(
-            model,
-            &selected.route_id,
-            text,
-            config.max_history_per_route,
-        );
         Some(selected)
     }
 
-    fn select_pressure_passthrough(
+    #[cfg(test)]
+    fn select(
         &mut self,
         model: &str,
         text: &str,
@@ -1031,16 +1438,18 @@ impl RouterState {
         config: &MiddlewareConfig,
         tier: UserTier,
     ) -> Option<RouteSelection> {
+        let metrics = RouterMetrics::new().expect("test router metrics");
+        self.select_observed(model, text, routes, config, tier, &metrics)
+    }
+
+    fn select_pressure_passthrough(
+        &self,
+        routes: &[RouterRoute],
+        config: &MiddlewareConfig,
+        tier: UserTier,
+    ) -> Option<RouteSelection> {
         let selected = self.least_loaded(routes, config, tier)?;
         let pressure = self.route_pressure(selected, config, tier);
-        if !text.is_empty() {
-            self.record_cache(
-                model,
-                &selected.route_id,
-                text,
-                config.max_history_per_route,
-            );
-        }
         Some(RouteSelection {
             route_id: selected.route_id.clone(),
             reason: PIG_PRESSURE_PASSTHROUGH_REASON,
@@ -1056,6 +1465,7 @@ impl RouterState {
         routes: &[RouterRoute],
         config: &MiddlewareConfig,
         tier: UserTier,
+        metrics: &RouterMetrics,
     ) -> Option<RouteSelection> {
         let matched = self.cache_index.match_prefix(model, text);
         let input_chars = matched.as_ref().map_or_else(
@@ -1067,6 +1477,7 @@ impl RouterState {
         });
         let least = self.least_loaded(routes, config, tier)?;
         if let Some(matched) = matched {
+            metrics.record_affinity_considered(&matched.route_id, rate, matched.matched_chars);
             if let Some(cache_route) = routes
                 .iter()
                 .find(|route| route.route_id == matched.route_id)
@@ -1074,6 +1485,7 @@ impl RouterState {
                 if rate > config.cache_threshold
                     && self.cache_route_is_acceptable(cache_route, least, config, tier)
                 {
+                    metrics.record_affinity_selected(&cache_route.route_id);
                     let pressure = self.route_pressure(cache_route, config, tier);
                     return Some(RouteSelection {
                         route_id: cache_route.route_id.clone(),
@@ -1087,7 +1499,14 @@ impl RouterState {
                         .entry(cache_route.route_id.clone())
                         .or_default()
                         .cache_rejected_by_pressure += 1;
+                    metrics.record_affinity_rejected("pressure");
+                } else {
+                    metrics.record_affinity_rejected("below_threshold");
                 }
+            } else if rate > config.cache_threshold {
+                metrics.record_affinity_rejected("route_unavailable");
+            } else {
+                metrics.record_affinity_rejected("below_threshold");
             }
         }
         let pressure = self.route_pressure(least, config, tier);
@@ -1285,6 +1704,26 @@ fn ratio_milli(value: f64, limit: Option<f64>) -> u64 {
         return 0;
     }
     ((value / limit) * 1_000.0).max(0.0).round() as u64
+}
+
+fn usage_prompt_tokens(usage: &Value) -> Option<u64> {
+    usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+}
+
+fn usage_cached_tokens(usage: &Value) -> Option<u64> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
 }
 
 fn spawn_metrics_poller(
@@ -1684,7 +2123,7 @@ mod tests {
         };
         assert_eq!(first.route_id, "a:m");
         state.lock().unwrap().mark_started(&first);
-        drop(RouteInFlight::from_reserved(state.clone(), &first));
+        drop(test_in_flight(state.clone(), &first, "aaaa"));
 
         let second = {
             let mut locked = state.lock().unwrap();
@@ -1962,7 +2401,7 @@ mod tests {
             .unwrap();
         state.lock().unwrap().mark_started(&selected);
 
-        drop(RouteInFlight::from_reserved(state.clone(), &selected));
+        drop(test_in_flight(state.clone(), &selected, "first"));
 
         let mut state = state.lock().unwrap();
         assert_eq!(state.stats["new:m"].running, 0);
@@ -2112,6 +2551,9 @@ mod tests {
                 .as_deref(),
             Some("a:m")
         );
+        // Selection no longer mutates the cache index. Model a confirmed first
+        // response before exercising pressure rejection of that affinity.
+        state.record_cache("m", "a:m", "stable prefix one", 16);
         state.update_upstream_metrics(
             "a".to_string(),
             UpstreamMetrics {
@@ -2406,7 +2848,7 @@ mod tests {
         };
 
         state.lock().unwrap().mark_started(&selection);
-        let mut guard = RouteInFlight::from_reserved(state.clone(), &selection);
+        let mut guard = test_in_flight(state.clone(), &selection, "test");
         assert_eq!(state.lock().unwrap().stats["a:m"].running, 1);
 
         guard.retarget("b:m");
@@ -2430,7 +2872,7 @@ mod tests {
             running_at_select: 0,
         };
         state.lock().unwrap().mark_started(&selection);
-        let mut guard = RouteInFlight::from_reserved(state.clone(), &selection);
+        let mut guard = test_in_flight(state.clone(), &selection, "test");
 
         assert_eq!(state.lock().unwrap().dispatch_watermark("a"), 0);
         MiddlewareAttemptObserver::attempt_started(&mut guard, "a:m");
@@ -2465,6 +2907,105 @@ mod tests {
     }
 
     #[test]
+    fn selection_does_not_record_cache_before_upstream_success() {
+        let state = Arc::new(Mutex::new(RouterState::default()));
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m"), test_route("b:m")];
+        let selected = state
+            .lock()
+            .unwrap()
+            .select("m", "shared prefix", &routes, &config, UserTier::Basic)
+            .unwrap();
+
+        assert_eq!(state.lock().unwrap().cache_index.stats().records, 0);
+
+        state.lock().unwrap().mark_started(&selected);
+        let mut in_flight = test_in_flight(state.clone(), &selected, "shared prefix");
+        in_flight.commit_cache(Some(&json!({
+            "prompt_tokens": 12,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        })));
+
+        let locked = state.lock().unwrap();
+        assert_eq!(locked.cache_index.stats().records, 1);
+        assert_eq!(
+            locked
+                .cache_index
+                .match_prefix("m", "shared prefix continuation")
+                .unwrap()
+                .route_id,
+            "a:m"
+        );
+    }
+
+    #[test]
+    fn failover_commits_only_the_actual_success_route() {
+        let state = Arc::new(Mutex::new(RouterState::default()));
+        let selection = RouteSelection {
+            route_id: "a:m".to_string(),
+            reason: "cache",
+            cache_match_rate: 0.75,
+            running_at_select: 0,
+        };
+        state.lock().unwrap().mark_started(&selection);
+        let metrics = RouterMetrics::new().unwrap();
+        let mut in_flight = RouteInFlight::from_reserved(
+            state.clone(),
+            metrics.clone(),
+            &selection,
+            "m".to_string(),
+            "shared failover prefix".to_string(),
+            16,
+        );
+
+        in_flight.retarget("b:m");
+        in_flight.commit_cache(Some(&json!({
+            "prompt_tokens": 20,
+            "prompt_tokens_details": {"cached_tokens": 8}
+        })));
+
+        let locked = state.lock().unwrap();
+        assert_eq!(locked.cache_index.route_stats("m", "a:m").records, 0);
+        assert_eq!(locked.cache_index.route_stats("m", "b:m").records, 1);
+        drop(locked);
+        let rendered = String::from_utf8(metrics.render().unwrap()).unwrap();
+        assert!(rendered.contains(
+            "router_cache_affinity_retarget_total{from_route=\"a:m\",to_route=\"b:m\"} 1"
+        ));
+        assert!(rendered.contains(
+            "router_cache_cached_tokens_total{route=\"b:m\",selection_reason=\"cache\"} 8"
+        ));
+    }
+
+    #[test]
+    fn failed_request_skips_cache_record() {
+        let state = Arc::new(Mutex::new(RouterState::default()));
+        let selection = RouteSelection {
+            route_id: "a:m".to_string(),
+            reason: "least_running",
+            cache_match_rate: 0.0,
+            running_at_select: 0,
+        };
+        state.lock().unwrap().mark_started(&selection);
+        let metrics = RouterMetrics::new().unwrap();
+        let mut in_flight = RouteInFlight::from_reserved(
+            state.clone(),
+            metrics.clone(),
+            &selection,
+            "m".to_string(),
+            "failed prefix".to_string(),
+            16,
+        );
+
+        in_flight.skip_cache("upstream_429");
+        drop(in_flight);
+
+        assert_eq!(state.lock().unwrap().cache_index.stats().records, 0);
+        let rendered = String::from_utf8(metrics.render().unwrap()).unwrap();
+        assert!(rendered.contains("router_cache_record_skipped_total{reason=\"upstream_429\"} 1"));
+    }
+
+    #[test]
     fn bounded_routing_text_caps_extracted_prompt_text() {
         let long = "x".repeat(MAX_ROUTING_HISTORY_CHARS + 10);
         let text = bounded_routing_text(
@@ -2493,6 +3034,21 @@ mod tests {
                 engine: None,
             },
         }
+    }
+
+    fn test_in_flight(
+        state: Arc<Mutex<RouterState>>,
+        selection: &RouteSelection,
+        routing_text: &str,
+    ) -> RouteInFlight {
+        RouteInFlight::from_reserved(
+            state,
+            RouterMetrics::new().expect("test router metrics"),
+            selection,
+            "m".to_string(),
+            routing_text.to_string(),
+            16,
+        )
     }
 
     fn test_metrics(

@@ -84,6 +84,9 @@ For each request, the router:
 8. Falls back to the least-loaded route when no prefix match exists or the
    matched route fails the load guard.
 9. Returns the rest as fallback candidates ordered by lower effective load.
+10. Commits the routing text to the cache index only after the actual serving
+    route succeeds. A buffered response must be a valid upstream 2xx JSON body;
+    a streaming response must emit its first valid model-data SSE event.
 
 The request body sent to every ordered candidate is the exact cleartext byte
 sequence received by middleware from the downstream PAG. Any JSON normalization
@@ -171,9 +174,42 @@ The index is intentionally limited:
   `/v1/admin/router` as `routing_text_max_chars`.
 - Disabled or removed routes are pruned from the model's cache index before
   selection, so stale cache affinity cannot route to an inactive upstream.
+- Selection alone never writes the index. Upstream 429/5xx, verification or
+  transport failure, all-candidate failure, malformed success responses, and
+  client cancellation before the first valid stream event do not create a
+  record. When failover succeeds, only the final serving route is recorded.
 
 Cache affinity is an optimization, not a proof. Receipts still prove the
 selected route and upstream verification facts, not a cache-hit claim.
+
+`GET /v1/metrics` includes low-cardinality Router outcome metrics alongside the
+gateway metrics. Important series are:
+
+```text
+router_cache_affinity_considered_total{route}
+router_cache_affinity_selected_total{route}
+router_cache_affinity_success_total{route}
+router_cache_affinity_retarget_total{from_route,to_route}
+router_cache_affinity_rejected_total{reason}
+router_cache_record_committed_total{route}
+router_cache_record_skipped_total{reason}
+router_cache_match_rate_bucket{route,le}
+router_cache_match_chars_bucket{route,le}
+router_cache_prompt_tokens_total{route,selection_reason}
+router_cache_cached_tokens_total{route,selection_reason}
+router_cache_usage_skipped_total{reason}
+```
+
+Route names are bounded by the configured upstream set, and `reason` and
+`selection_reason` use fixed enums. No prompt, message, tool schema, request id,
+user id, or session id is placed in a Prometheus label. The token counters are
+populated only when the upstream reports both prompt-token and cached-token
+details; missing details increment `router_cache_usage_skipped_total` instead
+of being treated as zero cache reuse.
+
+`selected_by_cache` remains a request-level Router decision counter. Actual
+cache effectiveness must be calculated from reported cached prompt tokens and
+compared with TTFT; the two measurements are not interchangeable.
 
 ## Failure Behavior
 

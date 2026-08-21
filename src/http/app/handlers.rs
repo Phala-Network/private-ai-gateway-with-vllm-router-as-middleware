@@ -160,7 +160,22 @@ pub(super) async fn metrics(State(state): State<AppState>, headers: HeaderMap) -
         return resp;
     }
     match state.service.metrics() {
-        Ok(snapshot) => {
+        Ok(mut snapshot) => {
+            if let Some(middleware) = state.middleware.as_ref() {
+                match middleware.metrics_body() {
+                    Ok(mut middleware_metrics) => {
+                        if !snapshot.body.ends_with(b"\n") {
+                            snapshot.body.push(b'\n');
+                        }
+                        snapshot.body.append(&mut middleware_metrics);
+                    }
+                    Err(err) => {
+                        return internal_error_response(ServiceError::Metrics(format!(
+                            "router metrics: {err}"
+                        )))
+                    }
+                }
+            }
             let mut headers = HeaderMap::new();
             insert_str_header(&mut headers, "content-type", &snapshot.content_type);
             (StatusCode::OK, headers, snapshot.body).into_response()

@@ -34,6 +34,7 @@ use super::completion::{
 };
 use super::control::ControlClient;
 use super::pricing;
+use super::router::CacheObservation;
 use super::types::{ErrorSource, PostReport, SpendMode};
 
 /// Cap on the partial-line reassembly buffer. An upstream that streams bytes
@@ -86,6 +87,9 @@ pub struct StreamReport {
     /// meter has already settled Completed and will not emit again) so it can
     /// record the failure itself.
     pub settled: Arc<AtomicBool>,
+    /// Pending Router cache observation. It commits only after the first valid
+    /// upstream data event proves that prompt processing reached a response.
+    pub(super) cache_observation: Option<CacheObservation>,
 }
 
 impl StreamReport {
@@ -289,6 +293,19 @@ impl MeterStream {
                 "stream settled"
             );
         }
+        if let Some(observation) = self.report.cache_observation.as_mut() {
+            if !observation.is_committed() {
+                let reason = match outcome {
+                    Outcome::ClientClosed => "client_cancel_before_first_token",
+                    Outcome::Failed => "upstream_stream_error",
+                    Outcome::Completed => "stream_no_data",
+                };
+                observation.skip(reason);
+            }
+            if observation.is_committed() {
+                observation.record_usage(self.last_usage.as_ref());
+            }
+        }
         self.report
             .settle(outcome, self.last_usage.take(), self.ttft_ms);
     }
@@ -482,6 +499,11 @@ impl MeterStream {
                         return line.to_string();
                     };
                     self.detect_outcome(&parsed);
+                    if is_cache_commit_event(&parsed) {
+                        if let Some(observation) = self.report.cache_observation.as_mut() {
+                            observation.commit();
+                        }
+                    }
 
                     let top_usage = parsed.get("usage").filter(|u| !u.is_null());
                     let nested = parsed
@@ -526,6 +548,44 @@ impl MeterStream {
             None => Bytes::from(raw),
         }
     }
+}
+
+fn is_cache_commit_event(parsed: &Value) -> bool {
+    if parsed.get("error").is_some_and(|error| !error.is_null())
+        || parsed
+            .get("response")
+            .and_then(|response| response.get("error"))
+            .is_some_and(|error| !error.is_null())
+        || parsed.get("type").and_then(Value::as_str) == Some("error")
+    {
+        return false;
+    }
+    if parsed
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+    {
+        return true;
+    }
+    if parsed.get("delta").is_some_and(|delta| !delta.is_null()) {
+        return true;
+    }
+    matches!(
+        parsed.get("type").and_then(Value::as_str),
+        Some(
+            "message_start"
+                | "content_block_start"
+                | "content_block_delta"
+                | "message_delta"
+                | "message_stop"
+                | "response.output_item.added"
+                | "response.content_part.added"
+                | "response.output_text.delta"
+                | "response.function_call_arguments.delta"
+                | "response.completed"
+                | "response.incomplete"
+        )
+    )
 }
 
 impl Stream for MeterStream {
@@ -613,6 +673,8 @@ impl Drop for MeterStream {
             } else {
                 self.settle(Outcome::ClientClosed);
             }
+        } else if let Some(observation) = self.report.cache_observation.as_mut() {
+            observation.skip("client_cancel_before_first_token");
         }
     }
 }
@@ -860,6 +922,7 @@ mod tests {
             started: Instant::now(),
             downstream_abort: Arc::new(AtomicBool::new(false)),
             settled: Arc::new(AtomicBool::new(false)),
+            cache_observation: None,
         };
         let inner: ServiceResponseStream = Box::pin(futures_util::stream::empty());
         MeterStream::new(inner, report, protocol)
@@ -1059,5 +1122,23 @@ mod tests {
             Fed::Emit(_)
         ));
         assert!(meter.ttft_ms.is_some(), "first content sets TTFT");
+    }
+
+    #[test]
+    fn cache_commit_event_requires_successful_model_data() {
+        assert!(is_cache_commit_event(&serde_json::json!({
+            "choices": [{"delta": {"role": "assistant"}}]
+        })));
+        assert!(is_cache_commit_event(&serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {"text": "hello"}
+        })));
+        assert!(!is_cache_commit_event(&serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 12}
+        })));
+        assert!(!is_cache_commit_event(&serde_json::json!({
+            "error": {"message": "failed"}
+        })));
     }
 }

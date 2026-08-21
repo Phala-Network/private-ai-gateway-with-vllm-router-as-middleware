@@ -43,7 +43,7 @@ This is the smallest practical container config.
 | `state_dir` | `/var/lib/private-ai-gateway` | Gateway-owned writable state directory. The active upstream config and attested-session log are derived from this directory. |
 | `upstream_config_seed_path` | unset | Read-only JSON seed copied to `<state_dir>/upstreams.json` only when the active upstream config is missing or empty. |
 | `admin_token` | unset | Bearer token for `GET`, `PUT`, and `PATCH /v1/admin/upstreams`, plus `GET /v1/admin/router`. When unset, the admin API is not exposed. |
-| `api_token` | unset | Optional bearer token for public inference, model catalog, metrics, and `/v1/upstream-status`. When unset, those routes are publicly reachable. |
+| `api_token` | unset | Optional bearer token for public inference, model catalog, gateway/Router metrics, and `/v1/upstream-status`. When unset, those routes are publicly reachable. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `direct_serving` | `false` | Set only when inference is served inside this same attested workload with no upstream hop. It is mutually exclusive with middleware mode. |
 | `enable_e2ee` | `false` | Inherited PAG field. Router middleware deployments do not use it because user-facing E2EE, if enabled, terminates at downstream PAG before this Router is called. |
@@ -101,6 +101,12 @@ tracing lines for routing/shaping failures, upstream errors, stream failures,
 client disconnects, and anomalous successful finish reasons. The `detail`
 field is emitted only when the `request_outcome` target is enabled at `debug`.
 Silence or re-route the target via `RUST_LOG` (the subscriber uses `EnvFilter`).
+
+Router cache-affinity outcome and token-efficiency counters are appended to the
+authenticated `GET /v1/metrics` response when middleware is enabled. Cache
+records are committed only after the final serving upstream succeeds; no extra
+configuration flag is required. See [router-middleware.md](router-middleware.md)
+for metric names and lifecycle semantics.
 
 ```json
 {

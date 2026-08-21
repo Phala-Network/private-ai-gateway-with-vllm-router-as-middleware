@@ -474,7 +474,7 @@ and [router middleware design](docs/router-middleware.md).
 | `GET /v1/aci/sessions/{session_id}` | Attested-session record referenced by a receipt. |
 | `GET /v1/aci/sessions?upstream_name=&model=` | List a provider's imported attested sessions. |
 | `GET /v1/attestation/report` · `GET /v1/signature/{id}` | Legacy dstack-vllm-proxy aliases. |
-| `GET /v1/metrics` | Gateway-owned Prometheus metrics. |
+| `GET /v1/metrics` | Gateway-owned Prometheus metrics plus Router cache-affinity outcome and token-efficiency metrics when middleware is enabled. |
 | `GET /v1/admin/upstreams` | Authenticated upstream config snapshot. |
 | `PUT /v1/admin/upstreams` | Authenticated upstream config replacement. |
 

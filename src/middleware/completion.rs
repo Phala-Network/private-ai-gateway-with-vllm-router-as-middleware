@@ -211,6 +211,37 @@ fn passthrough_forward_candidates(
         .collect()
 }
 
+fn response_usage(value: &Value) -> Option<&Value> {
+    value
+        .get("usage")
+        .filter(|usage| !usage.is_null())
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .filter(|usage| !usage.is_null())
+        })
+}
+
+fn cache_skip_reason_for_status(status: u16) -> &'static str {
+    match status {
+        429 => "upstream_429",
+        500..=599 => "upstream_5xx",
+        _ => "upstream_non_2xx",
+    }
+}
+
+fn cache_skip_reason_for_error(err: &ServiceError) -> &'static str {
+    match err {
+        ServiceError::Upstream(UpstreamError::Upstream { status, .. }) => {
+            cache_skip_reason_for_status(*status)
+        }
+        ServiceError::Upstream(UpstreamError::Transport(_)) => "transport_error",
+        ServiceError::UpstreamVerification(_) => "verification_error",
+        _ => "gateway_error",
+    }
+}
+
 pub(super) async fn run(
     service: &AciService,
     sse_keepalive_ms: Option<u64>,
@@ -304,6 +335,9 @@ pub(super) async fn run(
                 let upstream_json: Value = match serde_json::from_slice(&forward.upstream_body) {
                     Ok(value) => value,
                     Err(_) => {
+                        if let Some(in_flight) = route_in_flight.as_mut() {
+                            in_flight.skip_cache("malformed_success");
+                        }
                         let message = "upstream returned a malformed success body";
                         log_generated_outcome(
                             outcome_ctx,
@@ -323,6 +357,9 @@ pub(super) async fn run(
                         return finalize_generated(surface, service, endpoint_path, 502, body, &[]);
                     }
                 };
+                if let Some(in_flight) = route_in_flight.as_mut() {
+                    in_flight.commit_cache(response_usage(&upstream_json));
+                }
                 let mut transformed = response_transform::transform_response(
                     selected_format,
                     endpoint,
@@ -335,6 +372,9 @@ pub(super) async fn run(
                     serde_json::to_vec(&transformed).unwrap_or_default(),
                 )
             } else {
+                if let Some(in_flight) = route_in_flight.as_mut() {
+                    in_flight.skip_cache(cache_skip_reason_for_status(upstream_status));
+                }
                 errors::normalize_upstream_error_parts(
                     surface,
                     upstream_status,
@@ -418,6 +458,9 @@ pub(super) async fn run(
             ));
             let downstream_abort = Arc::new(AtomicBool::new(false));
             let meter_settled = Arc::new(AtomicBool::new(false));
+            let cache_observation = route_in_flight
+                .as_mut()
+                .and_then(RouteInFlight::take_cache_observation);
             let stream_report = StreamReport {
                 control: control.clone(),
                 request_id: request_id.clone(),
@@ -433,6 +476,7 @@ pub(super) async fn run(
                 started,
                 downstream_abort: downstream_abort.clone(),
                 settled: meter_settled.clone(),
+                cache_observation,
             };
             let metered: ServiceResponseStream = Box::pin(MeterStream::new(
                 sanitized,
@@ -530,6 +574,7 @@ pub(super) async fn run(
         Ok(MiddlewareForwardResult::UpstreamError(forward)) => {
             if let Some(in_flight) = route_in_flight.as_mut() {
                 in_flight.retarget(&forward.selected_route);
+                in_flight.skip_cache(cache_skip_reason_for_status(forward.error.upstream_status));
             }
             let (status, body) = errors::normalize_upstream_error_parts(
                 surface,
@@ -552,6 +597,9 @@ pub(super) async fn run(
             finalize_generated(surface, service, endpoint_path, status, body, &[])
         }
         Ok(MiddlewareForwardResult::AllFailed(forward)) => {
+            if let Some(in_flight) = route_in_flight.as_mut() {
+                in_flight.skip_cache(cache_skip_reason_for_error(&forward.error));
+            }
             log_failed_attempts(outcome_ctx, &forward.failed_attempts, stream);
             let status = forward_error_status(&forward.error);
             let detail = detail_snippet_text(&forward.error.to_string());
@@ -567,6 +615,9 @@ pub(super) async fn run(
             service_error_response(surface, endpoint_path, service, &request_id, forward.error)
         }
         Err(err) => {
+            if let Some(in_flight) = route_in_flight.as_mut() {
+                in_flight.skip_cache(cache_skip_reason_for_error(&err));
+            }
             let status = forward_error_status(&err);
             let detail = detail_snippet_text(&err.to_string());
             log_generated_outcome(outcome_ctx, "forward_error", status, 0, "", 0, &detail);
