@@ -830,13 +830,19 @@ impl RouterBackend {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let public_model = match self.public_model(&snapshot) {
-            Ok(Some(model)) => model,
+        let (public_model, requested_public_model) = match self.public_model(&snapshot) {
+            Ok(Some(model)) => {
+                let requested_public_model = requested_model.as_deref() == Some(model.as_str());
+                (model, requested_public_model)
+            }
             // With no enabled upstream, a single-model Router cannot derive the
             // model catalog. Treat the requested model as temporarily
             // unavailable so clients see the same capacity 429 they would get
             // from PIG, instead of a malformed/unroutable request error.
-            Ok(None) => requested_model.clone().unwrap_or_default(),
+            Ok(None) => (
+                requested_model.clone().unwrap_or_default(),
+                requested_model.is_some(),
+            ),
             Err(err) => {
                 return errors::error_response(
                     input.surface,
@@ -848,17 +854,16 @@ impl RouterBackend {
             }
         };
         let mut input = input;
-        let requested_public_model = !public_model.is_empty()
-            && requested_model
-                .as_deref()
-                .is_some_and(|model| model == public_model);
+        if !requested_public_model {
+            return completion::model_not_found(service, &input, requested_model.as_deref());
+        }
         let (routes, selected, configured_count, routing_text) =
             self.ordered_routes(&public_model, &input);
         let user_tier = self.request_tier(&input);
         if !self.config.trusted_user_tier_header {
             input.user_tier = None;
         }
-        if requested_public_model && selected.is_none() {
+        if selected.is_none() {
             if !routing_text.is_empty() && self.config.max_history_per_route > 0 {
                 self.metrics.record_cache_skipped("router_reject");
             }

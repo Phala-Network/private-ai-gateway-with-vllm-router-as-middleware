@@ -953,7 +953,7 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
     );
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let (status, _headers, body) = response_parts(
+    let (status, headers, body) = response_parts(
         mw.handle_completion(&service, chat_input("gpt-test", "hello"))
             .await,
     )
@@ -961,6 +961,8 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
 
     assert_eq!(status, 429);
     assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
+    assert!(headers.get("retry-after").is_some());
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_c.bodies.lock().unwrap().len(), 1);
@@ -976,6 +978,60 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
     }
     let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
     assert!(metrics.contains("router_cache_record_skipped_total{reason=\"upstream_429\"} 1"));
+}
+
+#[tokio::test]
+async fn two_pressured_streaming_routes_exhaust_to_rate_limit() {
+    let calls_a = Arc::new(CapturedCalls::default());
+    let calls_b = Arc::new(CapturedCalls::default());
+    let full_metrics = concat!(
+        "pig_dynamic_observed_running 10\n",
+        "pig_dynamic_observed_waiting 0\n",
+        "pig_dynamic_global_limit 10\n",
+        "pig_tier_basic_limit 9\n",
+        "pig_tier_inflight{tier=\"basic\"} 9\n",
+    );
+    let upstream_a = spawn_pig_upstream(
+        full_metrics,
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_a_full"}}),
+        calls_a.clone(),
+    )
+    .await;
+    let upstream_b = spawn_pig_upstream(
+        full_metrics,
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"type":"rate_limit_error","code":"pig_b_full"}}),
+        calls_b.clone(),
+    )
+    .await;
+    let manager = upstream_manager(vec![
+        upstream_config("gpu-a", &upstream_a, "gpt-test", "up-a"),
+        upstream_config("gpu-b", &upstream_b, "gpt-test", "up-b"),
+    ]);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            metrics_poll_ms: 10,
+            metrics_stale_ms: 10_000,
+            ..Default::default()
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let mut input = chat_input("gpt-test", "hello");
+    input.params["stream"] = json!(true);
+    input.received_body = serde_json::to_vec(&input.params).unwrap();
+    input.stream = true;
+
+    let (status, headers, body) = response_parts(mw.handle_completion(&service, input).await).await;
+
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
+    assert!(headers.get("retry-after").is_some());
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

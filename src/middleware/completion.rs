@@ -58,21 +58,53 @@ pub(super) fn rate_limited_by_router(
     input: &CompletionInput,
     message: &str,
 ) -> Response {
+    rate_limited_generated(
+        input.surface,
+        service,
+        input.endpoint_path,
+        &input.request_id,
+        message,
+    )
+}
+
+pub(super) fn model_not_found(
+    service: &AciService,
+    input: &CompletionInput,
+    model: Option<&str>,
+) -> Response {
+    let message = format!("no route available for model {}", model.unwrap_or("(none)"));
+    let body = errors::envelope_bytes(
+        input.surface,
+        "model_not_found",
+        &message,
+        Some(&input.request_id),
+    );
+    finalize_generated(input.surface, service, input.endpoint_path, 404, body, &[])
+}
+
+fn rate_limited_generated(
+    surface: Surface,
+    service: &AciService,
+    endpoint_path: &str,
+    request_id: &str,
+    message: &str,
+) -> Response {
+    let (body, headers) = rate_limit_parts(surface, request_id, message);
+    finalize_generated(surface, service, endpoint_path, 429, body, &headers)
+}
+
+fn rate_limit_parts(
+    surface: Surface,
+    request_id: &str,
+    message: &str,
+) -> (Vec<u8>, Vec<(&'static str, String)>) {
     let reset_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64 + 1)
         .unwrap_or(1);
-    let body =
-        errors::rate_limit_envelope_bytes(input.surface, message, Some(input.request_id.as_str()));
+    let body = errors::rate_limit_envelope_bytes(surface, message, Some(request_id));
     let headers = errors::rate_limit_headers(0, reset_at);
-    finalize_generated(
-        input.surface,
-        service,
-        input.endpoint_path,
-        429,
-        body,
-        &headers,
-    )
+    (body, headers)
 }
 
 const MAX_LOG_DETAIL_CHARS: usize = 240;
@@ -278,12 +310,12 @@ pub(super) async fn run(
         user_model: user_model.clone(),
     });
     if candidates.is_empty() {
-        // Not found, not malformed: model_not_found is an OpenAI-compatible
-        // 404. Capacity exhaustion is handled earlier by the router wrapper.
-        let message = format!("no route available for model {}", model.unwrap_or("(none)"));
-        log_generated_outcome(outcome_ctx, "routing", 404, 0, "", 0, &message);
-        let body = errors::envelope_bytes(surface, "model_not_found", &message, Some(&request_id));
-        return finalize_generated(surface, service, endpoint_path, 404, body, &[]);
+        // The Router resolves model identity before entering this function.
+        // An empty candidate set here is therefore a transient routing/capacity
+        // condition, including an upstream-config race, never model absence.
+        let message = "Rate limit exceeded. Please retry after some time.";
+        log_generated_outcome(outcome_ctx, "routing_exhausted", 429, 0, "", 0, message);
+        return rate_limited_generated(surface, service, endpoint_path, &request_id, message);
     }
 
     let forward_candidates = passthrough_forward_candidates(&received_body, &candidates);
@@ -331,7 +363,7 @@ pub(super) async fn run(
                 .map(|c| c.format)
                 .unwrap_or(ProviderFormat::Openai);
 
-            let (client_status, final_body) = if (200..300).contains(&upstream_status) {
+            let (client_status, mut final_body) = if (200..300).contains(&upstream_status) {
                 let upstream_json: Value = match serde_json::from_slice(&forward.upstream_body) {
                     Ok(value) => value,
                     Err(_) => {
@@ -383,6 +415,17 @@ pub(super) async fn run(
                     Some(&request_id),
                 )
             };
+            let rate_limit_headers = if client_status == 429 {
+                let (body, headers) = rate_limit_parts(
+                    surface,
+                    &request_id,
+                    "Rate limit exceeded. Please retry after some time.",
+                );
+                final_body = body;
+                headers
+            } else {
+                Vec::new()
+            };
             if client_status >= 400 {
                 log_failed_attempts(outcome_ctx, &forward.failed_attempts, false);
                 let detail = detail_snippet_bytes(&forward.upstream_body);
@@ -409,6 +452,9 @@ pub(super) async fn run(
                         StatusCode::from_u16(client_status).unwrap_or(StatusCode::BAD_GATEWAY);
                     let mut headers = gateway_owned_headers("application/json");
                     insert_header(&mut headers, "x-receipt-id", &finalized.receipt.receipt_id);
+                    for (name, value) in &rate_limit_headers {
+                        insert_header(&mut headers, name, value);
+                    }
                     (status, headers, finalized.wire_body).into_response()
                 }
                 Err(err) => {
@@ -594,6 +640,15 @@ pub(super) async fn run(
                 forward.failed_attempts.len() as u32,
                 &detail,
             );
+            if status == 429 {
+                return rate_limited_generated(
+                    surface,
+                    service,
+                    endpoint_path,
+                    &request_id,
+                    "Rate limit exceeded. Please retry after some time.",
+                );
+            }
             finalize_generated(surface, service, endpoint_path, status, body, &[])
         }
         Ok(MiddlewareForwardResult::AllFailed(forward)) => {
@@ -645,7 +700,11 @@ fn forward_error_status(err: &ServiceError) -> u16 {
     match err {
         ServiceError::E2ee(_) => 400,
         ServiceError::UpstreamVerification(_) => 503,
-        ServiceError::Upstream(UpstreamError::Routing(_)) => 404,
+        // At this point the Router already accepted the public model. A routing
+        // error means the selected route disappeared or every candidate was
+        // exhausted; exposing it as model_not_found incorrectly turns a
+        // temporary capacity event into a 404.
+        ServiceError::Upstream(UpstreamError::Routing(_)) => 429,
         _ => 502,
     }
 }
@@ -658,6 +717,15 @@ fn service_error_response(
     err: ServiceError,
 ) -> Response {
     let status = forward_error_status(&err);
+    if status == 429 {
+        return rate_limited_generated(
+            surface,
+            service,
+            endpoint_path,
+            request_id,
+            "Rate limit exceeded. Please retry after some time.",
+        );
+    }
     let body = errors::envelope_bytes(
         surface,
         errors::error_type(surface, status),
@@ -732,5 +800,14 @@ mod tests {
         assert_eq!(forward[0].route_id, "use2-a:gemma4-31b-it");
         assert_eq!(forward[1].route_id, "use2-b:gemma4-31b-it");
         assert!(forward.iter().all(|candidate| candidate.body == received));
+    }
+
+    #[test]
+    fn routing_exhaustion_maps_to_rate_limit() {
+        let error = ServiceError::Upstream(UpstreamError::Routing(
+            "all candidate routes disappeared".to_string(),
+        ));
+
+        assert_eq!(forward_error_status(&error), 429);
     }
 }
