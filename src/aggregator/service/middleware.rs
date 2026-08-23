@@ -13,11 +13,12 @@ use super::streaming::{
 };
 use super::{
     AciService, ChatCompletionRequest, E2eeError, E2eeRequestContext, E2eeResponseInfo,
-    ForwardCandidate, MiddlewareAllFailed, MiddlewareAttemptObserver, MiddlewareForwardResult,
-    MiddlewareForwarded, MiddlewareGeneratedFinalization, MiddlewareReceiptDraft,
-    MiddlewareReceiptFinalization, MiddlewareReceiptJournal, MiddlewareStreamFinalization,
-    MiddlewareStreamingForwarded, MiddlewareUpstreamError, ReceiptOwner, ServiceError,
-    ServiceResponseStream, StreamingUpstreamError, UpstreamVerificationError,
+    ForwardCandidate, MiddlewareAllFailed, MiddlewareAttemptFailure, MiddlewareAttemptObserver,
+    MiddlewareForwardResult, MiddlewareForwarded, MiddlewareGeneratedFinalization,
+    MiddlewareReceiptDraft, MiddlewareReceiptFinalization, MiddlewareReceiptJournal,
+    MiddlewareStreamFinalization, MiddlewareStreamingForwarded, MiddlewareUpstreamError,
+    ReceiptOwner, ServiceError, ServiceResponseStream, StreamingUpstreamError,
+    UpstreamVerificationError,
 };
 use crate::aci::receipt::{ReceiptBuilder, UpstreamVerifiedEvent};
 use crate::aci::upstream::{UpstreamError, UpstreamRequest, UpstreamResponse};
@@ -58,6 +59,17 @@ fn should_fail_over(status: u16, received_body: &[u8], upstream_body: &[u8]) -> 
     // ANY 5xx as a client 429, so a status outside the retryable whitelist
     // (e.g. 520) carrying that body would otherwise be denied failover.
     (is_retryable_provider_status(status) || is_upstream_capacity_signal(status, upstream_body))
+        && crate::middleware::errors::classify_image_input_error(
+            received_body,
+            status,
+            upstream_body,
+        )
+        .is_none()
+}
+
+fn is_route_failure_response(status: u16, received_body: &[u8], upstream_body: &[u8]) -> bool {
+    matches!(status, 401 | 402 | 403 | 404 | 500..=599)
+        && !is_upstream_capacity_signal(status, upstream_body)
         && crate::middleware::errors::classify_image_input_error(
             received_body,
             status,
@@ -318,6 +330,9 @@ impl AciService {
         for (index, candidate) in candidates.iter().enumerate() {
             let route_id = candidate.route_id.clone();
             let is_last = index == last_index;
+            if let Some(observer) = attempt_observer.as_deref_mut() {
+                observer.candidate_considered(&route_id);
+            }
 
             let prepared = match self.upstream.prepare(UpstreamRequest {
                 body: candidate.body.clone(),
@@ -327,6 +342,9 @@ impl AciService {
             }) {
                 Ok(prepared) => prepared,
                 Err(UpstreamError::Routing(message)) => {
+                    if let Some(observer) = attempt_observer.as_deref_mut() {
+                        observer.attempt_failed(&route_id, MiddlewareAttemptFailure::Routing);
+                    }
                     failed_attempts.push((route_id.clone(), 502));
                     upgrade_err(
                         &mut aggregated_err,
@@ -336,6 +354,9 @@ impl AciService {
                     continue;
                 }
                 Err(err) => {
+                    if let Some(observer) = attempt_observer.as_deref_mut() {
+                        observer.attempt_failed(&route_id, MiddlewareAttemptFailure::Transport);
+                    }
                     failed_attempts.push((route_id.clone(), 502));
                     upgrade_err(&mut aggregated_err, 2, err.into());
                     continue;
@@ -365,6 +386,9 @@ impl AciService {
             {
                 Ok(event) => event,
                 Err(ServiceError::UpstreamVerification(uv)) => {
+                    if let Some(observer) = attempt_observer.as_deref_mut() {
+                        observer.attempt_failed(&route_id, MiddlewareAttemptFailure::Verification);
+                    }
                     failed_attempts.push((route_id.clone(), 502));
                     upgrade_err(
                         &mut aggregated_err,
@@ -417,6 +441,14 @@ impl AciService {
                 {
                     ReverifyOutcome::Forwarded(response) => Some(response),
                     ReverifyOutcome::RefreshFailed(err) => {
+                        let failure = if matches!(err, ServiceError::UpstreamVerification(_)) {
+                            MiddlewareAttemptFailure::Verification
+                        } else {
+                            MiddlewareAttemptFailure::Transport
+                        };
+                        if let Some(observer) = attempt_observer.as_deref_mut() {
+                            observer.attempt_failed(&route_id, failure);
+                        }
                         let priority = if matches!(err, ServiceError::UpstreamVerification(_)) {
                             3
                         } else {
@@ -426,6 +458,9 @@ impl AciService {
                         None
                     }
                     ReverifyOutcome::Failed(err) => {
+                        if let Some(observer) = attempt_observer.as_deref_mut() {
+                            observer.attempt_failed(&route_id, MiddlewareAttemptFailure::Transport);
+                        }
                         upgrade_err(&mut aggregated_err, 2, err.into());
                         None
                     }
@@ -436,9 +471,6 @@ impl AciService {
                 };
 
                 let status = upstream_response.status_code;
-                if let Some(observer) = attempt_observer.as_deref_mut() {
-                    observer.attempt_response(&route_id, status);
-                }
                 if status != 200 {
                     self.metrics.record_upstream_response(
                         endpoint_path,
@@ -450,6 +482,11 @@ impl AciService {
                     let upstream_body = collect_upstream_body(upstream_response.body)
                         .await
                         .unwrap_or_default();
+                    let route_failure =
+                        is_route_failure_response(status, received_body, &upstream_body);
+                    if let Some(observer) = attempt_observer.as_deref_mut() {
+                        observer.attempt_response(&route_id, status, route_failure);
+                    }
                     if !is_last && should_fail_over(status, received_body, &upstream_body) {
                         retained = Some(RetainedResponse::Streaming {
                             error: StreamingUpstreamError {
@@ -476,6 +513,9 @@ impl AciService {
                             failed_attempts: std::mem::take(&mut failed_attempts),
                         },
                     )));
+                }
+                if let Some(observer) = attempt_observer.as_deref_mut() {
+                    observer.attempt_response(&route_id, status, false);
                 }
 
                 let upstream_headers = upstream_response.headers;
@@ -541,6 +581,14 @@ impl AciService {
             {
                 ReverifyOutcome::Forwarded(response) => Some(response),
                 ReverifyOutcome::RefreshFailed(err) => {
+                    let failure = if matches!(err, ServiceError::UpstreamVerification(_)) {
+                        MiddlewareAttemptFailure::Verification
+                    } else {
+                        MiddlewareAttemptFailure::Transport
+                    };
+                    if let Some(observer) = attempt_observer.as_deref_mut() {
+                        observer.attempt_failed(&route_id, failure);
+                    }
                     let priority = if matches!(err, ServiceError::UpstreamVerification(_)) {
                         3
                     } else {
@@ -550,6 +598,9 @@ impl AciService {
                     None
                 }
                 ReverifyOutcome::Failed(err) => {
+                    if let Some(observer) = attempt_observer.as_deref_mut() {
+                        observer.attempt_failed(&route_id, MiddlewareAttemptFailure::Transport);
+                    }
                     upgrade_err(&mut aggregated_err, 2, err.into());
                     None
                 }
@@ -560,8 +611,10 @@ impl AciService {
             };
 
             let status = upstream_response.status_code;
+            let route_failure =
+                is_route_failure_response(status, received_body, &upstream_response.body);
             if let Some(observer) = attempt_observer.as_deref_mut() {
-                observer.attempt_response(&route_id, status);
+                observer.attempt_response(&route_id, status, route_failure);
             }
             let response_model = accepted_response_model(status, &upstream_response.body);
             self.metrics.record_upstream_response(

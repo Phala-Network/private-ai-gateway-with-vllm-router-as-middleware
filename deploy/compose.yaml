@@ -32,6 +32,10 @@ services:
       - gateway-checkout:/var/lib/git-launcher
       - gateway-state:/var/lib/private-ai-gateway
       - /var/run/dstack.sock:/var/run/dstack.sock
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
 
 configs:

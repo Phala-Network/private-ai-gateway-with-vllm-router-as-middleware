@@ -6,6 +6,7 @@
 //! upstream verification, forwarding, and receipt finalization.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -370,6 +371,51 @@ async fn spawn_pressured_pig_upstream(calls: Arc<CapturedCalls>) -> String {
         calls,
     )
     .await
+}
+
+async fn spawn_slow_metrics_upstream(
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+) -> String {
+    let app = Router::new()
+        .route(
+            "/v1/metrics",
+            axum::routing::get(move || {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        concat!(
+                            "pig_dynamic_observed_running 0\n",
+                            "pig_dynamic_observed_waiting 0\n",
+                            "pig_dynamic_global_limit 10\n",
+                            "pig_tier_basic_limit 9\n",
+                            "pig_tier_inflight{tier=\"basic\"} 0\n",
+                        ),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({"object":"chat.completion","choices":[]})),
+                )
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
 }
 
 fn capture_headers(headers: &HeaderMap) -> HashMap<String, String> {
@@ -981,6 +1027,143 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
 }
 
 #[tokio::test]
+async fn ordinary_forwarding_bounds_failover_and_circuits_failed_routes() {
+    let mut configs = Vec::new();
+    let mut calls = Vec::new();
+    for index in 0..10 {
+        let captured = Arc::new(CapturedCalls::default());
+        let upstream = spawn_openai_upstream(
+            "failed-upstream",
+            502,
+            json!({"error":{"type":"server_error","message":"fixture failure"}}),
+            captured.clone(),
+        )
+        .await;
+        configs.push(upstream_config(
+            &format!("gpu-{index:02}"),
+            &upstream,
+            "gpt-test",
+            "upstream-model",
+        ));
+        calls.push(captured);
+    }
+    let manager = upstream_manager(configs);
+    let service = service_from_manager(&manager);
+    let mw = middleware(
+        manager,
+        MiddlewareConfig {
+            metrics_poll_ms: 0,
+            ..Default::default()
+        },
+    );
+
+    let (first_status, _, _) = response_parts(
+        mw.handle_completion(&service, chat_input("gpt-test", "fail quickly"))
+            .await,
+    )
+    .await;
+    assert_eq!(first_status, 502);
+    assert_eq!(calls[0].bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls[1].bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls[2].bodies.lock().unwrap().len(), 1);
+    assert!(calls[3..]
+        .iter()
+        .all(|captured| captured.bodies.lock().unwrap().is_empty()));
+
+    let total_calls = || {
+        calls
+            .iter()
+            .map(|captured| captured.bodies.lock().unwrap().len())
+            .sum::<usize>()
+    };
+    let mut forwarded_requests = 1usize;
+    let mut exhausted = None;
+    for _ in 0..19 {
+        let before = total_calls();
+        let response = response_parts(
+            mw.handle_completion(&service, chat_input("gpt-test", "keep failing"))
+                .await,
+        )
+        .await;
+        let after = total_calls();
+        if response.0 == 429 {
+            assert_eq!(
+                after, before,
+                "exhausted routing must not contact an upstream"
+            );
+            exhausted = Some(response);
+            break;
+        }
+        assert_eq!(response.0, 502);
+        assert!((1..=3).contains(&(after - before)));
+        forwarded_requests += 1;
+    }
+
+    for captured in &calls {
+        assert_eq!(captured.bodies.lock().unwrap().len(), 2);
+    }
+    let exhausted_snapshot = mw.admin_snapshot().unwrap();
+    assert!(exhausted_snapshot["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|route| route["circuit_open"] == json!(true)));
+
+    let (status, headers, body) = exhausted.expect("all failed routes must open their circuits");
+    assert_eq!(status, 429);
+    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
+    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
+    assert!(headers.get("retry-after").is_some());
+    for captured in &calls {
+        assert_eq!(captured.bodies.lock().unwrap().len(), 2);
+    }
+
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains(&format!(
+        "router_forward_candidate_count_count {forwarded_requests}"
+    )));
+    assert!(metrics.contains(&format!(
+        "router_forward_attempt_count_count {forwarded_requests}"
+    )));
+    assert!(metrics.contains("router_open_circuits 10"));
+}
+
+#[tokio::test]
+async fn metrics_polling_uses_bounded_concurrency() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let upstream = spawn_slow_metrics_upstream(active.clone(), max_active.clone()).await;
+    let configs = (0..10)
+        .map(|index| {
+            upstream_config(
+                &format!("gpu-{index:02}"),
+                &upstream,
+                "gpt-test",
+                "upstream-model",
+            )
+        })
+        .collect();
+    let manager = upstream_manager(configs);
+    let _mw = middleware(
+        manager,
+        MiddlewareConfig {
+            metrics_poll_ms: 10,
+            metrics_timeout_ms: 500,
+            ..Default::default()
+        },
+    );
+
+    tokio::time::sleep(Duration::from_millis(220)).await;
+
+    let observed = max_active.load(Ordering::SeqCst);
+    assert!(observed > 1, "poller did not exercise concurrent requests");
+    assert!(
+        observed <= 4,
+        "poller exceeded its four-request concurrency bound: {observed}"
+    );
+}
+
+#[tokio::test]
 async fn two_pressured_streaming_routes_exhaust_to_rate_limit() {
     let calls_a = Arc::new(CapturedCalls::default());
     let calls_b = Arc::new(CapturedCalls::default());
@@ -1553,7 +1736,7 @@ async fn image_fetch_5xx_becomes_client_400() {
                 "code": 500
             }
         }),
-        calls,
+        calls.clone(),
     )
     .await;
     let manager = upstream_manager(vec![upstream_config(
@@ -1561,8 +1744,7 @@ async fn image_fetch_5xx_becomes_client_400() {
     )]);
     let service = service_from_manager(&manager);
     let mw = middleware(manager, MiddlewareConfig::default());
-    let mut input = chat_input("gpt-test", "describe");
-    input.params = json!({
+    let params = json!({
         "model": "gpt-test",
         "messages": [{
             "role": "user",
@@ -1572,11 +1754,21 @@ async fn image_fetch_5xx_becomes_client_400() {
             ]
         }]
     });
-    input.received_body = serde_json::to_vec(&input.params).unwrap();
+    for _ in 0..2 {
+        let mut input = chat_input("gpt-test", "describe");
+        input.params = params.clone();
+        input.received_body = serde_json::to_vec(&input.params).unwrap();
 
-    let (status, _, body) = response_parts(mw.handle_completion(&service, input).await).await;
+        let (status, _, body) = response_parts(mw.handle_completion(&service, input).await).await;
 
-    assert_eq!(status, 400);
-    assert_eq!(body["error"]["type"], json!("invalid_request_error"));
-    assert!(body["error"]["message"].as_str().unwrap().contains(url));
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+        assert!(body["error"]["message"].as_str().unwrap().contains(url));
+    }
+    assert_eq!(calls.bodies.lock().unwrap().len(), 2);
+    let snapshot = mw.admin_snapshot().unwrap();
+    assert_eq!(
+        route_snapshot(&snapshot, "gpu-a:gpt-test")["circuit_open"],
+        json!(false)
+    );
 }

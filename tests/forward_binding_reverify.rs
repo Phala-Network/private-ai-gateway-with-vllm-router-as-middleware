@@ -297,7 +297,7 @@ impl MiddlewareAttemptObserver for RecordingAttemptObserver {
         self.events.push((route_id.to_string(), None));
     }
 
-    fn attempt_response(&mut self, route_id: &str, status: u16) {
+    fn attempt_response(&mut self, route_id: &str, status: u16, _route_failure: bool) {
         self.events.push((route_id.to_string(), Some(status)));
     }
 }

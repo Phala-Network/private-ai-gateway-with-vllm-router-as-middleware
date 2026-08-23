@@ -83,7 +83,9 @@ For each request, the router:
    meaningfully more loaded than the least-loaded route.
 8. Falls back to the least-loaded route when no prefix match exists or the
    matched route fails the load guard.
-9. Returns the rest as fallback candidates ordered by lower effective load.
+9. Returns at most three candidates, ordered by lower effective load, to bound
+   per-request connection and verification amplification during a multi-node
+   failure.
 10. Commits the routing text to the cache index only after the actual serving
     route succeeds. A buffered response must be a valid upstream 2xx JSON body;
     a streaming response must emit its first valid model-data SSE event.
@@ -104,7 +106,10 @@ nodes over time.
 
 ## PIG Metrics
 
-The router polls each upstream's metrics endpoint concurrently. By default:
+The router polls each upstream's metrics endpoint with bounded concurrency. A
+poll cycle uses at most four simultaneous metrics requests, so a large or
+failing upstream set cannot consume one connection per node at once. By
+default:
 
 ```text
 metrics_path = /v1/metrics
@@ -127,9 +132,12 @@ pig_tier_inflight{tier="basic"}
 pig_tier_inflight{tier="premium"}
 ```
 
-If a metrics sample is missing, failed, or stale, the route stays usable. The
-router falls back to gateway-local in-flight counters instead of blocking
-traffic only because observability is temporarily unavailable.
+After one or two failed polls, the router preserves the last successful sample
+and deprioritizes the affected route instead of presenting it as an empty node.
+Three consecutive poll failures open a metrics circuit and temporarily remove
+the route from request selection. The next successful poll closes that circuit.
+If no successful sample has ever existed, the router uses gateway-local
+in-flight counters until the failure threshold is reached.
 
 ## Basic And Premium
 
@@ -198,6 +206,13 @@ router_cache_match_chars_bucket{route,le}
 router_cache_prompt_tokens_total{route,selection_reason}
 router_cache_cached_tokens_total{route,selection_reason}
 router_cache_usage_skipped_total{reason}
+router_forward_candidate_count
+router_forward_attempt_count
+router_circuit_open_total{route,reason}
+router_process_open_fds
+router_process_max_fds
+router_metrics_error_upstreams
+router_open_circuits
 ```
 
 Route names are bounded by the configured upstream set, and `reason` and
@@ -223,6 +238,17 @@ middleware returns one aggregate client error but keeps the full attempt chain
 internally for structured `request_outcome` logs. When the chain ends in an
 upstream HTTP response, including an all-429 chain, the gateway relays the
 terminal upstream status after normal response classification.
+
+Request-side route circuits complement the three-candidate bound. Two
+consecutive routing, verification, transport, authentication/catalog, or 5xx
+failures open a route circuit for five seconds. A 5xx response that the existing
+error classifier identifies as client image-input failure or capacity
+exhaustion does not count as a node failure. A reachable response such as 2xx,
+3xx, 400, 422, or PIG 429 also closes the circuit. After five seconds the route
+is eligible for a new probe and a successful response restores it immediately.
+If every route is circuit-open, the router returns its standard
+OpenAI/vLLM-shaped 429 with `Retry-After` instead of walking failed nodes or
+leaking a routing 404.
 
 An unknown or unroutable public model is a `404 model_not_found`, not a malformed
 request. A provider-side `404` for one selected candidate is treated as a
@@ -253,8 +279,17 @@ The snapshot includes:
 - Cache-selection and load-selection counters.
 - Cache index type, aggregate index counters, and per-route cache record counts.
 - Redacted PIG metrics status, including sample age and parse errors.
+- Request-side and metrics-side circuit state, including consecutive failures
+  and remaining open time.
 
 The snapshot is operational state only. It is not part of the ACI proof chain.
+
+Production containers should set an explicit file-descriptor limit appropriate
+for expected long-lived streaming concurrency, for example a soft and hard
+`nofile` limit of `65536`. The router exports the effective Linux process limit
+as `router_process_max_fds`; operators should verify that value after startup
+instead of assuming the container inherited the intended limit. Raising the
+limit is headroom, not a substitute for the bounded failover and circuit logic.
 
 Downstream gateways that only need a coarse capacity signal can call
 `GET /v1/upstream-status` with API bearer auth. The response is one plain-text

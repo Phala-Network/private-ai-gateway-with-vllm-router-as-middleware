@@ -89,9 +89,18 @@ pub enum MiddlewareForwardResult {
 /// Bounded lifecycle notifications for middleware-owned route accounting.
 /// The generic forwarding service reports attempts without depending on a
 /// particular routing policy or metrics implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewareAttemptFailure {
+    Routing,
+    Verification,
+    Transport,
+}
+
 pub trait MiddlewareAttemptObserver: Send {
+    fn candidate_considered(&mut self, _route_id: &str) {}
     fn attempt_started(&mut self, route_id: &str);
-    fn attempt_response(&mut self, route_id: &str, status: u16);
+    fn attempt_response(&mut self, route_id: &str, status: u16, route_failure: bool);
+    fn attempt_failed(&mut self, _route_id: &str, _failure: MiddlewareAttemptFailure) {}
 }
 
 pub struct MiddlewareAllFailed {

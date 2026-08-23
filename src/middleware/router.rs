@@ -10,12 +10,14 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::StreamExt;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, Registry,
+    TextEncoder,
 };
 use serde_json::{json, Value};
 
-use crate::aggregator::service::{AciService, MiddlewareAttemptObserver};
+use crate::aggregator::service::{AciService, MiddlewareAttemptFailure, MiddlewareAttemptObserver};
 use crate::aggregator::upstream_config::{
     PublicUpstreamConfig, UpstreamConfigManager, UpstreamConfigSnapshot, UpstreamMetricsTarget,
     UpstreamProvider,
@@ -33,7 +35,11 @@ const UPSTREAM_STATUS_GREEN: u8 = 0;
 const UPSTREAM_STATUS_YELLOW: u8 = 1;
 const UPSTREAM_STATUS_RED: u8 = 2;
 const PIG_PRESSURE_PASSTHROUGH_REASON: &str = "pig_pressure_passthrough";
-const PIG_PRESSURE_PASSTHROUGH_CANDIDATE_LIMIT: usize = 3;
+const ROUTER_FORWARD_CANDIDATE_LIMIT: usize = 3;
+const ROUTE_CIRCUIT_FAILURE_THRESHOLD: u32 = 2;
+const ROUTE_CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(5);
+const METRICS_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
+const METRICS_POLL_CONCURRENCY_LIMIT: usize = 4;
 
 #[derive(Clone)]
 struct RouterRoute {
@@ -61,6 +67,44 @@ struct RouterState {
     cache_index: CacheIndex,
     upstream_metrics: HashMap<String, UpstreamMetrics>,
     dispatch_ledgers: HashMap<String, DispatchLedger>,
+    route_circuits: HashMap<String, RouteCircuit>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct RouteCircuit {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+    opens: u64,
+}
+
+impl RouteCircuit {
+    fn record_failure(&mut self, now: Instant) -> bool {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures < ROUTE_CIRCUIT_FAILURE_THRESHOLD {
+            return false;
+        }
+        let newly_opened = !self.is_open(now);
+        if newly_opened {
+            self.opens = self.opens.saturating_add(1);
+        }
+        self.open_until = Some(now + ROUTE_CIRCUIT_OPEN_DURATION);
+        newly_opened
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+
+    fn is_open(self, now: Instant) -> bool {
+        self.open_until.is_some_and(|until| now < until)
+    }
+
+    fn remaining_ms(self, now: Instant) -> u64 {
+        self.open_until
+            .and_then(|until| until.checked_duration_since(now))
+            .map_or(0, |remaining| remaining.as_millis() as u64)
+    }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -100,6 +144,8 @@ struct UpstreamMetrics {
     ok: bool,
     error: Option<String>,
     updated_at: Option<Instant>,
+    last_error_at: Option<Instant>,
+    consecutive_errors: u32,
     raw_observed_running: Option<f64>,
     raw_observed_waiting: Option<f64>,
     observed_running: Option<f64>,
@@ -140,6 +186,7 @@ impl UserTier {
 #[derive(Clone, Copy, Debug)]
 struct RoutePressure {
     blocked: bool,
+    circuit_open: bool,
     metrics_missing: bool,
     metrics_error: bool,
     waiting: u64,
@@ -156,7 +203,7 @@ enum LoadOrder {
     Running,
 }
 
-type RouteOrderKey = (u8, u8, u8, u64, u64, u64, u64, String);
+type RouteOrderKey = (u8, u8, u8, u8, u64, u64, u64, u64, String);
 
 pub(super) struct RouterBackend {
     upstream_config: Arc<UpstreamConfigManager>,
@@ -177,6 +224,8 @@ pub(super) struct RouteInFlight {
     route_id: Option<String>,
     pending_dispatch: bool,
     state: Arc<Mutex<RouterState>>,
+    metrics: RouterMetrics,
+    candidates_considered: usize,
     cache_observation: Option<CacheObservation>,
 }
 
@@ -195,6 +244,13 @@ struct RouterMetrics {
     cache_match_chars: HistogramVec,
     cache_prompt_tokens_total: IntCounterVec,
     cache_cached_tokens_total: IntCounterVec,
+    forward_candidate_count: Histogram,
+    forward_attempt_count: Histogram,
+    circuit_open_total: IntCounterVec,
+    process_open_fds: IntGauge,
+    process_max_fds: IntGauge,
+    metrics_error_upstreams: IntGauge,
+    open_circuits: IntGauge,
 }
 
 pub(super) struct CacheObservation {
@@ -314,6 +370,50 @@ impl RouterMetrics {
             &["route", "selection_reason"],
         )
         .map_err(|err| err.to_string())?;
+        let forward_candidate_count = Histogram::with_opts(
+            HistogramOpts::new(
+                "router_forward_candidate_count",
+                "Ordered candidates offered to one routed request.",
+            )
+            .buckets(vec![1.0, 2.0, 3.0]),
+        )
+        .map_err(|err| err.to_string())?;
+        let forward_attempt_count = Histogram::with_opts(
+            HistogramOpts::new(
+                "router_forward_attempt_count",
+                "Candidates considered by the forwarding walk for one request.",
+            )
+            .buckets(vec![1.0, 2.0, 3.0]),
+        )
+        .map_err(|err| err.to_string())?;
+        let circuit_open_total = IntCounterVec::new(
+            Opts::new(
+                "router_circuit_open_total",
+                "Route circuit openings by route and bounded failure class.",
+            ),
+            &["route", "reason"],
+        )
+        .map_err(|err| err.to_string())?;
+        let process_open_fds = IntGauge::new(
+            "router_process_open_fds",
+            "Open file descriptors held by the Router process on Linux.",
+        )
+        .map_err(|err| err.to_string())?;
+        let process_max_fds = IntGauge::new(
+            "router_process_max_fds",
+            "Soft file descriptor limit of the Router process on Linux.",
+        )
+        .map_err(|err| err.to_string())?;
+        let metrics_error_upstreams = IntGauge::new(
+            "router_metrics_error_upstreams",
+            "Configured upstreams whose most recent metrics poll failed.",
+        )
+        .map_err(|err| err.to_string())?;
+        let open_circuits = IntGauge::new(
+            "router_open_circuits",
+            "Open request-side route circuits plus metrics-side upstream circuits.",
+        )
+        .map_err(|err| err.to_string())?;
 
         for collector in [
             &affinity_considered_total,
@@ -326,6 +426,7 @@ impl RouterMetrics {
             &cache_usage_skipped_total,
             &cache_prompt_tokens_total,
             &cache_cached_tokens_total,
+            &circuit_open_total,
         ] {
             registry
                 .register(Box::new(collector.clone()))
@@ -337,6 +438,21 @@ impl RouterMetrics {
         registry
             .register(Box::new(cache_match_chars.clone()))
             .map_err(|err| err.to_string())?;
+        for collector in [&forward_candidate_count, &forward_attempt_count] {
+            registry
+                .register(Box::new(collector.clone()))
+                .map_err(|err| err.to_string())?;
+        }
+        for collector in [
+            &process_open_fds,
+            &process_max_fds,
+            &metrics_error_upstreams,
+            &open_circuits,
+        ] {
+            registry
+                .register(Box::new(collector.clone()))
+                .map_err(|err| err.to_string())?;
+        }
 
         Ok(Self {
             registry,
@@ -352,6 +468,13 @@ impl RouterMetrics {
             cache_match_chars,
             cache_prompt_tokens_total,
             cache_cached_tokens_total,
+            forward_candidate_count,
+            forward_attempt_count,
+            circuit_open_total,
+            process_open_fds,
+            process_max_fds,
+            metrics_error_upstreams,
+            open_circuits,
         })
     }
 
@@ -360,6 +483,47 @@ impl RouterMetrics {
         let mut body = Vec::new();
         encoder.encode(&self.registry.gather(), &mut body)?;
         Ok(body)
+    }
+
+    fn record_forward_candidate_count(&self, count: usize) {
+        self.forward_candidate_count.observe(count as f64);
+    }
+
+    fn record_forward_attempt_count(&self, count: usize) {
+        self.forward_attempt_count.observe(count as f64);
+    }
+
+    fn record_circuit_open(&self, route: &str, reason: &'static str) {
+        self.circuit_open_total
+            .with_label_values(&[route, reason])
+            .inc();
+    }
+
+    fn refresh_runtime(&self, state: &RouterState) {
+        let now = Instant::now();
+        let metrics_errors = state
+            .upstream_metrics
+            .values()
+            .filter(|metrics| !metrics.ok)
+            .count();
+        let open_routes = state
+            .route_circuits
+            .values()
+            .filter(|circuit| circuit.is_open(now))
+            .count()
+            + state
+                .upstream_metrics
+                .values()
+                .filter(|metrics| metrics.metrics_circuit_open())
+                .count();
+        self.metrics_error_upstreams.set(metrics_errors as i64);
+        self.open_circuits.set(open_routes as i64);
+        if let Some(open) = linux_open_fd_count() {
+            self.process_open_fds.set(open as i64);
+        }
+        if let Some(limit) = linux_soft_fd_limit() {
+            self.process_max_fds.set(limit as i64);
+        }
     }
 
     fn record_affinity_considered(&self, route: &str, rate: f32, matched_chars: usize) {
@@ -615,6 +779,9 @@ impl RouterBackend {
                 } else {
                     routes
                         .iter()
+                        .filter(|route| {
+                            !state.route_pressure(route, &self.config, tier).circuit_open
+                        })
                         .map(|route| route.route_id.clone())
                         .collect::<HashSet<_>>()
                 };
@@ -649,7 +816,7 @@ impl RouterBackend {
                     });
                     candidate_route_ids = ordered_route_ids
                         .into_iter()
-                        .take(PIG_PRESSURE_PASSTHROUGH_CANDIDATE_LIMIT)
+                        .take(ROUTER_FORWARD_CANDIDATE_LIMIT)
                         .collect::<HashSet<_>>();
                     ordered_pressure_keys
                 } else {
@@ -694,10 +861,14 @@ impl RouterBackend {
                 .cmp(&b_load)
                 .then_with(|| a.route_id.cmp(&b.route_id))
         });
+        limit_forward_routes(&mut routes);
         (routes, Some(selected), configured_count, routing_text)
     }
 
     pub(super) fn metrics_body(&self) -> Result<Vec<u8>, prometheus::Error> {
+        let state = self.state.lock().expect("router state poisoned");
+        self.metrics.refresh_runtime(&state);
+        drop(state);
         self.metrics.render()
     }
 
@@ -713,6 +884,7 @@ impl RouterBackend {
                 let cache_stats = state.cache_index.route_stats(model, &route_id);
                 let route = route_from_upstream(upstream, model, &self.config);
                 let pressure = state.route_pressure(&route, &self.config, UserTier::Basic);
+                let circuit = state.route_circuit_admin_json(&route_id);
                 routes.push(json!({
                     "route_id": route_id,
                     "enabled": upstream.enabled,
@@ -730,8 +902,10 @@ impl RouterBackend {
                     "pressure_passthrough": stats.pressure_passthrough,
                     "cache_records": cache_stats.records,
                     "cache_chars": cache_stats.chars,
-                    "selectable": !pressure.blocked,
-                    "pressure_passthrough_eligible": pressure.blocked,
+                    "selectable": !pressure.blocked && !pressure.circuit_open,
+                    "pressure_passthrough_eligible": pressure.blocked && !pressure.circuit_open,
+                    "circuit_open": pressure.circuit_open,
+                    "circuit": circuit,
                     "effective_running": pressure.effective_running,
                     "pending_reservations": pressure.pending_reservations,
                     "unreconciled_dispatches": pressure.unreconciled_dispatches,
@@ -904,6 +1078,8 @@ impl RouterBackend {
             tracing::debug!(public_model, "router middleware found no route");
         }
 
+        self.metrics.record_forward_candidate_count(routes.len());
+
         completion::run(
             service,
             self.config.sse_keepalive_ms,
@@ -936,7 +1112,7 @@ impl RouteInFlight {
     ) -> Self {
         let cache_observation = CacheObservation::new(
             state.clone(),
-            metrics,
+            metrics.clone(),
             model,
             routing_text,
             max_records,
@@ -946,6 +1122,8 @@ impl RouteInFlight {
             route_id: Some(selection.route_id.clone()),
             pending_dispatch: true,
             state,
+            metrics,
+            candidates_considered: 0,
             cache_observation,
         }
     }
@@ -1007,14 +1185,18 @@ impl RouteInFlight {
 }
 
 impl MiddlewareAttemptObserver for RouteInFlight {
+    fn candidate_considered(&mut self, _route_id: &str) {
+        self.candidates_considered = self.candidates_considered.saturating_add(1);
+    }
+
     fn attempt_started(&mut self, route_id: &str) {
         self.move_reservation(route_id, true);
     }
 
-    fn attempt_response(&mut self, route_id: &str, status: u16) {
+    fn attempt_response(&mut self, route_id: &str, status: u16, route_failure: bool) {
         let recorded = {
             let mut state = self.state.lock().expect("router state poisoned");
-            state.record_attempt_response(route_id, status)
+            state.record_attempt_response(route_id, status, route_failure, &self.metrics)
         };
         if let Some((upstream_429_total, unreconciled_dispatches)) = recorded {
             tracing::info!(
@@ -1026,10 +1208,17 @@ impl MiddlewareAttemptObserver for RouteInFlight {
             );
         }
     }
+
+    fn attempt_failed(&mut self, route_id: &str, failure: MiddlewareAttemptFailure) {
+        let mut state = self.state.lock().expect("router state poisoned");
+        state.record_attempt_failure(route_id, failure, &self.metrics);
+    }
 }
 
 impl Drop for RouteInFlight {
     fn drop(&mut self) {
+        self.metrics
+            .record_forward_attempt_count(self.candidates_considered);
         if let Some(route_id) = self.route_id.take() {
             let mut state = self.state.lock().expect("router state poisoned");
             state.decrement_running(&route_id);
@@ -1092,7 +1281,21 @@ impl RouterState {
         }
     }
 
-    fn record_attempt_response(&mut self, route_id: &str, status: u16) -> Option<(u64, usize)> {
+    fn record_attempt_response(
+        &mut self,
+        route_id: &str,
+        status: u16,
+        route_failure: bool,
+        metrics: &RouterMetrics,
+    ) -> Option<(u64, usize)> {
+        if route_failure {
+            self.record_route_failure(route_id, "upstream_status", metrics);
+        } else {
+            self.route_circuits
+                .entry(route_id.to_string())
+                .or_default()
+                .record_success();
+        }
         if status != 429 {
             return None;
         }
@@ -1108,6 +1311,60 @@ impl RouterState {
             .unwrap_or_default()
             .unreconciled();
         Some((upstream_429_total, unreconciled))
+    }
+
+    fn record_attempt_failure(
+        &mut self,
+        route_id: &str,
+        failure: MiddlewareAttemptFailure,
+        metrics: &RouterMetrics,
+    ) {
+        let reason = match failure {
+            MiddlewareAttemptFailure::Routing => "routing",
+            MiddlewareAttemptFailure::Verification => "verification",
+            MiddlewareAttemptFailure::Transport => "transport",
+        };
+        self.record_route_failure(route_id, reason, metrics);
+    }
+
+    fn record_route_failure(
+        &mut self,
+        route_id: &str,
+        reason: &'static str,
+        metrics: &RouterMetrics,
+    ) {
+        let circuit = self.route_circuits.entry(route_id.to_string()).or_default();
+        if circuit.record_failure(Instant::now()) {
+            metrics.record_circuit_open(route_id, reason);
+            tracing::warn!(
+                route = route_id,
+                reason,
+                failures = circuit.consecutive_failures,
+                open_ms = ROUTE_CIRCUIT_OPEN_DURATION.as_millis() as u64,
+                "router middleware opened route circuit"
+            );
+        }
+    }
+
+    fn route_circuit_open(&self, route_id: &str) -> bool {
+        self.route_circuits
+            .get(route_id)
+            .is_some_and(|circuit| circuit.is_open(Instant::now()))
+    }
+
+    fn route_circuit_admin_json(&self, route_id: &str) -> Value {
+        let now = Instant::now();
+        let circuit = self
+            .route_circuits
+            .get(route_id)
+            .copied()
+            .unwrap_or_default();
+        json!({
+            "open": circuit.is_open(now),
+            "remaining_ms": circuit.remaining_ms(now),
+            "consecutive_failures": circuit.consecutive_failures,
+            "opens": circuit.opens,
+        })
     }
 
     fn decrement_running(&mut self, route_id: &str) {
@@ -1170,6 +1427,7 @@ impl RouterState {
             LoadOrder::Running => (pressure.effective_running as u64, pressure.fullness_milli),
         };
         (
+            u8::from(pressure.circuit_open),
             u8::from(pressure.blocked),
             u8::from(pressure.metrics_error),
             u8::from(pressure.metrics_missing),
@@ -1188,7 +1446,7 @@ impl RouterState {
         tier: UserTier,
     ) -> bool {
         let pressure = self.route_pressure(route, config, tier);
-        !pressure.blocked
+        !pressure.blocked && !pressure.circuit_open
     }
 
     fn selectable_route_ids<'a>(
@@ -1220,9 +1478,11 @@ impl RouterState {
         let unreconciled_dispatches = ledger.unreconciled();
         let local_projection = pending_reservations.saturating_add(unreconciled_dispatches);
         let fallback_effective_running = local_running.max(local_projection);
+        let request_circuit_open = self.route_circuit_open(&route.route_id);
         let Some(metrics) = self.upstream_metrics.get(&route.upstream_name) else {
             return RoutePressure {
                 blocked: false,
+                circuit_open: request_circuit_open,
                 metrics_missing: true,
                 metrics_error: false,
                 waiting: 0,
@@ -1233,11 +1493,13 @@ impl RouterState {
                 processed: stats.processed,
             };
         };
+        let circuit_open = request_circuit_open || metrics.metrics_circuit_open();
         if metrics.is_stale(config) {
             return RoutePressure {
                 blocked: false,
+                circuit_open,
                 metrics_missing: true,
-                metrics_error: false,
+                metrics_error: !metrics.ok,
                 waiting: 0,
                 fullness_milli: 0,
                 effective_running: fallback_effective_running,
@@ -1246,11 +1508,12 @@ impl RouterState {
                 processed: stats.processed,
             };
         }
-        if !metrics.ok {
+        if metrics.updated_at.is_none() {
             return RoutePressure {
                 blocked: false,
+                circuit_open,
                 metrics_missing: true,
-                metrics_error: true,
+                metrics_error: !metrics.ok,
                 waiting: 0,
                 fullness_milli: 0,
                 effective_running: fallback_effective_running,
@@ -1285,8 +1548,9 @@ impl RouterState {
             blocked: inconsistent_request_aware_projection
                 || observed_waiting > 0.0
                 || tier_fullness >= 1_000,
+            circuit_open,
             metrics_missing: false,
-            metrics_error: false,
+            metrics_error: !metrics.ok,
             waiting: observed_waiting.ceil() as u64,
             fullness_milli: tier_fullness,
             effective_running,
@@ -1327,6 +1591,9 @@ impl RouterState {
         tier: UserTier,
     ) -> u8 {
         let pressure = self.route_pressure(route, config, tier);
+        if pressure.circuit_open {
+            return UPSTREAM_STATUS_RED;
+        }
         if pressure.blocked || pressure.waiting > 0 || pressure.fullness_milli >= 1_000 {
             return UPSTREAM_STATUS_YELLOW;
         }
@@ -1453,7 +1720,12 @@ impl RouterState {
         config: &MiddlewareConfig,
         tier: UserTier,
     ) -> Option<RouteSelection> {
-        let selected = self.least_loaded(routes, config, tier)?;
+        let available = routes
+            .iter()
+            .filter(|route| !self.route_pressure(route, config, tier).circuit_open)
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected = self.least_loaded(&available, config, tier)?;
         let pressure = self.route_pressure(selected, config, tier);
         Some(RouteSelection {
             route_id: selected.route_id.clone(),
@@ -1571,7 +1843,7 @@ impl RouterState {
     fn update_upstream_metrics_from_poll(
         &mut self,
         upstream_name: String,
-        metrics: UpstreamMetrics,
+        mut metrics: UpstreamMetrics,
         dispatch_watermark: u64,
     ) {
         if metrics.ok {
@@ -1579,8 +1851,18 @@ impl RouterState {
                 .entry(upstream_name.clone())
                 .or_default()
                 .observe_successful_poll(dispatch_watermark);
+            self.update_upstream_metrics(upstream_name, metrics);
+            return;
         }
-        self.update_upstream_metrics(upstream_name, metrics);
+        if let Some(previous) = self.upstream_metrics.get_mut(&upstream_name) {
+            previous.ok = false;
+            previous.error = metrics.error.take();
+            previous.last_error_at = metrics.last_error_at.or(Some(Instant::now()));
+            previous.consecutive_errors = previous.consecutive_errors.saturating_add(1);
+        } else {
+            metrics.consecutive_errors = metrics.consecutive_errors.max(1);
+            self.update_upstream_metrics(upstream_name, metrics);
+        }
     }
 
     fn dispatch_watermark(&self, upstream_name: &str) -> u64 {
@@ -1594,6 +1876,11 @@ impl RouterState {
             .retain(|name, _| upstream_names.contains(name));
         self.dispatch_ledgers
             .retain(|name, _| upstream_names.contains(name));
+        self.route_circuits.retain(|route_id, _| {
+            route_id
+                .split_once(':')
+                .is_some_and(|(name, _)| upstream_names.contains(name))
+        });
     }
 
     fn metrics_admin_json(&self, upstream_name: &str, config: &MiddlewareConfig) -> Value {
@@ -1608,6 +1895,9 @@ impl RouterState {
             "ok": metrics.ok,
             "stale": metrics.is_stale(config),
             "error": metrics.error,
+            "consecutive_errors": metrics.consecutive_errors,
+            "last_error_age_ms": metrics.last_error_age_ms(),
+            "metrics_circuit_open": metrics.metrics_circuit_open(),
             "capacity_protocol": metrics.capacity_protocol_name(),
             "raw_observed_running": metrics.raw_observed_running,
             "raw_observed_waiting": metrics.raw_observed_waiting,
@@ -1646,7 +1936,8 @@ impl UpstreamMetrics {
         Self {
             ok: false,
             error: Some(message.into()),
-            updated_at: Some(Instant::now()),
+            last_error_at: Some(Instant::now()),
+            consecutive_errors: 1,
             ..Default::default()
         }
     }
@@ -1661,6 +1952,15 @@ impl UpstreamMetrics {
     fn age_ms(&self) -> Option<u64> {
         self.updated_at
             .map(|updated_at| updated_at.elapsed().as_millis() as u64)
+    }
+
+    fn last_error_age_ms(&self) -> Option<u64> {
+        self.last_error_at
+            .map(|last_error_at| last_error_at.elapsed().as_millis() as u64)
+    }
+
+    fn metrics_circuit_open(&self) -> bool {
+        !self.ok && self.consecutive_errors >= METRICS_CIRCUIT_FAILURE_THRESHOLD
     }
 
     fn request_aware_capacity_is_open(&self) -> bool {
@@ -1709,6 +2009,34 @@ fn ratio_milli(value: f64, limit: Option<f64>) -> u64 {
         return 0;
     }
     ((value / limit) * 1_000.0).max(0.0).round() as u64
+}
+
+fn linux_open_fd_count() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_dir("/proc/self/fd")
+            .ok()
+            .map(|entries| entries.count())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn linux_soft_fd_limit() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+        let line = limits
+            .lines()
+            .find(|line| line.starts_with("Max open files"))?;
+        line.split_whitespace().nth(3)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 fn usage_prompt_tokens(usage: &Value) -> Option<u64> {
@@ -1776,7 +2104,7 @@ fn spawn_metrics_poller(
                     })
                     .collect::<HashMap<_, _>>()
             };
-            let fetched = futures_util::future::join_all(targets.into_iter().map(|target| {
+            let mut fetched = futures_util::stream::iter(targets.into_iter().map(|target| {
                 let upstream_name = target.upstream_name.clone();
                 let dispatch_watermark = dispatch_watermarks
                     .get(&upstream_name)
@@ -1789,8 +2117,8 @@ fn spawn_metrics_poller(
                     (upstream_name, dispatch_watermark, metrics)
                 }
             }))
-            .await;
-            for (upstream_name, dispatch_watermark, metrics) in fetched {
+            .buffer_unordered(METRICS_POLL_CONCURRENCY_LIMIT);
+            while let Some((upstream_name, dispatch_watermark, metrics)) = fetched.next().await {
                 let mut state = state.lock().expect("router state poisoned");
                 state.update_upstream_metrics_from_poll(upstream_name, metrics, dispatch_watermark);
             }
@@ -1930,6 +2258,10 @@ fn route_from_upstream(
             engine: config.default_engine,
         },
     }
+}
+
+fn limit_forward_routes(routes: &mut Vec<RouterRoute>) {
+    routes.truncate(ROUTER_FORWARD_CANDIDATE_LIMIT);
 }
 
 fn provider_format(provider: UpstreamProvider) -> ProviderFormat {
@@ -2477,7 +2809,12 @@ mod tests {
             request_aware_metrics(0.0, 0.0, false, 0.0),
         );
         state.record_dispatch_for_route("new:m");
-        state.record_attempt_response("new:m", 429);
+        state.record_attempt_response(
+            "new:m",
+            429,
+            false,
+            &RouterMetrics::new().expect("test router metrics"),
+        );
 
         let pressure = state.route_pressure(&routes[0], &config, UserTier::Basic);
         assert!(!pressure.blocked);
@@ -2773,6 +3110,149 @@ mod tests {
     }
 
     #[test]
+    fn failed_metrics_poll_preserves_last_good_capacity() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let route = test_route("a:m");
+        state.update_upstream_metrics_from_poll(
+            "a".to_string(),
+            test_metrics(7.0, 0.0, 10.0, 9.0, 7.0),
+            0,
+        );
+
+        state.update_upstream_metrics_from_poll(
+            "a".to_string(),
+            UpstreamMetrics::collected_error("fetch_error"),
+            0,
+        );
+
+        let pressure = state.route_pressure(&route, &config, UserTier::Basic);
+        assert!(pressure.metrics_error);
+        assert!(!pressure.metrics_missing);
+        assert!(!pressure.circuit_open);
+        assert_eq!(pressure.effective_running, 7);
+        assert_eq!(pressure.fullness_milli, 778);
+        assert_eq!(state.upstream_metrics["a"].observed_running, Some(7.0));
+        assert_eq!(state.upstream_metrics["a"].consecutive_errors, 1);
+    }
+
+    #[test]
+    fn repeated_metrics_failures_open_and_success_closes_metrics_circuit() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m")];
+        state.update_upstream_metrics_from_poll(
+            "a".to_string(),
+            test_metrics(1.0, 0.0, 10.0, 9.0, 1.0),
+            0,
+        );
+        for _ in 0..METRICS_CIRCUIT_FAILURE_THRESHOLD {
+            state.update_upstream_metrics_from_poll(
+                "a".to_string(),
+                UpstreamMetrics::collected_error("fetch_error"),
+                0,
+            );
+        }
+
+        let pressure = state.route_pressure(&routes[0], &config, UserTier::Basic);
+        assert!(pressure.circuit_open);
+        assert!(
+            state
+                .select("m", "blocked", &routes, &config, UserTier::Basic)
+                .is_none(),
+            "a metrics circuit must not fall back through pressure passthrough"
+        );
+
+        state.update_upstream_metrics_from_poll(
+            "a".to_string(),
+            test_metrics(1.0, 0.0, 10.0, 9.0, 1.0),
+            0,
+        );
+        assert!(state
+            .select("m", "recovered", &routes, &config, UserTier::Basic)
+            .is_some());
+    }
+
+    #[test]
+    fn request_failures_open_route_circuit_and_http_success_closes_it() {
+        let mut state = RouterState::default();
+        let config = MiddlewareConfig::default();
+        let routes = vec![test_route("a:m")];
+        let metrics = RouterMetrics::new().expect("test router metrics");
+        state.update_upstream_metrics("a".to_string(), test_metrics(1.0, 0.0, 10.0, 9.0, 1.0));
+
+        for _ in 0..ROUTE_CIRCUIT_FAILURE_THRESHOLD {
+            state.record_attempt_failure("a:m", MiddlewareAttemptFailure::Transport, &metrics);
+        }
+        assert!(
+            state
+                .route_pressure(&routes[0], &config, UserTier::Basic)
+                .circuit_open
+        );
+        assert!(state
+            .select("m", "blocked", &routes, &config, UserTier::Basic)
+            .is_none());
+
+        state.record_attempt_response("a:m", 200, false, &metrics);
+        assert!(state
+            .select("m", "recovered", &routes, &config, UserTier::Basic)
+            .is_some());
+    }
+
+    #[test]
+    fn client_errors_and_capacity_rejections_do_not_open_route_circuit() {
+        let metrics = RouterMetrics::new().expect("test router metrics");
+        for status in [200, 400, 422, 429, 500] {
+            let mut state = RouterState::default();
+            for _ in 0..ROUTE_CIRCUIT_FAILURE_THRESHOLD {
+                state.record_attempt_failure("a:m", MiddlewareAttemptFailure::Transport, &metrics);
+            }
+
+            state.record_attempt_response("a:m", status, false, &metrics);
+
+            let circuit = state.route_circuits["a:m"];
+            assert!(!circuit.is_open(Instant::now()), "status {status}");
+            assert_eq!(circuit.consecutive_failures, 0, "status {status}");
+        }
+    }
+
+    #[test]
+    fn route_circuit_reopens_only_for_bounded_duration() {
+        let now = Instant::now();
+        let mut circuit = RouteCircuit::default();
+        for _ in 0..ROUTE_CIRCUIT_FAILURE_THRESHOLD {
+            circuit.record_failure(now);
+        }
+        assert!(circuit.is_open(now + Duration::from_secs(1)));
+        assert!(!circuit.is_open(now + ROUTE_CIRCUIT_OPEN_DURATION));
+    }
+
+    #[test]
+    fn forwarding_candidate_list_is_bounded_to_three() {
+        let mut routes = (0..10)
+            .map(|index| test_route(&format!("gpu-{index}:m")))
+            .collect::<Vec<_>>();
+
+        limit_forward_routes(&mut routes);
+
+        assert_eq!(routes.len(), ROUTER_FORWARD_CANDIDATE_LIMIT);
+        assert_eq!(routes[0].route_id, "gpu-0:m");
+        assert_eq!(routes[2].route_id, "gpu-2:m");
+    }
+
+    #[test]
+    fn runtime_metrics_expose_fd_and_breaker_signals() {
+        let metrics = RouterMetrics::new().expect("test router metrics");
+        metrics.refresh_runtime(&RouterState::default());
+        let body = String::from_utf8(metrics.render().unwrap()).unwrap();
+
+        assert!(body.contains("router_process_open_fds"));
+        assert!(body.contains("router_process_max_fds"));
+        assert!(body.contains("router_metrics_error_upstreams"));
+        assert!(body.contains("router_open_circuits"));
+    }
+
+    #[test]
     fn upstream_status_returns_green_when_any_route_has_capacity() {
         let mut state = RouterState::default();
         let config = MiddlewareConfig::default();
@@ -2881,7 +3361,7 @@ mod tests {
 
         assert_eq!(state.lock().unwrap().dispatch_watermark("a"), 0);
         MiddlewareAttemptObserver::attempt_started(&mut guard, "a:m");
-        MiddlewareAttemptObserver::attempt_response(&mut guard, "a:m", 429);
+        MiddlewareAttemptObserver::attempt_response(&mut guard, "a:m", 429, false);
         MiddlewareAttemptObserver::attempt_started(&mut guard, "b:m");
 
         {
@@ -3104,6 +3584,7 @@ mod tests {
             basic_inflight: Some(0.0),
             premium_inflight: Some(0.0),
             error: None,
+            ..Default::default()
         }
     }
 }

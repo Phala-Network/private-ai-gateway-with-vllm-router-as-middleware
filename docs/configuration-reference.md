@@ -84,7 +84,7 @@ security boundary.
 | `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
 | `middleware.max_history_per_route` | `256` | Maximum routing-text records kept per public model and route in the process-local radix cache index. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
 | `middleware.metrics_poll_ms` | `1000` | Background upstream metrics polling interval. Set to `0` to disable PIG-aware routing and use only gateway-local in-flight counters. |
-| `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling is concurrent, so one slow upstream does not serially delay the full target set. |
+| `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling uses an internal concurrency bound of four, so one slow upstream does not block the other active slots and a large target set cannot open one metrics connection per node at once. |
 | `middleware.metrics_stale_ms` | `3000` | Age after which a metrics sample is ignored and the route falls back to local in-flight state. |
 | `middleware.metrics_path` | `/v1/metrics` | Metrics path appended to each upstream base URL. The upstream's configured bearer token is used for metrics auth. |
 | `middleware.trusted_user_tier_header` | `false` | Whether inbound `x-user-tier` is trusted for routing and forwarding to PIG. Keep `false` for public endpoints unless a trusted front door strips or sets this header. With the default, all requests are routed as `basic` and no caller-supplied tier header is forwarded. |
