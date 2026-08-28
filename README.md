@@ -157,6 +157,8 @@ Operationally useful Router artifacts are:
 - `GET /v1/aci/sessions/{session_id}`: fetches an attested-session audit
   record referenced by a receipt.
 - `GET /v1/admin/router`: authenticated router snapshot with per-route state.
+- `PATCH /v1/admin/router`: authenticated hot update for bounded Router tuning
+  parameters. Overrides persist in the gateway state directory until reset.
 - `GET /v1/admin/upstreams`: authenticated dynamic upstream config snapshot.
 - `GET /v1/upstream-status`: coarse route capacity signal for downstream
   gateways.

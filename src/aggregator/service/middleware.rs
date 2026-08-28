@@ -335,7 +335,7 @@ impl AciService {
             }
 
             let prepared = match self.upstream.prepare(UpstreamRequest {
-                body: candidate.body.clone(),
+                body: candidate.body.as_ref().to_vec(),
                 headers: upstream_headers.clone(),
                 path: Some(endpoint_path.to_string()),
                 target_route_id: Some(route_id.clone()),
@@ -630,7 +630,7 @@ impl AciService {
                         response_model,
                         recorded_event,
                         route_id: route_id.clone(),
-                        middleware_forwarded_body: candidate.body.clone(),
+                        middleware_forwarded_body: candidate.body.as_ref().to_vec(),
                         forwarded_body,
                     }),
                     attempt_slot: failed_attempts.len(),
@@ -645,7 +645,7 @@ impl AciService {
                     response_model,
                     recorded_event,
                     route_id,
-                    middleware_forwarded_body: candidate.body.clone(),
+                    middleware_forwarded_body: candidate.body.as_ref().to_vec(),
                     forwarded_body,
                 },
                 std::mem::take(&mut failed_attempts),

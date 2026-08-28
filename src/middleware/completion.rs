@@ -4,6 +4,7 @@
 //! route, verifies the upstream, enforces channel binding, forwards the request,
 //! and finalizes receipts.
 
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,10 +28,16 @@ use crate::aggregator::service::{
 
 use super::control::ControlClient;
 use super::errors::{self, Surface};
-use super::router::RouteInFlight;
+use super::router::{RetryPlanner, RouteInFlight};
 use super::sse::{KeepAliveStream, MeterStream, StreamReport};
 use super::stream_transform::SseTransformStream;
 use super::types::{Endpoint, ProviderFormat, RouteCandidate};
+
+pub(super) struct CompletionRoutePlan {
+    pub(super) candidates: Vec<RouteCandidate>,
+    pub(super) retry_planner: Option<RetryPlanner>,
+    pub(super) route_in_flight: Option<RouteInFlight>,
+}
 use super::{response_transform, stream_transform};
 
 /// Everything the completion path needs, computed by the HTTP handler after
@@ -234,13 +241,51 @@ fn passthrough_forward_candidates(
     received_body: &[u8],
     candidates: &[RouteCandidate],
 ) -> Vec<ForwardCandidate> {
+    let body: Arc<[u8]> = Arc::from(received_body);
     candidates
         .iter()
         .map(|candidate| ForwardCandidate {
             route_id: candidate.route_id.clone(),
-            body: received_body.to_vec(),
+            body: body.clone(),
         })
         .collect()
+}
+
+fn retryable_capacity_attempts(result: &MiddlewareForwardResult) -> Option<Vec<(String, u16)>> {
+    let (status, selected_route, failed_attempts) = match result {
+        MiddlewareForwardResult::Forwarded(forward) => (
+            forward.upstream_status,
+            &forward.selected_route,
+            &forward.failed_attempts,
+        ),
+        MiddlewareForwardResult::UpstreamError(error) => (
+            error.error.upstream_status,
+            &error.selected_route,
+            &error.failed_attempts,
+        ),
+        MiddlewareForwardResult::Stream(_) | MiddlewareForwardResult::AllFailed(_) => return None,
+    };
+    if status != 429
+        || failed_attempts
+            .iter()
+            .any(|(_, failed_status)| *failed_status != 429)
+    {
+        return None;
+    }
+    let mut attempts = failed_attempts.clone();
+    attempts.push((selected_route.clone(), 429));
+    Some(attempts)
+}
+
+fn prepend_failed_attempts(result: &mut MiddlewareForwardResult, mut previous: Vec<(String, u16)>) {
+    let current = match result {
+        MiddlewareForwardResult::Forwarded(result) => &mut result.failed_attempts,
+        MiddlewareForwardResult::Stream(result) => &mut result.failed_attempts,
+        MiddlewareForwardResult::UpstreamError(result) => &mut result.failed_attempts,
+        MiddlewareForwardResult::AllFailed(result) => &mut result.failed_attempts,
+    };
+    previous.append(current);
+    *current = previous;
 }
 
 fn response_usage(value: &Value) -> Option<&Value> {
@@ -280,9 +325,13 @@ pub(super) async fn run(
     control: Option<ControlClient>,
     pricing: Option<Value>,
     input: CompletionInput,
-    candidates: Vec<RouteCandidate>,
-    mut route_in_flight: Option<RouteInFlight>,
+    route_plan: CompletionRoutePlan,
 ) -> Response {
+    let CompletionRoutePlan {
+        candidates,
+        retry_planner,
+        mut route_in_flight,
+    } = route_plan;
     let started = Instant::now();
     let CompletionInput {
         endpoint,
@@ -318,17 +367,21 @@ pub(super) async fn run(
         return rate_limited_generated(surface, service, endpoint_path, &request_id, message);
     }
 
+    let mut candidate_formats = candidates
+        .iter()
+        .map(|candidate| (candidate.route_id.clone(), candidate.format))
+        .collect::<HashMap<_, _>>();
     let forward_candidates = passthrough_forward_candidates(&received_body, &candidates);
 
     let context = GatewayRequestContext {
         request_id: request_id.clone(),
-        user_model,
+        user_model: user_model.clone(),
         target_route_id: None,
-        user_tier,
+        user_tier: user_tier.clone(),
     };
 
     let journal = MiddlewareReceiptJournal::default();
-    let result = service
+    let mut result = service
         .forward_chat_completion_for_middleware_observed(
             ChatCompletionRequest {
                 context,
@@ -336,7 +389,7 @@ pub(super) async fn run(
                 received_body: &received_body,
                 forwarded_body: None,
                 aci_required,
-                aci_session_ids,
+                aci_session_ids: aci_session_ids.clone(),
                 upstream_verification_event: None,
                 requester: requester.clone(),
                 e2ee: None,
@@ -350,17 +403,76 @@ pub(super) async fn run(
         )
         .await;
 
+    if let (Ok(forwarded), Some(planner), Some(in_flight)) = (
+        result.as_ref(),
+        retry_planner.as_ref(),
+        route_in_flight.as_mut(),
+    ) {
+        if let Some(previous_attempts) = retryable_capacity_attempts(forwarded) {
+            let attempted_route_ids = previous_attempts
+                .iter()
+                .map(|(route_id, _)| route_id.clone())
+                .collect::<HashSet<_>>();
+            let retry_candidates = planner.next_round(&attempted_route_ids, in_flight).await;
+            if !retry_candidates.is_empty() {
+                candidate_formats.extend(
+                    retry_candidates
+                        .iter()
+                        .map(|candidate| (candidate.route_id.clone(), candidate.format)),
+                );
+                let forward_candidates =
+                    passthrough_forward_candidates(&received_body, &retry_candidates);
+                let retry_context = GatewayRequestContext {
+                    request_id: request_id.clone(),
+                    user_model: user_model.clone(),
+                    target_route_id: None,
+                    user_tier: user_tier.clone(),
+                };
+                let mut retry_result = service
+                    .forward_chat_completion_for_middleware_observed(
+                        ChatCompletionRequest {
+                            context: retry_context,
+                            endpoint_path,
+                            received_body: &received_body,
+                            forwarded_body: None,
+                            aci_required,
+                            aci_session_ids: aci_session_ids.clone(),
+                            upstream_verification_event: None,
+                            requester: requester.clone(),
+                            e2ee: None,
+                        },
+                        forward_candidates,
+                        stream,
+                        journal.clone(),
+                        Some(in_flight as &mut dyn MiddlewareAttemptObserver),
+                    )
+                    .await;
+                let retry_outcome = match retry_result.as_ref() {
+                    Ok(forwarded) if retryable_capacity_attempts(forwarded).is_some() => {
+                        "exhausted_429"
+                    }
+                    Ok(_) => "completed",
+                    Err(_) => "error",
+                };
+                planner.record_outcome(retry_outcome);
+                if let Ok(retry_forwarded) = retry_result.as_mut() {
+                    prepend_failed_attempts(retry_forwarded, previous_attempts);
+                }
+                result = retry_result;
+            }
+        }
+    }
+
     match result {
         Ok(MiddlewareForwardResult::Forwarded(forward)) => {
             if let Some(in_flight) = route_in_flight.as_mut() {
                 in_flight.retarget(&forward.selected_route);
             }
             let upstream_status = forward.upstream_status;
-            let selected_format = candidates
-                .iter()
-                .find(|c| c.route_id == forward.selected_route)
-                .or_else(|| candidates.first())
-                .map(|c| c.format)
+            let selected_format = candidate_formats
+                .get(&forward.selected_route)
+                .copied()
+                .or_else(|| candidates.first().map(|candidate| candidate.format))
                 .unwrap_or(ProviderFormat::Openai);
 
             let (client_status, mut final_body) = if (200..300).contains(&upstream_status) {
@@ -486,11 +598,10 @@ pub(super) async fn run(
                 .to_string();
             let upstream_status = forward.upstream_status;
             let attempt_index = forward.failed_attempts.len() as u32;
-            let selected_format = candidates
-                .iter()
-                .find(|c| c.route_id == forward.selected_route)
-                .or_else(|| candidates.first())
-                .map(|c| c.format)
+            let selected_format = candidate_formats
+                .get(&forward.selected_route)
+                .copied()
+                .or_else(|| candidates.first().map(|candidate| candidate.format))
                 .unwrap_or(ProviderFormat::Openai);
             let transformed: ServiceResponseStream =
                 match stream_transform::select_stream_transform(selected_format, endpoint) {
@@ -799,7 +910,10 @@ mod tests {
         assert_eq!(forward.len(), candidates.len());
         assert_eq!(forward[0].route_id, "use2-a:gemma4-31b-it");
         assert_eq!(forward[1].route_id, "use2-b:gemma4-31b-it");
-        assert!(forward.iter().all(|candidate| candidate.body == received));
+        assert!(forward
+            .iter()
+            .all(|candidate| candidate.body.as_ref() == received));
+        assert!(Arc::ptr_eq(&forward[0].body, &forward[1].body));
     }
 
     #[test]

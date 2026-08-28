@@ -48,23 +48,31 @@ real admission decision. This keeps the learning loop observable.
    - label the selection reason as `pig_pressure_passthrough`.
 
 3. Keep candidate ordering useful:
-   - for normal selection, keep only normally selectable routes;
+   - for normal selection, put the cache/load winner first but retain
+     pressure-ordered hard-eligible fallbacks;
    - for passthrough fallback, keep all hard-eligible routes and put the selected
-     route first;
-   - preserve pressure order for the remaining fallback candidates, so if the
-     first PIG returns 429 the verified forwarding layer can immediately try the
-     next least-pressured hard-eligible route instead of stopping at the first
-     rejected node.
+     least-bad route first;
+   - preserve pressure order for the remaining candidates, so a PIG 429 can
+     immediately fall through to a sibling that may still admit the request.
 
-4. Bound the pressure fallback walk:
-   - `pig_pressure_passthrough` passes at most the first three pressure-ordered
-     candidates into verified forwarding;
-   - the cap is count-based, not time-based, so it cannot abort an accepted
-     generation request;
-   - if all three candidates return capacity signals, the existing forwarding
-     path returns the final real upstream 429.
+4. Bound the first pressure fallback window:
+   - pass at most the first three candidates into verified forwarding;
+   - only an explicit HTTP 429 advances the capacity algorithm; request errors
+     remain terminal and an accepted SSE stream is never moved;
+   - a 429 records a short penalty for that route in the current metrics epoch,
+     preventing stale-low-pressure herding.
 
-5. Update aggregate status semantics:
+5. Add one fresh-metrics retry window:
+   - when every actual first-window response is 429, wait for the next completed
+     metrics epoch and re-evaluate the current live upstream config;
+   - prefer normally selectable and previously untried routes, then use the
+     same tier-aware pressure key;
+   - attempt at most three more candidates and at most six total by default;
+   - if the new epoch does not arrive within one poll interval plus a bounded
+     guard, or the second window is also all 429, return the normal PIG-shaped
+     429.
+
+6. Update aggregate status semantics:
    - green: at least one route has clear capacity;
    - yellow: no clear capacity, but at least one hard-eligible route can still
      receive passthrough/probe traffic;
@@ -80,6 +88,10 @@ Add or update tests for:
   pressured PIG can fail over to a later PIG that still accepts the request;
 - passthrough mode supplies at most the first three pressure-ordered candidates;
 - PIG/upstream 429 is preserved to the client;
+- same-epoch 429 deprioritizes one route and a new metrics epoch releases it;
+- an all-429 first window retries only after a fresh metrics epoch;
+- both windows are bounded to three candidates and the total attempt budget is
+  configurable from one through six;
 - no configured/enabled route still returns the PIG-shaped Router 429;
 - `/v1/upstream-status` returns yellow for soft-pressure-only exhaustion and red
   only for no hard-eligible route;
@@ -92,8 +104,9 @@ Add or update tests for:
 2. Run local source checks that do not depend on Windows-only linker state.
 3. Push source before building an image.
 4. Build and push the Router image on the remote builder.
-5. Update the authorized Router CVMs directly with the new image.
-6. Validate each Router with:
+5. Stop after image publication unless production deployment is separately
+   authorized.
+6. For a separately authorized deployment, validate each Router with:
    - current Compose/image check;
    - container/log health;
    - `/health`;

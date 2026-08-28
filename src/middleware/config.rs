@@ -21,7 +21,10 @@ pub struct MiddlewareConfig {
     pub balance_abs_threshold: usize,
     pub balance_rel_threshold: f32,
     pub max_history_per_route: usize,
-    /// Background upstream `/v1/metrics` polling interval. `0` disables metric
+    /// Maximum number of ordered upstream candidates offered to one request.
+    /// Only retryable failures advance to the next candidate.
+    pub max_forward_candidates: usize,
+    /// Background upstream PIG metrics polling interval. `0` disables metric
     /// polling and falls back to gateway-local in-flight routing only.
     pub metrics_poll_ms: u64,
     pub metrics_timeout_ms: u64,
@@ -59,10 +62,11 @@ impl Default for MiddlewareConfig {
             balance_abs_threshold: 64,
             balance_rel_threshold: 1.50,
             max_history_per_route: 256,
+            max_forward_candidates: 6,
             metrics_poll_ms: 1_000,
             metrics_timeout_ms: 800,
             metrics_stale_ms: 3_000,
-            metrics_path: "/v1/metrics".to_string(),
+            metrics_path: "/pig/metrics".to_string(),
             trusted_user_tier_header: false,
             tee_only_domains: Vec::new(),
             default_engine: None,
@@ -151,5 +155,12 @@ mod tests {
         ] {
             assert_eq!(normalize_tee_only_domain(value), None, "{value}");
         }
+    }
+
+    #[test]
+    fn middleware_defaults_use_pig_metrics_and_two_window_budget() {
+        let config = MiddlewareConfig::default();
+        assert_eq!(config.metrics_path, "/pig/metrics");
+        assert_eq!(config.max_forward_candidates, 6);
     }
 }

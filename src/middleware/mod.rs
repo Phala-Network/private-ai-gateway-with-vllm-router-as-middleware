@@ -12,6 +12,7 @@ pub mod errors;
 pub mod pricing;
 pub mod response_transform;
 mod router;
+mod runtime_config;
 pub mod sse;
 pub mod stream_transform;
 pub mod types;
@@ -23,6 +24,7 @@ use serde_json::Value;
 
 pub use completion::CompletionInput;
 pub use config::MiddlewareConfig;
+pub use runtime_config::{RouterConfigPatch, RouterConfigUpdateError};
 
 use crate::aggregator::service::AciService;
 use crate::aggregator::upstream_config::UpstreamConfigManager;
@@ -39,10 +41,26 @@ impl Middleware {
         config: &MiddlewareConfig,
         upstream_config: Arc<UpstreamConfigManager>,
     ) -> Result<Self, String> {
+        Self::new_with_runtime_config(config, upstream_config, None)
+    }
+
+    pub fn new_persistent(
+        config: &MiddlewareConfig,
+        upstream_config: Arc<UpstreamConfigManager>,
+        runtime_config_path: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        Self::new_with_runtime_config(config, upstream_config, Some(runtime_config_path))
+    }
+
+    fn new_with_runtime_config(
+        config: &MiddlewareConfig,
+        upstream_config: Arc<UpstreamConfigManager>,
+        runtime_config_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
         let control = control::ControlClient::from_config(config)?;
         let tee_only_domains = config.normalized_tee_only_domains()?.into_iter().collect();
         Ok(Self {
-            router: router::RouterBackend::new(config, upstream_config)?,
+            router: router::RouterBackend::new(config, upstream_config, runtime_config_path)?,
             control,
             tee_only_domains,
         })
@@ -54,6 +72,14 @@ impl Middleware {
 
     pub fn admin_snapshot(&self) -> Option<Value> {
         Some(self.router.admin_snapshot_value())
+    }
+
+    pub fn patch_router_config(
+        &self,
+        patch: RouterConfigPatch,
+    ) -> Result<Value, RouterConfigUpdateError> {
+        self.router.patch_config(patch)?;
+        Ok(self.router.admin_snapshot_value())
     }
 
     pub fn upstream_status_code(&self) -> u8 {

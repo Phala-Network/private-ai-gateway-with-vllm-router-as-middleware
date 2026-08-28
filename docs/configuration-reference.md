@@ -11,12 +11,15 @@ directory. Operators must choose the config file with
 | Static gateway config | Deployment | Required. Selected by `PRIVATE_AI_GATEWAY_CONFIG_PATH`. |
 | Upstream seed config | Deployment | Selected by `upstream_config_seed_path` in the static gateway config. |
 | Active upstream config | Gateway | `<state_dir>/upstreams.json` |
+| Router runtime override | Gateway | `<state_dir>/router-runtime.json` |
 | Attested-session log | Gateway | `<state_dir>/sessions.jsonl` |
 
 Operators configure `state_dir`, not the individual writable files inside it.
 The gateway creates `state_dir` on startup, seeds `upstreams.json` from the
 read-only upstream seed only when the active file is missing or empty, and
-updates `upstreams.json` through `PUT /v1/admin/upstreams`.
+updates `upstreams.json` through `PUT /v1/admin/upstreams`. An authenticated
+`PATCH /v1/admin/router` writes the Router tuning override atomically; a reset
+removes it and restores the immutable startup values.
 
 Unknown fields in the static gateway config are rejected at startup.
 
@@ -42,7 +45,7 @@ This is the smallest practical container config.
 | `bind` | `127.0.0.1:8086` | Public HTTP listener address. Use `0.0.0.0:8086` in containers that expose the gateway port. |
 | `state_dir` | `/var/lib/private-ai-gateway` | Gateway-owned writable state directory. The active upstream config and attested-session log are derived from this directory. |
 | `upstream_config_seed_path` | unset | Read-only JSON seed copied to `<state_dir>/upstreams.json` only when the active upstream config is missing or empty. |
-| `admin_token` | unset | Bearer token for `GET`, `PUT`, and `PATCH /v1/admin/upstreams`, plus `GET /v1/admin/router`. When unset, the admin API is not exposed. |
+| `admin_token` | unset | Bearer token for `GET`, `PUT`, and `PATCH /v1/admin/upstreams`, plus `GET` and `PATCH /v1/admin/router`. When unset, the admin API is not exposed. |
 | `api_token` | unset | Optional bearer token for public inference, model catalog, gateway/Router metrics, and `/v1/upstream-status`. When unset, those routes are publicly reachable. |
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `direct_serving` | `false` | Set only when inference is served inside this same attested workload with no upstream hop. It is mutually exclusive with middleware mode. |
@@ -83,10 +86,11 @@ security boundary.
 | `middleware.balance_abs_threshold` | `64` | Absolute running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
 | `middleware.balance_rel_threshold` | `1.50` | Relative running-request gap above which a cache-matched route is rejected in favor of the least-running route. |
 | `middleware.max_history_per_route` | `256` | Maximum routing-text records kept per public model and route in the process-local radix cache index. Each stored routing text is capped internally and the cap is visible as `routing_text_max_chars` in `/v1/admin/router`. |
+| `middleware.max_forward_candidates` | `6` | Maximum total upstream attempts for one request across both capacity windows. Each window is independently capped at three candidates. Values must be from `1` through `6`. |
 | `middleware.metrics_poll_ms` | `1000` | Background upstream metrics polling interval. Set to `0` to disable PIG-aware routing and use only gateway-local in-flight counters. |
 | `middleware.metrics_timeout_ms` | `800` | Per-upstream metrics request timeout. Polling uses an internal concurrency bound of four, so one slow upstream does not block the other active slots and a large target set cannot open one metrics connection per node at once. |
 | `middleware.metrics_stale_ms` | `3000` | Age after which a metrics sample is ignored and the route falls back to local in-flight state. |
-| `middleware.metrics_path` | `/v1/metrics` | Metrics path appended to each upstream base URL. The upstream's configured bearer token is used for metrics auth. |
+| `middleware.metrics_path` | `/pig/metrics` | PIG's compact Router-only metrics path appended to each upstream base URL. The upstream's configured bearer token is used for metrics auth. |
 | `middleware.trusted_user_tier_header` | `false` | Whether inbound `x-user-tier` is trusted for routing and forwarding to PIG. Keep `false` for public endpoints unless a trusted front door strips or sets this header. With the default, all requests are routed as `basic` and no caller-supplied tier header is forwarded. |
 | `middleware.default_engine` | unset | Deprecated compatibility field. Transparent router middleware accepts it in existing configs but does not use it to shape request bodies. |
 | `middleware.control_url` | unset | Optional control-plane URL for best-effort post-request usage reports only. Routing and catalog handling stay local. |
@@ -112,7 +116,7 @@ for metric names and lifecycle semantics.
 {
   "middleware": {
     "public_model": "gemma4-31b-it",
-    "metrics_path": "/v1/metrics",
+    "metrics_path": "/pig/metrics",
     "trusted_user_tier_header": true,
     "control_url": "https://control.example"
   }
@@ -121,6 +125,44 @@ for metric names and lifecycle semantics.
 
 No middleware field is strictly required, but production deployments normally
 set `public_model` and `trusted_user_tier_header` explicitly.
+
+### Router Runtime Tuning
+
+When `admin_token` is configured, operators can change bounded routing and
+polling parameters without restarting the gateway:
+
+```http
+PATCH /v1/admin/router
+Authorization: Bearer <admin-token>
+Content-Type: application/json
+
+{
+  "balance_abs_threshold": 16,
+  "max_history_per_route": 16384,
+  "max_forward_candidates": 6,
+  "metrics_poll_ms": 1000,
+  "metrics_path": "/pig/metrics"
+}
+```
+
+The patch accepts `cache_threshold`, `balance_abs_threshold`,
+`balance_rel_threshold`, `max_history_per_route`, `max_forward_candidates`,
+`metrics_poll_ms`, `metrics_timeout_ms`, `metrics_stale_ms`, `metrics_path`, and
+`sse_keepalive_ms`. Unknown fields and unsafe values are rejected atomically.
+Security, identity, provider, public-model, trusted-tier, TEE, token, and proof
+settings cannot be changed through this endpoint.
+
+The active tuning snapshot is persisted to
+`<state_dir>/router-runtime.json` and takes precedence over startup tuning after
+a restart. Restore the startup values and remove the persisted override with:
+
+```json
+{"reset": true}
+```
+
+`reset` cannot be combined with parameter updates. `GET /v1/admin/router`
+reports `runtime_config.source`, `runtime_config.revision`, and
+`runtime_config.persistent`.
 
 ## Source Provenance
 

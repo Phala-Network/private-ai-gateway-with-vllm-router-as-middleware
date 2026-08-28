@@ -336,7 +336,9 @@ pub struct GatewayRequestContext {
 #[derive(Debug, Clone)]
 pub struct ForwardCandidate {
     pub route_id: String,
-    pub body: Vec<u8>,
+    /// Shared immutable request bytes. Candidate expansion must not retain one
+    /// full JSON copy per fallback route.
+    pub body: Arc<[u8]>,
 }
 
 /// Provider HTTP statuses that trigger failover to the next candidate when

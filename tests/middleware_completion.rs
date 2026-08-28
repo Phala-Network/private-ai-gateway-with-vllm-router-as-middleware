@@ -323,7 +323,7 @@ async fn spawn_pig_upstream(
     let response_body = Arc::new(body);
     let app = Router::new()
         .route(
-            "/v1/metrics",
+            "/pig/metrics",
             axum::routing::get(move || async move { (StatusCode::OK, metrics) }),
         )
         .route(
@@ -379,7 +379,7 @@ async fn spawn_slow_metrics_upstream(
 ) -> String {
     let app = Router::new()
         .route(
-            "/v1/metrics",
+            "/pig/metrics",
             axum::routing::get(move || {
                 let active = active.clone();
                 let max_active = max_active.clone();
@@ -811,7 +811,7 @@ async fn pressured_pig_route_is_forwarded_instead_of_router_prerejected() {
     let mw = middleware(
         manager,
         MiddlewareConfig {
-            metrics_poll_ms: 10,
+            metrics_poll_ms: 100,
             metrics_stale_ms: 10_000,
             ..Default::default()
         },
@@ -825,7 +825,7 @@ async fn pressured_pig_route_is_forwarded_instead_of_router_prerejected() {
     .await;
 
     assert_eq!(status, 429);
-    assert_eq!(calls.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls.bodies.lock().unwrap().len(), 2);
 
     let snapshot = mw.admin_snapshot().unwrap();
     let route = route_snapshot(&snapshot, "gpu-a:gpt-test");
@@ -889,7 +889,7 @@ async fn pressured_pig_passthrough_failovers_after_first_429() {
     let mw = middleware(
         manager,
         MiddlewareConfig {
-            metrics_poll_ms: 10,
+            metrics_poll_ms: 100,
             metrics_stale_ms: 10_000,
             ..Default::default()
         },
@@ -942,7 +942,7 @@ async fn pressured_pig_passthrough_failovers_after_first_429() {
 }
 
 #[tokio::test]
-async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
+async fn pressured_pig_passthrough_reaches_an_untried_second_window_candidate() {
     let calls_a = Arc::new(CapturedCalls::default());
     let calls_b = Arc::new(CapturedCalls::default());
     let calls_c = Arc::new(CapturedCalls::default());
@@ -992,7 +992,7 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
     let mw = middleware(
         manager,
         MiddlewareConfig {
-            metrics_poll_ms: 10,
+            metrics_poll_ms: 100,
             metrics_stale_ms: 10_000,
             ..Default::default()
         },
@@ -1005,14 +1005,13 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
     )
     .await;
 
-    assert_eq!(status, 429);
-    assert_eq!(body["error"]["type"], json!("rate_limit_error"));
-    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
-    assert!(headers.get("retry-after").is_some());
+    assert_eq!(status, 200);
+    assert_eq!(body["model"], json!("gpt-test"));
+    assert!(headers.get("x-receipt-id").is_some());
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
     assert_eq!(calls_c.bodies.lock().unwrap().len(), 1);
-    assert_eq!(calls_d.bodies.lock().unwrap().len(), 0);
+    assert_eq!(calls_d.bodies.lock().unwrap().len(), 1);
     let snapshot = mw.admin_snapshot().unwrap();
     for route in [
         "gpu-a:gpt-test",
@@ -1020,10 +1019,15 @@ async fn pressured_pig_passthrough_tries_only_first_three_candidates() {
         "gpu-c:gpt-test",
         "gpu-d:gpt-test",
     ] {
-        assert_eq!(route_snapshot(&snapshot, route)["cache_records"], json!(0));
+        let expected = usize::from(route == "gpu-d:gpt-test");
+        assert_eq!(
+            route_snapshot(&snapshot, route)["cache_records"],
+            json!(expected)
+        );
     }
     let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
-    assert!(metrics.contains("router_cache_record_skipped_total{reason=\"upstream_429\"} 1"));
+    assert!(metrics.contains("router_capacity_retry_total{outcome=\"started\"} 1"));
+    assert!(metrics.contains("router_capacity_retry_total{outcome=\"completed\"} 1"));
 }
 
 #[tokio::test]
@@ -1147,7 +1151,7 @@ async fn metrics_polling_uses_bounded_concurrency() {
     let _mw = middleware(
         manager,
         MiddlewareConfig {
-            metrics_poll_ms: 10,
+            metrics_poll_ms: 100,
             metrics_timeout_ms: 500,
             ..Default::default()
         },
@@ -1196,7 +1200,7 @@ async fn two_pressured_streaming_routes_exhaust_to_rate_limit() {
     let mw = middleware(
         manager,
         MiddlewareConfig {
-            metrics_poll_ms: 10,
+            metrics_poll_ms: 100,
             metrics_stale_ms: 10_000,
             ..Default::default()
         },
@@ -1213,8 +1217,10 @@ async fn two_pressured_streaming_routes_exhaust_to_rate_limit() {
     assert_eq!(body["error"]["type"], json!("rate_limit_error"));
     assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
     assert!(headers.get("retry-after").is_some());
-    assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);
-    assert_eq!(calls_b.bodies.lock().unwrap().len(), 1);
+    assert_eq!(calls_a.bodies.lock().unwrap().len(), 2);
+    assert_eq!(calls_b.bodies.lock().unwrap().len(), 2);
+    let metrics = String::from_utf8(mw.metrics_body().unwrap()).unwrap();
+    assert!(metrics.contains("router_capacity_retry_total{outcome=\"exhausted_429\"} 1"));
 }
 
 #[tokio::test]
@@ -1380,17 +1386,24 @@ async fn failover_records_only_the_upstream_that_actually_succeeded() {
         manager,
         MiddlewareConfig {
             cache_threshold: 0.25,
+            metrics_poll_ms: 100,
             ..Default::default()
         },
     );
 
-    for prompt in ["shared failover prefix one", "shared failover prefix two"] {
+    for (index, prompt) in ["shared failover prefix one", "shared failover prefix two"]
+        .into_iter()
+        .enumerate()
+    {
         let (status, _, _) = response_parts(
             mw.handle_completion(&service, chat_input("gpt-test", prompt))
                 .await,
         )
         .await;
         assert_eq!(status, 200);
+        if index == 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
     }
 
     assert_eq!(calls_a.bodies.lock().unwrap().len(), 1);

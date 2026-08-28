@@ -76,17 +76,23 @@ For each request, the router:
    radix-tree cache index used for prefix affinity.
 4. Reads the latest PIG metrics sample for each upstream when metrics polling is
    enabled and the sample is fresh.
-5. Classifies pressure and removes routes that are not selectable for the
-   request tier.
+5. Classifies hard eligibility separately from soft PIG capacity. Disabled,
+   model-mismatched, or request-circuit-open routes are excluded; full,
+   waiting, stale, or metrics-error routes remain bounded least-bad fallbacks.
 6. Attempts a prefix-cache match when routing text is present.
 7. Accepts the matched route only if it is not waiting, not full, and not
    meaningfully more loaded than the least-loaded route.
 8. Falls back to the least-loaded route when no prefix match exists or the
    matched route fails the load guard.
-9. Returns at most three candidates, ordered by lower effective load, to bound
-   per-request connection and verification amplification during a multi-node
-   failure.
-10. Commits the routing text to the cache index only after the actual serving
+9. Returns at most three first-window candidates. The selected cache/load route
+   is first and the remaining candidates are pressure ordered.
+10. If every actual first-window response is 429, records a capacity penalty
+    for those routes in the current metrics epoch, waits for a fresh metrics
+    epoch, and computes a pressure-first second window. Routes not tried in the
+    first window win ties within the same pressure class.
+11. Attempts at most three routes per window and at most
+    `max_forward_candidates` routes in total. The default total budget is six.
+12. Commits the routing text to the cache index only after the actual serving
     route succeeds. A buffered response must be a valid upstream 2xx JSON body;
     a streaming response must emit its first valid model-data SSE event.
 
@@ -112,7 +118,7 @@ failing upstream set cannot consume one connection per node at once. By
 default:
 
 ```text
-metrics_path = /v1/metrics
+metrics_path = /pig/metrics
 metrics_poll_ms = 1000
 metrics_timeout_ms = 800
 metrics_stale_ms = 3000
@@ -132,12 +138,13 @@ pig_tier_inflight{tier="basic"}
 pig_tier_inflight{tier="premium"}
 ```
 
-After one or two failed polls, the router preserves the last successful sample
-and deprioritizes the affected route instead of presenting it as an empty node.
-Three consecutive poll failures open a metrics circuit and temporarily remove
-the route from request selection. The next successful poll closes that circuit.
-If no successful sample has ever existed, the router uses gateway-local
-in-flight counters until the failure threshold is reached.
+After a failed poll, the router preserves the last successful sample and
+deprioritizes the affected route instead of presenting it as an empty node.
+Repeated failures open a metrics circuit for observability and ordering, but do
+not hard-remove the inference route. If every measured route is full or metrics
+are unavailable, the Router still sends a bounded least-bad probe so PIG remains
+the final admission authority. Request-side transport or verification circuits
+remain hard exclusions until their short probe interval expires.
 
 ## Basic And Premium
 
@@ -208,6 +215,7 @@ router_cache_cached_tokens_total{route,selection_reason}
 router_cache_usage_skipped_total{reason}
 router_forward_candidate_count
 router_forward_attempt_count
+router_capacity_retry_total{outcome}
 router_circuit_open_total{route,reason}
 router_process_open_fds
 router_process_max_fds
@@ -239,6 +247,20 @@ internally for structured `request_outcome` logs. When the chain ends in an
 upstream HTTP response, including an all-429 chain, the gateway relays the
 terminal upstream status after normal response classification.
 
+An explicit 429 before any response body reaches the client is a capacity
+signal, not a route-health failure. Within one metrics epoch, that route is
+deprioritized behind siblings so stale low-pressure metrics cannot attract a
+concurrent 429 burst. The penalty automatically expires on the next completed
+metrics poll and never becomes a long-lived circuit.
+
+Only an all-429 first window activates the second capacity window. Request
+errors such as 400/422 remain terminal, transport/verification/retryable 5xx use
+the existing immediate failover path, and a stream is never moved after SSE has
+started. The Router waits for a new metrics epoch rather than blindly sleeping;
+the wait is bounded to one poll interval plus a small guard, at most 1200 ms.
+If the second window also exhausts, the client receives the normal
+OpenAI/vLLM/PIG-compatible 429.
+
 Request-side route circuits complement the three-candidate bound. Two
 consecutive routing, verification, transport, authentication/catalog, or 5xx
 failures open a route circuit for five seconds. A 5xx response that the existing
@@ -269,6 +291,7 @@ When `admin_token` is configured, operators can inspect the router:
 
 ```text
 GET /v1/admin/router
+PATCH /v1/admin/router
 ```
 
 The snapshot includes:
@@ -281,6 +304,15 @@ The snapshot includes:
 - Redacted PIG metrics status, including sample age and parse errors.
 - Request-side and metrics-side circuit state, including consecutive failures
   and remaining open time.
+- Current metrics epoch and same-epoch capacity-rejection flags.
+- Active runtime tuning source and revision.
+
+`PATCH /v1/admin/router` uses the same Bearer admin authentication as the other
+admin endpoints. It can hot-update only bounded cache, balancing, candidate,
+polling, metrics-path, and SSE keep-alive parameters. The override is persisted
+under the gateway state directory. Proof-chain, provider, model, tier-trust,
+token, and TEE policy cannot be changed through this endpoint. See
+[configuration-reference.md](configuration-reference.md#router-runtime-tuning).
 
 The snapshot is operational state only. It is not part of the ACI proof chain.
 

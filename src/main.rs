@@ -141,6 +141,10 @@ fn session_log_path(state_dir: &Path) -> PathBuf {
     state_dir.join("sessions.jsonl")
 }
 
+fn router_runtime_config_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("router-runtime.json")
+}
+
 fn resolve_source_provenance() -> Result<SourceProvenance, String> {
     Ok(
         source_provenance_from_git_launcher_config(Path::new(GIT_LAUNCHER_CONFIG_PATH))?
@@ -514,7 +518,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = if let Some(middleware_config) = middleware_config {
         let middleware = Arc::new(
-            Middleware::new(&middleware_config, upstream_config.clone()).map_err(invalid_input)?,
+            Middleware::new_persistent(
+                &middleware_config,
+                upstream_config.clone(),
+                router_runtime_config_path(&state_dir),
+            )
+            .map_err(invalid_input)?,
         );
         tracing::info!(
             mode = %middleware.name(),
@@ -653,7 +662,7 @@ mod tests {
 
     use super::{
         load_gateway_config, resolve_state_dir, resolve_tls_public_keys,
-        seed_upstream_config_if_empty, session_log_path,
+        router_runtime_config_path, seed_upstream_config_if_empty, session_log_path,
         source_provenance_from_git_launcher_config, upstream_config_path,
     };
 
@@ -898,6 +907,10 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         assert_eq!(
             session_log_path(&state_dir),
             state_dir.join("sessions.jsonl")
+        );
+        assert_eq!(
+            router_runtime_config_path(&state_dir),
+            state_dir.join("router-runtime.json")
         );
         assert!(resolve_state_dir(Some("  ")).is_err());
     }

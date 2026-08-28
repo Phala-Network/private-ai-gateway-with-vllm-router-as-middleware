@@ -434,7 +434,7 @@ async fn middleware_single_candidate_caller_supplied_always_mismatch_flushes() {
 
     let candidates = vec![ForwardCandidate {
         route_id: "route-a".to_string(),
-        body: CHAT_BODY.to_vec(),
+        body: CHAT_BODY.to_vec().into(),
     }];
     let journal = MiddlewareReceiptJournal::default();
 
@@ -518,11 +518,11 @@ async fn middleware_capacity_failover_is_single_pass_without_delayed_retry() {
     let candidates = vec![
         ForwardCandidate {
             route_id: "route-a".to_string(),
-            body: CHAT_BODY.to_vec(),
+            body: CHAT_BODY.to_vec().into(),
         },
         ForwardCandidate {
             route_id: "route-b".to_string(),
-            body: CHAT_BODY.to_vec(),
+            body: CHAT_BODY.to_vec().into(),
         },
     ];
     let mut observer = RecordingAttemptObserver::default();

@@ -3,6 +3,7 @@
 //! Uses `tower::ServiceExt::oneshot` to drive the router directly,
 //! avoiding a TCP listener.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod common;
@@ -979,19 +980,32 @@ fn upstream_runtime_options() -> UpstreamRuntimeOptions {
 }
 
 fn setup_with_config(config_json: &str) -> (Arc<AciService>, Router) {
-    setup_with_config_inner(config_json, None)
+    setup_with_config_inner(config_json, None, None)
 }
 
 fn setup_with_config_and_middleware(
     config_json: &str,
     middleware_config: MiddlewareConfig,
 ) -> (Arc<AciService>, Router) {
-    setup_with_config_inner(config_json, Some(middleware_config))
+    setup_with_config_inner(config_json, Some(middleware_config), None)
+}
+
+fn setup_with_config_and_middleware_admin(
+    config_json: &str,
+    middleware_config: MiddlewareConfig,
+    admin_token: &str,
+) -> (Arc<AciService>, Router) {
+    setup_with_config_inner(
+        config_json,
+        Some(middleware_config),
+        Some(admin_token.to_string()),
+    )
 }
 
 fn setup_with_config_inner(
     config_json: &str,
     middleware_config: Option<MiddlewareConfig>,
+    admin_token: Option<String>,
 ) -> (Arc<AciService>, Router) {
     // Unique per call: a coarse system clock can hand concurrent tests the same
     // nanos, so an atomic counter guarantees distinct temp paths.
@@ -1019,11 +1033,259 @@ fn setup_with_config_inner(
     let app = match middleware_config {
         Some(config) => {
             let middleware = Arc::new(Middleware::new(&config, manager.clone()).unwrap());
-            build_router_with_admin_and_middleware(service.clone(), manager, None, middleware)
+            build_router_with_admin_and_middleware(
+                service.clone(),
+                manager,
+                admin_token,
+                middleware,
+            )
         }
-        None => build_router_with_admin(service.clone(), manager, None),
+        None => build_router_with_admin(service.clone(), manager, admin_token),
     };
     (service, app)
+}
+
+#[tokio::test]
+async fn router_runtime_patch_is_admin_authenticated_and_immediately_visible() {
+    let middleware = MiddlewareConfig {
+        public_model: Some("gpt-test".to_string()),
+        ..Default::default()
+    };
+    let (_, hidden_app) = setup_with_config_and_middleware("[]", middleware.clone());
+    let hidden = hidden_app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1/admin/router")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"balance_abs_threshold":16}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+
+    let (_, app) = setup_with_config_and_middleware_admin("[]", middleware, "admin-secret");
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1/admin/router")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"balance_abs_threshold":16}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let forbidden = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1/admin/router")
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer wrong")
+                .body(Body::from(r#"{"balance_abs_threshold":16}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let patched = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/v1/admin/router")
+                .header(CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer admin-secret")
+                .body(Body::from(
+                    r#"{"balance_abs_threshold":16,"max_forward_candidates":6,"metrics_path":"/pig/metrics"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), StatusCode::OK);
+
+    let snapshot = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/admin/router")
+                .header("authorization", "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), StatusCode::OK);
+    let snapshot: Value = serde_json::from_slice(&body_bytes(snapshot.into_body()).await).unwrap();
+    assert_eq!(snapshot["config"]["balance_abs_threshold"], 16);
+    assert_eq!(snapshot["config"]["max_forward_candidates"], 6);
+    assert_eq!(snapshot["config"]["metrics_path"], "/pig/metrics");
+    assert_eq!(snapshot["runtime_config"]["source"], "runtime_override");
+    assert_eq!(snapshot["runtime_config"]["revision"], 1);
+}
+
+#[derive(Clone)]
+struct CapacityStubState {
+    attempts: Arc<AtomicUsize>,
+    accept: bool,
+}
+
+async fn capacity_stub_chat(State(state): State<CapacityStubState>, _body: Bytes) -> Response {
+    state.attempts.fetch_add(1, Ordering::SeqCst);
+    if state.accept {
+        return (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            r#"{"id":"chat-capacity","object":"chat.completion","created":1,"model":"upstream-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        )
+            .into_response();
+    }
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(CONTENT_TYPE, "application/json")],
+        r#"{"error":{"message":"Too many requests","type":"TooManyRequestsError","param":null,"code":429}}"#,
+    )
+        .into_response()
+}
+
+async fn capacity_stub_metrics() -> Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        "pig_dynamic_observed_running 0\n\
+         pig_dynamic_observed_waiting 0\n\
+         pig_dynamic_global_limit 10\n\
+         pig_tier_basic_limit 9\n\
+         pig_tier_inflight{tier=\"basic\"} 0\n\
+         pig_tier_inflight{tier=\"premium\"} 0\n",
+    )
+        .into_response()
+}
+
+async fn serve_capacity_stub(accept: bool) -> (String, Arc<AtomicUsize>) {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(capacity_stub_chat))
+        .route("/pig/metrics", get(capacity_stub_metrics))
+        .with_state(CapacityStubState {
+            attempts: attempts.clone(),
+            accept,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), attempts)
+}
+
+async fn capacity_router(accept_last: bool) -> (Router, Vec<Arc<AtomicUsize>>) {
+    let mut upstreams = Vec::new();
+    let mut attempts = Vec::new();
+    for (index, name) in ["a", "b", "c", "d"].iter().enumerate() {
+        let (base_url, route_attempts) = serve_capacity_stub(accept_last && index == 3).await;
+        attempts.push(route_attempts);
+        upstreams.push(serde_json::json!({
+            "name": name,
+            "provider": "openai-compatible",
+            "base_url": base_url,
+            "models": {"gpt-test": "upstream-model"},
+            "bearer_token": "upstream-token"
+        }));
+    }
+    let config = serde_json::to_string(&upstreams).unwrap();
+    let middleware = MiddlewareConfig {
+        public_model: Some("gpt-test".to_string()),
+        max_forward_candidates: 6,
+        metrics_poll_ms: 100,
+        metrics_timeout_ms: 100,
+        metrics_stale_ms: 1_000,
+        metrics_path: "/pig/metrics".to_string(),
+        ..Default::default()
+    };
+    let (_, app) = setup_with_config_and_middleware(&config, middleware);
+    (app, attempts)
+}
+
+fn capacity_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"gpt-test","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn buffered_capacity_retry_uses_a_fresh_epoch_and_untried_route() {
+    let (app, attempts) = capacity_router(true).await;
+    let metrics_app = app.clone();
+    let response = app.oneshot(capacity_request()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|count| count.load(Ordering::SeqCst))
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 1]
+    );
+
+    let metrics = metrics_app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(body_bytes(metrics.into_body()).await.to_vec()).unwrap();
+    assert!(metrics.contains("router_capacity_retry_total{outcome=\"started\"} 1"));
+    assert!(metrics.contains("router_capacity_retry_total{outcome=\"completed\"} 1"));
+}
+
+#[tokio::test]
+async fn two_capacity_windows_exhaust_to_a_router_429() {
+    let (app, attempts) = capacity_router(false).await;
+    let metrics_app = app.clone();
+    let response = app.oneshot(capacity_request()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: Value = serde_json::from_slice(&body_bytes(response.into_body()).await).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|count| count.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        6,
+        "two windows must remain bounded to three candidates each"
+    );
+
+    let metrics = metrics_app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(body_bytes(metrics.into_body()).await.to_vec()).unwrap();
+    assert!(metrics.contains("router_capacity_retry_total{outcome=\"exhausted_429\"} 1"));
 }
 
 /// Records the query string and `Authorization` header the stub received.

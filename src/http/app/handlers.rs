@@ -44,7 +44,7 @@ use super::util::{
 use super::AppState;
 use crate::middleware::errors::Surface;
 use crate::middleware::types::Endpoint;
-use crate::middleware::CompletionInput;
+use crate::middleware::{CompletionInput, RouterConfigPatch, RouterConfigUpdateError};
 
 #[derive(Deserialize)]
 pub(super) struct AttestationQuery {
@@ -343,6 +343,33 @@ pub(super) async fn admin_router_status(
             "not_found",
             "router middleware is not enabled",
         ),
+    }
+}
+
+pub(super) async fn admin_patch_router(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(patch): Json<RouterConfigPatch>,
+) -> Response {
+    if let Some(resp) = enforce_admin(&state, &headers) {
+        return resp;
+    }
+    let Some(middleware) = state.middleware.as_ref() else {
+        return admin_not_found_response();
+    };
+    match middleware.patch_router_config(patch) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(RouterConfigUpdateError::Invalid(message)) => {
+            error_response(StatusCode::BAD_REQUEST, "invalid_router_config", &message)
+        }
+        Err(RouterConfigUpdateError::Persist(message)) => {
+            tracing::error!(error = %message, "failed to persist router runtime config");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router_config_persist_failed",
+                "failed to persist router runtime config",
+            )
+        }
     }
 }
 

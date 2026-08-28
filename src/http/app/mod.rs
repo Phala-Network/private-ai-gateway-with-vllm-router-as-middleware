@@ -90,10 +90,10 @@ mod util;
 
 use handlers::{
     aci_attestation_report, aci_list_sessions, aci_receipt, admin_get_upstreams,
-    admin_patch_upstream, admin_put_upstreams, admin_router_status, attestation_report,
-    attested_session, chat_completions, completions, embeddings, embeddings_models, health,
-    messages, metrics, models, models_subpath, receipt_by_chat_id, responses, root,
-    upstream_status,
+    admin_patch_router, admin_patch_upstream, admin_put_upstreams, admin_router_status,
+    attestation_report, attested_session, chat_completions, completions, embeddings,
+    embeddings_models, health, messages, metrics, models, models_subpath, receipt_by_chat_id,
+    responses, root, upstream_status,
 };
 
 #[derive(Clone)]
@@ -193,7 +193,10 @@ fn build_router_inner(
             get(admin_get_upstreams).put(admin_put_upstreams),
         )
         .route("/v1/admin/upstreams/:name", patch(admin_patch_upstream))
-        .route("/v1/admin/router", get(admin_router_status))
+        .route(
+            "/v1/admin/router",
+            get(admin_router_status).patch(admin_patch_router),
+        )
         // Canonical ACI verification surface (clean shapes).
         .route("/v1/aci/attestation", get(aci_attestation_report))
         .route("/v1/aci/receipts/:id", get(aci_receipt))
