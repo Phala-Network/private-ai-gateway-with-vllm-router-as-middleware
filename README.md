@@ -1,6 +1,12 @@
 # Private AI Gateway With vLLM Router Middleware
 
-This repository is Phala's integration of **Private AI Gateway** with an
+> [!WARNING]
+> **Archived and no longer operated by Phala.** The required multi-node
+> routing functionality has been integrated into Redpill. Do not deploy this
+> standalone Router in production. This repository is retained only as a
+> historical implementation reference.
+
+This repository was Phala's integration of **Private AI Gateway** with an
 in-process, vLLM-router-style middleware. Its purpose is to keep Private AI
 Gateway as the only data-plane gateway while adding multi-upstream,
 cache-aware routing inside the same attested workload.
